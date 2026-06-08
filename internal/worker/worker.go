@@ -79,6 +79,7 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 	if err := writeEnvelope(conn, hello); err != nil {
 		return err
 	}
+	w.Logger.Info("worker connected", "hub", target, "id", w.ID, "name", w.Name)
 	if err := w.sendSnapshot(ctx, conn); err != nil {
 		w.Logger.Error("snapshot failed", "error", err)
 	}

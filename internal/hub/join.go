@@ -21,6 +21,7 @@ type joinToken struct {
 	Hash          string    `json:"-"`
 	ExpiresAt     time.Time `json:"expires_at"`
 	UsesRemaining int       `json:"uses_remaining"`
+	Reusable      bool      `json:"reusable"`
 	Scopes        []string  `json:"scopes"`
 }
 
@@ -54,6 +55,7 @@ func (s *joinTokenStore) Mint(ttl time.Duration, uses int, scopes []string) (min
 		Hash:          tokenHash(token),
 		ExpiresAt:     expiresAt,
 		UsesRemaining: uses,
+		Reusable:      true,
 		Scopes:        append([]string(nil), scopes...),
 	}
 	s.mu.Lock()
@@ -76,8 +78,11 @@ func (s *joinTokenStore) Valid(token string) bool {
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
 	entry, ok := s.tokens[hash]
-	if !ok || now.After(entry.ExpiresAt) || entry.UsesRemaining <= 0 {
+	if !ok || now.After(entry.ExpiresAt) || (!entry.Reusable && entry.UsesRemaining <= 0) {
 		return false
+	}
+	if entry.Reusable {
+		return true
 	}
 	entry.UsesRemaining--
 	if entry.UsesRemaining <= 0 {
@@ -110,11 +115,11 @@ func tokenHash(token string) string {
 }
 
 func installWorkerCommand(baseURL string, token string) string {
-	return fmt.Sprintf("go run ./cmd/agentmux worker --hub %s --token %s --name $(hostname)", websocketBase(baseURL), shellQuote(token))
+	return fmt.Sprintf("go run ./cmd/agentmux worker --hub %s --join %s --name $(hostname)", websocketBase(baseURL), shellQuote(token))
 }
 
 func installControlCommand(baseURL string, token string) string {
-	return fmt.Sprintf("go run ./cmd/agentmux control list --hub %s --token %s", baseURL, shellQuote(token))
+	return fmt.Sprintf("go run ./cmd/agentmux control list --hub %s --join %s", baseURL, shellQuote(token))
 }
 
 func websocketBase(baseURL string) string {

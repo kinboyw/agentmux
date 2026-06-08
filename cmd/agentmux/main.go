@@ -13,6 +13,7 @@ import (
 	"private/agentmux/internal/control"
 	"private/agentmux/internal/hub"
 	"private/agentmux/internal/protocol"
+	"private/agentmux/internal/term"
 	"private/agentmux/internal/tmux"
 	"private/agentmux/internal/worker"
 )
@@ -73,6 +74,7 @@ func runWorker(ctx context.Context, args []string) {
 }
 
 func runControl(ctx context.Context, args []string) {
+	defer term.ResetModes(os.Stdout)
 	if len(args) < 1 {
 		controlUsage()
 		os.Exit(2)

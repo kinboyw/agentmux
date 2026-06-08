@@ -17,8 +17,8 @@ func TestJoinTokenStoreMintAndConsume(t *testing.T) {
 	if !store.Valid(minted.Token) {
 		t.Fatal("expected token to be valid")
 	}
-	if store.Valid(minted.Token) {
-		t.Fatal("expected one-use token to be consumed")
+	if !store.Valid(minted.Token) {
+		t.Fatal("prototype join tokens should be reusable within ttl")
 	}
 }
 

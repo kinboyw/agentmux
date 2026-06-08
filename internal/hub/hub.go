@@ -116,6 +116,7 @@ func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
 		"token":           minted.Token,
 		"expires_at":      minted.ExpiresAt,
 		"uses_remaining":  minted.UsesRemaining,
+		"reusable":        true,
 		"scopes":          minted.Scopes,
 		"worker_command":  installWorkerCommand(baseURL, minted.Token),
 		"control_command": installControlCommand(baseURL, minted.Token),
@@ -580,7 +581,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       const data = await res.json();
       result.innerHTML =
         '<p><strong>Join token</strong><br><code>' + escapeHTML(data.token) + '</code></p>' +
-        '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Uses remaining: ' + escapeHTML(String(data.uses_remaining)) + '.</p>' +
+        '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Prototype tokens are reusable until expiry.</p>' +
         '<p><strong>Worker</strong></p>' +
         '<pre>' + escapeHTML(data.worker_command) + '</pre>' +
         '<p><strong>Control</strong></p>' +
