@@ -25,16 +25,17 @@ import (
 var webDist embed.FS
 
 type Server struct {
-	addr   string
-	token  string
-	logger *slog.Logger
+	addr      string
+	token     string
+	publicURL string
+	logger    *slog.Logger
 
 	mu          sync.RWMutex
 	workers     map[string]*workerConn
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
 	previews    map[string]chan protocol.Envelope
-	auth        *authStore
+	auth        AuthStore
 }
 
 type workerConn struct {
@@ -62,24 +63,50 @@ type authContext struct {
 type authContextKey struct{}
 
 func New(addr, token string, logger *slog.Logger) *Server {
+	server, err := NewWithOptions(ServerOptions{Addr: addr, Token: token, Logger: logger})
+	if err != nil {
+		panic(err)
+	}
+	return server
+}
+
+type ServerOptions struct {
+	Addr      string
+	Token     string
+	PublicURL string
+	Logger    *slog.Logger
+	AuthStore AuthStore
+}
+
+func NewWithOptions(options ServerOptions) (*Server, error) {
+	logger := options.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Server{
-		addr:        addr,
-		token:       token,
+		addr:        options.Addr,
+		token:       options.Token,
+		publicURL:   strings.TrimRight(options.PublicURL, "/"),
 		logger:      logger,
 		workers:     map[string]*workerConn{},
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
 		previews:    map[string]chan protocol.Envelope{},
-		auth:        newAuthStore(),
+		auth:        defaultAuthStore(options.AuthStore),
+	}, nil
+}
+
+func defaultAuthStore(store AuthStore) AuthStore {
+	if store != nil {
+		return store
 	}
+	return newAuthStore()
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleLanding)
+	mux.HandleFunc("/install.sh", s.handleInstallScript)
 	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/assets/", s.handleWebAssets)
 	mux.HandleFunc("/health", s.handleHealth)
@@ -119,7 +146,7 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	baseURL := requestBaseURL(r)
+	baseURL := s.requestBaseURL(r)
 	data := landingData{
 		BaseURL: baseURL,
 		WSURL:   websocketBase(baseURL),
@@ -136,7 +163,7 @@ func (s *Server) handleControlPage(w http.ResponseWriter, r *http.Request) {
 	if serveEmbeddedControl(w, r) {
 		return
 	}
-	baseURL := requestBaseURL(r)
+	baseURL := s.requestBaseURL(r)
 	data := controlPageData{
 		BaseURL: baseURL,
 		WSURL:   websocketBase(baseURL),
@@ -154,6 +181,16 @@ func (s *Server) handleWebAssets(w http.ResponseWriter, r *http.Request) {
 	http.FileServer(http.FS(dist)).ServeHTTP(w, r)
 }
 
+func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	baseURL := s.requestBaseURL(r)
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = fmt.Fprintf(w, installScriptTemplate, baseURL, websocketBase(baseURL))
+}
+
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
 	s.handleSignals(w, r)
 }
@@ -168,7 +205,7 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	baseURL := requestBaseURL(r)
+	baseURL := s.requestBaseURL(r)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"token":           minted.Signal,
 		"signal":          minted.Signal,
@@ -834,7 +871,10 @@ type controlPageData struct {
 	WSURL   string
 }
 
-func requestBaseURL(r *http.Request) string {
+func (s *Server) requestBaseURL(r *http.Request) string {
+	if s.publicURL != "" {
+		return s.publicURL
+	}
 	scheme := "http"
 	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 		scheme = "https"
@@ -845,6 +885,44 @@ func requestBaseURL(r *http.Request) string {
 	}
 	return scheme + "://" + host
 }
+
+const installScriptTemplate = `#!/bin/sh
+set -eu
+
+ROLE="${1:-worker}"
+shift || true
+
+VERSION="${AGENTMUX_VERSION:-latest}"
+HUB_HTTP="%s"
+HUB_WS="%s"
+BIN_DIR="${AGENTMUX_BIN_DIR:-$HOME/.local/bin}"
+BIN="$BIN_DIR/agentmux"
+
+mkdir -p "$BIN_DIR"
+
+if command -v agentmux >/dev/null 2>&1; then
+  BIN="$(command -v agentmux)"
+elif command -v go >/dev/null 2>&1 && [ -f "./cmd/agentmux/main.go" ]; then
+  go build -o "$BIN" ./cmd/agentmux
+else
+  echo "agentmux binary is not installed." >&2
+  echo "Install a release binary into PATH, or run this script from a source checkout with Go installed." >&2
+  exit 1
+fi
+
+case "$ROLE" in
+  worker)
+    exec "$BIN" worker --hub "$HUB_WS" "$@"
+    ;;
+  control)
+    exec "$BIN" control app --hub "$HUB_HTTP" "$@"
+    ;;
+  *)
+    echo "usage: install.sh worker|control [agentmux flags]" >&2
+    exit 2
+    ;;
+esac
+`
 
 func controlPageURL(baseURL string, token string) string {
 	u, err := url.Parse(baseURL + "/control")
@@ -876,49 +954,169 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AgentMux Hub</title>
+  <title>AgentMux</title>
   <style>
-    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: Canvas; color: CanvasText; }
-    main { max-width: 980px; margin: 0 auto; padding: 48px 24px; }
-    h1 { font-size: 36px; margin: 0 0 12px; }
-    p { color: color-mix(in srgb, CanvasText 70%, Canvas 30%); line-height: 1.5; }
-    .panel { border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas 82%); border-radius: 8px; padding: 20px; margin-top: 24px; }
-    button { font: inherit; padding: 10px 14px; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas 75%); background: CanvasText; color: Canvas; cursor: pointer; }
+    :root {
+      color-scheme: dark;
+      --bg: #070909;
+      --panel: #101414;
+      --panel-2: #171d1d;
+      --line: #273131;
+      --text: #edf5f2;
+      --muted: #9fb0aa;
+      --accent: #35c98f;
+      --accent-2: #76a9ff;
+      --warn: #f2b84b;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { min-height: 100%; background: var(--bg); }
+    body { margin: 0; background: radial-gradient(circle at 70% 10%, rgba(53, 201, 143, .14), transparent 32rem), var(--bg); color: var(--text); }
+    a { color: inherit; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    pre { overflow-x: auto; padding: 14px; border-radius: 6px; background: color-mix(in srgb, CanvasText 8%, Canvas 92%); }
-    .muted { font-size: 14px; }
+    .shell { min-height: 100vh; display: flex; flex-direction: column; }
+    .nav { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(7, 9, 9, .78); backdrop-filter: blur(18px); position: sticky; top: 0; z-index: 10; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 750; letter-spacing: 0; }
+    .mark { width: 24px; height: 24px; border-radius: 6px; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 0 22px rgba(53, 201, 143, .35); }
+    .navlinks { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 14px; }
+    .navlinks a { text-decoration: none; }
+    main { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+    .hero { display: grid; grid-template-columns: minmax(0, 1fr) 500px; gap: 36px; align-items: center; padding: 56px 0 34px; }
+    h1 { margin: 0; font-size: clamp(42px, 7vw, 76px); line-height: .96; letter-spacing: 0; max-width: 760px; }
+    .lead { margin: 22px 0 0; max-width: 660px; color: var(--muted); font-size: 18px; line-height: 1.6; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 28px; }
+    button, .button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); color: var(--text); padding: 0 14px; font: inherit; text-decoration: none; cursor: pointer; }
+    button.primary, .button.primary { background: var(--accent); border-color: var(--accent); color: #06130e; font-weight: 750; }
+    .status { color: var(--muted); font-size: 13px; }
+    .terminal { border: 1px solid var(--line); border-radius: 8px; background: #050606; overflow: hidden; box-shadow: 0 24px 80px rgba(0, 0, 0, .35); }
+    .terminal-head { height: 34px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 0 12px; color: var(--muted); font-size: 12px; background: #0d1111; }
+    .terminal-body { padding: 16px; min-height: 320px; display: grid; align-content: start; gap: 12px; }
+    .line { color: #c9d8d2; font-size: 13px; line-height: 1.55; }
+    .line b { color: var(--accent); font-weight: 650; }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; padding: 24px 0 50px; }
+    .card { border: 1px solid var(--line); border-radius: 8px; background: rgba(16, 20, 20, .82); padding: 18px; }
+    .card h2 { margin: 0 0 8px; font-size: 16px; }
+    .card p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
+    .panel { border: 1px solid var(--line); border-radius: 8px; background: rgba(16, 20, 20, .9); padding: 18px; margin-bottom: 50px; }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+    .panel h2 { margin: 0; font-size: 22px; }
+    .panel p { margin: 4px 0 0; color: var(--muted); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .command { border: 1px solid var(--line); border-radius: 7px; background: #060808; overflow: hidden; }
+    .command-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; padding: 8px 10px; }
+    pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #d7e5df; font-size: 13px; line-height: 1.55; }
+    .pill { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; color: var(--muted); font-size: 13px; }
+    .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--accent); }
+    .footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; padding: 18px 0 34px; display: flex; justify-content: space-between; gap: 16px; }
+    @media (max-width: 900px) {
+      .nav { padding: 0 18px; }
+      .navlinks { display: none; }
+      main { width: min(100% - 28px, 720px); }
+      .hero, .grid, .cards { grid-template-columns: 1fr; }
+      .hero { padding-top: 34px; }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <h1>AgentMux Hub</h1>
-    <p>Generate a short-lived join signal, connect a worker, then control long-lived agent sessions through this hub.</p>
-    <div class="panel">
-      <p class="muted">Hub: <code>{{.BaseURL}}</code><br>Worker WebSocket: <code>{{.WSURL}}</code></p>
-      <button id="mint">Generate join signal</button>
-      <div id="result"></div>
-    </div>
-  </main>
+  <div class="shell">
+    <nav class="nav">
+      <div class="brand"><span class="mark"></span><span>AgentMux</span></div>
+      <div class="navlinks">
+        <a href="/control">Web Control</a>
+        <a href="/install.sh">install.sh</a>
+        <a href="#quickstart">Quick Start</a>
+      </div>
+    </nav>
+    <main>
+      <section class="hero">
+        <div>
+          <div class="pill"><span class="dot"></span>tmux-first remote control plane for coding agents</div>
+          <h1>Bring every agent session back to one hub.</h1>
+          <p class="lead">AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux sessions, Hub routes identity and WebSockets, Control gives you a browser and CLI surface from anywhere.</p>
+          <div class="actions">
+            <button id="mint" class="primary">Generate join signal</button>
+            <a class="button" href="/control">Open Web Control</a>
+            <span id="status" class="status">Hub {{.BaseURL}} · Worker {{.WSURL}}</span>
+          </div>
+        </div>
+        <div class="terminal" aria-label="AgentMux flow">
+          <div class="terminal-head"><span>agentmux flow</span><span>wss relay</span></div>
+          <div class="terminal-body">
+            <div class="line"><b>1.</b> Generate a short-lived signal from this page.</div>
+            <div class="line"><b>2.</b> Run one command on a worker machine.</div>
+            <div class="line"><b>3.</b> Open Web Control and split sessions into panes.</div>
+            <div class="line"><b>4.</b> The agent only sees a local tmux terminal.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="cards">
+        <div class="card"><h2>Agent-unaware</h2><p>No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.</p></div>
+        <div class="card"><h2>Cloudflare-ready</h2><p>Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.</p></div>
+        <div class="card"><h2>Multi-session control</h2><p>The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.</p></div>
+      </section>
+
+      <section id="quickstart" class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Quick Start</h2>
+            <p>Generate a signal, then use the commands below before it expires.</p>
+          </div>
+          <button id="mint2">Generate</button>
+        </div>
+        <div id="result" class="grid">
+          <div class="command">
+            <div class="command-title"><span>Local hub</span></div>
+            <pre>agentmux hub --addr 0.0.0.0:8080 --data ./agentmux.db --public-url {{.BaseURL}}</pre>
+          </div>
+          <div class="command">
+            <div class="command-title"><span>Cloudflare tunnel</span></div>
+            <pre>cloudflared tunnel --url http://127.0.0.1:8080</pre>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span>Default admin token stays local. Signals exchange into scoped credentials.</span>
+        <span>Docs: README.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md</span>
+      </footer>
+    </main>
+  </div>
   <script>
     const result = document.getElementById('result');
-    document.getElementById('mint').addEventListener('click', async () => {
-      result.textContent = 'Generating...';
+    const status = document.getElementById('status');
+    document.getElementById('mint').addEventListener('click', mint);
+    document.getElementById('mint2').addEventListener('click', mint);
+    async function mint() {
+      status.textContent = 'Generating signal...';
       const res = await fetch('/api/signals', { method: 'POST' });
       if (!res.ok) {
-        result.textContent = 'Failed: ' + await res.text();
+        status.textContent = 'Failed: ' + await res.text();
         return;
       }
       const data = await res.json();
+      status.textContent = 'Signal ready · expires ' + new Date(data.expires_at).toLocaleString();
       result.innerHTML =
-        '<p><strong>Signal</strong><br><code>' + escapeHTML(data.signal || data.token) + '</code></p>' +
-        '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Signals are exchanged for scoped credentials.</p>' +
-        '<p><strong>Web Control</strong><br><a href="' + escapeAttr(data.control_url) + '">' + escapeHTML(data.control_url) + '</a></p>' +
-        '<p><strong>Worker</strong></p>' +
-        '<pre>' + escapeHTML(data.worker_command) + '</pre>' +
-        '<p><strong>Control</strong></p>' +
-        '<pre>' + escapeHTML(data.control_command) + '</pre>';
-    });
+        commandBlock('Signal', data.signal || data.token, false) +
+        commandBlock('Worker source/dev', data.worker_command, true) +
+        commandBlock('Worker one-line script', 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- worker --join ' + shellQuote(data.signal || data.token) + ' --name "$(hostname)"', true) +
+        commandBlock('Web Control', data.control_url, false) +
+        commandBlock('Control CLI', data.control_command, true) +
+        commandBlock('Control app script', 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- control --join ' + shellQuote(data.signal || data.token), true);
+    }
+    function commandBlock(title, value, copyable) {
+      return '<div class="command"><div class="command-title"><span>' + escapeHTML(title) + '</span>' +
+        (copyable ? '<button data-copy="' + escapeAttr(value) + '" onclick="copyValue(this)">Copy</button>' : '') +
+        '</div><pre>' + escapeHTML(value) + '</pre></div>';
+    }
+    async function copyValue(button) {
+      await navigator.clipboard.writeText(button.getAttribute('data-copy') || '');
+      button.textContent = 'Copied';
+      setTimeout(() => button.textContent = 'Copy', 1000);
+    }
+    function shellQuote(value) {
+      return "'" + String(value).replace(/'/g, "'\\''") + "'";
+    }
     function escapeHTML(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     }

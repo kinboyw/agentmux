@@ -529,6 +529,11 @@ function TerminalPane({
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
+  const activeRef = React.useRef(active);
+
+  React.useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   React.useEffect(() => {
     if (!pane.sessionId || !terminalRef.current) return;
@@ -613,6 +618,16 @@ function TerminalPane({
     helperTextarea?.addEventListener("compositionstart", onCompositionStart);
     helperTextarea?.addEventListener("compositionupdate", onCompositionUpdate);
     helperTextarea?.addEventListener("compositionend", onCompositionEnd);
+    const terminalElement = terminalRef.current;
+    const requestShortcutLock = () => {
+      void lockTerminalShortcutKeys();
+    };
+    const releaseShortcutLock = () => {
+      unlockTerminalShortcutKeys();
+    };
+    terminalElement.addEventListener("pointerdown", requestShortcutLock);
+    helperTextarea?.addEventListener("focus", requestShortcutLock);
+    helperTextarea?.addEventListener("blur", releaseShortcutLock);
     const dataDisposable = term.onData((data) => {
       if (suppressNextText.current && data === suppressNextText.current) {
         suppressNextText.current = "";
@@ -623,7 +638,8 @@ function TerminalPane({
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
     });
     term.attachCustomKeyEventHandler((event) => {
-      if (!shouldManuallyCaptureTerminalKey(event)) return true;
+      if (event.type !== "keydown") return true;
+      if (!shouldCaptureTerminalKey(event)) return true;
       const data = encodeKeyEvent(event);
       if (!data) return true;
       event.preventDefault();
@@ -631,6 +647,19 @@ function TerminalPane({
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
       return false;
     });
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (!activeRef.current || event.defaultPrevented) return;
+      if (!terminalHasKeyboardFocus(event, terminalRef.current)) return;
+      if (!shouldCaptureTerminalKey(event)) return;
+      const data = encodeKeyEvent(event);
+      if (!data) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      term.focus();
+      sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+    };
+    document.addEventListener("keydown", onDocumentKeyDown, true);
 
     const observer = new ResizeObserver(() => {
       scheduleFit();
@@ -639,9 +668,14 @@ function TerminalPane({
 
     return () => {
       dataDisposable.dispose();
+      document.removeEventListener("keydown", onDocumentKeyDown, true);
       helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
       helperTextarea?.removeEventListener("compositionupdate", onCompositionUpdate);
       helperTextarea?.removeEventListener("compositionend", onCompositionEnd);
+      terminalElement.removeEventListener("pointerdown", requestShortcutLock);
+      helperTextarea?.removeEventListener("focus", requestShortcutLock);
+      helperTextarea?.removeEventListener("blur", releaseShortcutLock);
+      unlockTerminalShortcutKeys();
       observer.disconnect();
       if (ws.readyState === WebSocket.OPEN) sendEnvelope(ws, "terminal.close", pane.sessionId!, streamId.current, {});
       ws.close();
@@ -909,9 +943,47 @@ function base64ToBytes(value: string) {
   return bytes;
 }
 
-function shouldManuallyCaptureTerminalKey(event: KeyboardEvent) {
+function shouldCaptureTerminalKey(event: KeyboardEvent) {
   if (event.isComposing || event.metaKey) return false;
-  return event.ctrlKey || event.altKey || event.key === "Tab";
+  return true;
+}
+
+function terminalHasKeyboardFocus(event: Event, element: Element | null) {
+  if (!element) return false;
+  if (event.target instanceof Node && element.contains(event.target)) return true;
+  return document.activeElement instanceof Node && element.contains(document.activeElement);
+}
+
+const terminalShortcutLockCodes = [
+  "Tab",
+  "Space",
+  "BracketLeft",
+  "BracketRight",
+  "Backslash",
+  "Minus",
+  "Digit6",
+  ...Array.from({ length: 26 }, (_, index) => `Key${String.fromCharCode(65 + index)}`),
+];
+
+type KeyboardLockNavigator = Navigator & {
+  keyboard?: {
+    lock?: (keyCodes?: string[]) => Promise<void>;
+    unlock?: () => void;
+  };
+};
+
+async function lockTerminalShortcutKeys() {
+  const keyboard = (navigator as KeyboardLockNavigator).keyboard;
+  if (!keyboard?.lock) return;
+  try {
+    await keyboard.lock(terminalShortcutLockCodes);
+  } catch {
+    // Browsers may reject keyboard lock outside secure contexts or without activation.
+  }
+}
+
+function unlockTerminalShortcutKeys() {
+  (navigator as KeyboardLockNavigator).keyboard?.unlock?.();
 }
 
 function isPrintableText(value: string) {

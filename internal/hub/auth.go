@@ -25,6 +25,14 @@ type authStore struct {
 	users       map[string]userEntry
 }
 
+type AuthStore interface {
+	MintSignal(ttl time.Duration, uses int, scopes []string) (mintedSignal, error)
+	Exchange(req exchangeRequest) (exchangedCredential, error)
+	Register(req registerRequest) (authCredentialResponse, error)
+	Login(req loginRequest) (authCredentialResponse, error)
+	Credential(token string) (credentialEntry, bool)
+}
+
 type signalEntry struct {
 	Hash          string
 	ID            string

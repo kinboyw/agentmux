@@ -192,6 +192,8 @@ func terminalTokens(data string) []string {
 			i += 4
 		default:
 			switch data[i] {
+			case 0x1b:
+				tokens = append(tokens, "Escape")
 			case '\r', '\n':
 				tokens = append(tokens, "C-m")
 			case 0x7f, '\b':
@@ -201,12 +203,32 @@ func terminalTokens(data string) []string {
 			case 0x03:
 				tokens = append(tokens, "C-c")
 			default:
+				if token := controlKeyToken(data[i]); token != "" {
+					tokens = append(tokens, token)
+					i++
+					continue
+				}
 				tokens = append(tokens, "literal:"+string(data[i]))
 			}
 			i++
 		}
 	}
 	return tokens
+}
+
+func controlKeyToken(value byte) string {
+	if value >= 0x01 && value <= 0x1a {
+		return "C-" + string(rune('a'+value-1))
+	}
+	if value >= 0x1c && value <= 0x1f {
+		return map[byte]string{
+			0x1c: `C-\`,
+			0x1d: "C-]",
+			0x1e: "C-^",
+			0x1f: "C-_",
+		}[value]
+	}
+	return ""
 }
 
 func (a Adapter) Capture(ctx context.Context, name string, lines int) (string, error) {

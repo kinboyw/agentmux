@@ -104,6 +104,49 @@ func TestSignalIncludesControlURL(t *testing.T) {
 	}
 }
 
+func TestSignalUsesConfiguredPublicURL(t *testing.T) {
+	server, err := NewWithOptions(ServerOptions{Addr: ":0", PublicURL: "https://mux.example.com/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	req.Host = "internal.local"
+	rec := httptest.NewRecorder()
+
+	server.handleSignals(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := payload["control_url"].(string); !strings.HasPrefix(got, "https://mux.example.com/control?signal=amx_sig_") {
+		t.Fatalf("unexpected control URL: %s", got)
+	}
+	if got := payload["worker_command"].(string); !strings.Contains(got, "--hub wss://mux.example.com") {
+		t.Fatalf("worker command did not use wss public URL: %s", got)
+	}
+}
+
+func TestInstallScriptEndpoint(t *testing.T) {
+	server := New(":0", "", nil)
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "agentmux.test"
+	rec := httptest.NewRecorder()
+
+	server.handleInstallScript(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "agentmux") || !strings.Contains(body, "ws://agentmux.test") {
+		t.Fatalf("unexpected install script:\n%s", body)
+	}
+}
+
 func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
 	server := New(":0", "", nil)
 	signalReq := httptest.NewRequest(http.MethodPost, "/api/signals", nil)

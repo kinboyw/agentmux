@@ -63,6 +63,51 @@ func TestAuthStoreRegisterLogin(t *testing.T) {
 	}
 }
 
+func TestSQLiteAuthStorePersistsUsersAndSignals(t *testing.T) {
+	path := t.TempDir() + "/agentmux.db"
+	store, err := OpenSQLiteAuthStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minted, err := store.MintSignal(time.Hour, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := store.Register(registerRequest{
+		Email: "persist@example.com", Password: "password123", Name: "Persist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenSQLiteAuthStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	loggedIn, err := reopened.Login(loginRequest{Email: "persist@example.com", Password: "password123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loggedIn.TenantID != registered.TenantID {
+		t.Fatalf("tenant was not persisted: got %s want %s", loggedIn.TenantID, registered.TenantID)
+	}
+	credential, err := reopened.Exchange(exchangeRequest{Signal: minted.Signal, Role: "control"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.TenantID != minted.TenantID || credential.Credential == "" {
+		t.Fatalf("unexpected persisted signal exchange: %+v", credential)
+	}
+}
+
 func TestWebSocketBase(t *testing.T) {
 	if got := websocketBase("https://hub.example.com"); got != "wss://hub.example.com" {
 		t.Fatalf("unexpected wss base: %q", got)

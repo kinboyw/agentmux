@@ -34,6 +34,17 @@ Hub is the product entrypoint.
 Hub should be deployable behind a reverse proxy with HTTPS/WSS. Later it can
 serve TLS directly.
 
+Current deployment flags:
+
+```bash
+agentmux hub --addr 127.0.0.1:8080 --data ./agentmux.db --public-url https://hub.example.com
+```
+
+- `--data` enables SQLite persistence for identity bootstrap state.
+- `--public-url` makes generated commands stable behind Cloudflare Tunnel,
+  Cloudflare Proxy, Caddy, Nginx, or another TLS terminator.
+- Without `--data`, Hub keeps the development in-memory auth store.
+
 ### Worker
 
 Worker is an outbound connector.
@@ -87,13 +98,25 @@ Deployment model:
 
 Current implementation boundary:
 
-- Registered users are stored in Hub memory.
+- Registered users can be stored in Hub memory or SQLite.
 - Password hashing is a development placeholder using standard-library SHA-256.
 - GitHub/Google OAuth routes exist and return a structured "not configured"
   response until provider config and callback handling are implemented.
 - Production auth should add persistent storage, password KDF such as Argon2id
   or external identity only, secure cookies/session rotation, CSRF protection,
   revocation, audit logs, and tenant/workspace policy enforcement.
+
+SQLite is the near-term default because it matches the one-binary deployment
+goal. For Cloudflare, the recommended first-class path is:
+
+```text
+Browser/Worker/Control -> Cloudflare HTTPS/WSS -> cloudflared tunnel -> Go Hub -> SQLite
+```
+
+Cloudflare D1 is a later option for a Workers/Pages-native control plane or an
+HTTP storage service. It is not the simplest persistence backend for the current
+Go binary because D1 is exposed inside Cloudflare Workers rather than as a local
+SQLite file.
 
 ## Onboarding Model
 
@@ -224,6 +247,11 @@ go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join amx_sig_xxx --name
 `--join` performs signal exchange and uses the returned credential as the
 runtime bearer token. `--token` remains as a local development/admin override.
 
+The current `/install.sh` endpoint is intentionally conservative: it uses an
+existing `agentmux` binary from `PATH`, or builds from source when run inside the
+repository. Release assets from GitHub Actions will later let the script fetch
+the correct OS/architecture binary automatically.
+
 ## Trust and Token Model
 
 Use three token classes:
@@ -262,12 +290,13 @@ tenant_id = org_<id>
 user_id = usr_<id>
 ```
 
-The immediate implementation can keep this in memory, but the API and data
-model should avoid assuming a single global namespace.
+The immediate implementation stores anonymous and registered tenant identity in
+memory or SQLite. Worker connectivity and terminal streams remain runtime state.
 
 ## TODO
 
-- Persist signals, credentials, tenants, workers, and audit events in SQLite.
+- Persist tenant records, workers, layouts, revocations, and audit events in
+  SQLite.
 - Add explicit scopes to every API and WebSocket route.
 - Add credential revocation and expiry cleanup.
 - Vendor xterm.js assets into Go embed; remove CDN dependency.
@@ -352,6 +381,16 @@ The Go CLI should remain a debug tool. The product-grade control should be web.
 4. Add `--join` exchange flow to worker/control CLI. Done.
 5. Add basic in-memory signal and credential stores. Done.
 6. Add browser control shell with xterm.js. Done.
-7. Vendor web assets and split static files.
-8. Persist auth/device state in SQLite.
+7. Vendor web assets and split static files. Done.
+8. Persist auth/device state in SQLite. Done for signals, credentials, users.
 9. Add headless terminal state sidecar.
+
+## Automation
+
+GitHub Actions now provide two tracks:
+
+- CI on pushes and pull requests: Go tests, Web Control build, binary build.
+- Release on `v*` tags: cross-compiled Linux, macOS, and Windows tarballs.
+
+The release build rebuilds Web Control and embeds it into `internal/hub/webdist`
+before compiling the Go binary.

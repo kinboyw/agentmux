@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Go test
+        run: go test ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/control/package-lock.json
+      - name: Install web dependencies
+        working-directory: web/control
+        run: npm ci
+      - name: Build web control
+        working-directory: web/control
+        run: npm run build
+      - name: Build agentmux
+        run: go build -o /tmp/agentmux ./cmd/agentmux

@@ -65,7 +65,7 @@ func TestSendInputSplitsNewline(t *testing.T) {
 func TestSendTerminalInputTranslatesControlKeys(t *testing.T) {
 	runner := &fakeRunner{}
 	adapter := New(runner)
-	if err := adapter.SendTerminalInput(context.Background(), "demo", "ls\r\x7f\x1b[A"); err != nil {
+	if err := adapter.SendTerminalInput(context.Background(), "demo", "ls\r\x7f\x1b[A\x14\x1b"); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]string, 0, len(runner.calls))
@@ -77,6 +77,8 @@ func TestSendTerminalInputTranslatesControlKeys(t *testing.T) {
 		"send-keys -t demo C-m",
 		"send-keys -t demo BSpace",
 		"send-keys -t demo Up",
+		"send-keys -t demo C-t",
+		"send-keys -t demo Escape",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("unexpected calls:\n%s", strings.Join(got, "\n"))

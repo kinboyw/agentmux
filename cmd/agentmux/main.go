@@ -43,8 +43,27 @@ func runHub(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("hub", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8080", "HTTP listen address")
 	token := fs.String("token", os.Getenv("AGENTMUX_TOKEN"), "shared auth token")
+	data := fs.String("data", os.Getenv("AGENTMUX_DATA"), "SQLite database path for persistent hub state")
+	publicURL := fs.String("public-url", os.Getenv("AGENTMUX_PUBLIC_URL"), "external hub URL used for generated HTTPS/WSS commands")
 	_ = fs.Parse(args)
-	server := hub.New(*addr, *token, slog.Default())
+	var authStore hub.AuthStore
+	if *data != "" {
+		store, err := hub.OpenSQLiteAuthStore(*data)
+		if err != nil {
+			fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				slog.Default().Warn("close sqlite store failed", "error", err)
+			}
+		}()
+		authStore = store
+		slog.Default().Info("hub persistence enabled", "data", *data)
+	}
+	server, err := hub.NewWithOptions(hub.ServerOptions{Addr: *addr, Token: *token, PublicURL: *publicURL, Logger: slog.Default(), AuthStore: authStore})
+	if err != nil {
+		fatal(err)
+	}
 	if err := server.ListenAndServe(ctx); err != nil {
 		fatal(err)
 	}

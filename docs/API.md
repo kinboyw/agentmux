@@ -31,6 +31,30 @@ The page uses the same HTTP and WebSocket APIs documented below. Its session
 status bar lives outside the terminal buffer, so remote full-screen TUIs and
 local shell history do not share terminal state.
 
+### `GET /`
+
+Serves the Hub landing page. The page is intentionally operational: it can mint
+signals, display worker/control commands, and link directly into Web Control.
+
+### `GET /install.sh`
+
+Serves a small bootstrap script used by the landing page.
+
+Worker mode:
+
+```bash
+curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_...' --name "$(hostname)"
+```
+
+Control mode:
+
+```bash
+curl -fsSL https://hub.example.com/install.sh | sh -s -- control --join 'amx_sig_...'
+```
+
+Until release binaries are published, the script expects either `agentmux` to
+already be in `PATH` or to be run from a source checkout with Go available.
+
 ### `GET /health`
 
 Returns hub liveness.
@@ -64,6 +88,10 @@ Response:
 ```
 
 `POST /api/join-tokens` remains as a compatibility alias for now.
+
+If the Hub is started with `--public-url https://hub.example.com`, generated
+commands and `control_url` use that URL instead of request-local host headers.
+This is the recommended mode behind Cloudflare Tunnel or another reverse proxy.
 
 ### `POST /api/exchange`
 
@@ -252,6 +280,30 @@ The payload includes the current terminal size:
 ```json
 {"cols":120,"rows":36}
 ```
+
+## Persistence Boundary
+
+SQLite persistence is enabled by:
+
+```bash
+agentmux hub --data ./agentmux.db
+```
+
+Persisted:
+
+- anonymous signals
+- exchanged credentials
+- registered users
+
+Runtime-only:
+
+- currently connected workers
+- active WebSocket streams
+- live session snapshots
+
+Workers reconnect and resubmit snapshots after a Hub restart. This keeps SQLite
+as the durable identity/policy store while tmux remains the source of terminal
+truth on each worker.
 
 ### `control.input`
 
