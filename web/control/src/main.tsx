@@ -591,18 +591,16 @@ function TerminalPane({
       }
     });
     ws.addEventListener("close", () => setStatus({ tone: "warn", title: `Detached ${pane.sessionId}`, detail: "The browser stream closed." }));
-    term.onData((data) => sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data }));
-    const keyHandler = (event: KeyboardEvent) => {
-      if (!terminalRef.current || !terminalRef.current.contains(event.target as Node)) return;
-      if (!shouldManuallyCaptureTerminalKey(event)) return;
+    const dataDisposable = term.onData((data) => sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data }));
+    term.attachCustomKeyEventHandler((event) => {
+      if (!shouldManuallyCaptureTerminalKey(event)) return true;
       const data = encodeKeyEvent(event);
-      if (!data) return;
+      if (!data) return true;
       event.preventDefault();
       event.stopPropagation();
-      event.stopImmediatePropagation();
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
-    };
-    document.addEventListener("keydown", keyHandler, true);
+      return false;
+    });
 
     const observer = new ResizeObserver(() => {
       scheduleFit();
@@ -610,7 +608,7 @@ function TerminalPane({
     observer.observe(terminalRef.current);
 
     return () => {
-      document.removeEventListener("keydown", keyHandler, true);
+      dataDisposable.dispose();
       observer.disconnect();
       if (ws.readyState === WebSocket.OPEN) sendEnvelope(ws, "terminal.close", pane.sessionId!, streamId.current, {});
       ws.close();
@@ -953,7 +951,5 @@ function errorDetail(text: string) {
 }
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
+  <App />,
 );
