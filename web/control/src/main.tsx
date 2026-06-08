@@ -489,7 +489,7 @@ function LayoutRenderer({
               )}
             />
           ) : null}
-          <Panel minSize={15}>
+          <Panel minSize={15} className="min-h-0 min-w-0 overflow-hidden">
             <LayoutRenderer
               node={child}
               activePane={activePane}
@@ -537,6 +537,7 @@ function TerminalPane({
   const fit = React.useRef<FitAddon | null>(null);
   const socket = React.useRef<WebSocket | null>(null);
   const streamId = React.useRef("");
+  const lastSize = React.useRef({ cols: 0, rows: 0 });
 
   React.useEffect(() => {
     if (!pane.sessionId || !terminalRef.current) return;
@@ -553,17 +554,42 @@ function TerminalPane({
     term.open(terminalRef.current);
     terminal.current = term;
     fit.current = fitAddon;
-    fitAddon.fit();
     term.focus();
 
     streamId.current = makeStreamId(pane.sessionId);
     const ws = new WebSocket(`${wsBaseFromLocation()}/ws/control?token=${encodeURIComponent(token)}`);
     socket.current = ws;
 
-    ws.addEventListener("open", () => {
+    const fitTerminal = () => {
+      if (!terminalRef.current) return;
+      const rect = terminalRef.current.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 20) return;
       fitAddon.fit();
-      sendEnvelope(ws, "control.open", pane.sessionId!, streamId.current, { cols: term.cols, rows: term.rows });
+      return { cols: term.cols, rows: term.rows };
+    };
+    const fitAndSendResize = () => {
+      const size = fitTerminal();
+      if (!size) return;
+      if (term.cols === lastSize.current.cols && term.rows === lastSize.current.rows) return;
+      lastSize.current = size;
+      if (ws.readyState === WebSocket.OPEN) {
+        sendEnvelope(ws, "terminal.resize", pane.sessionId!, streamId.current, size);
+      }
+    };
+    const scheduleFit = () => {
+      requestAnimationFrame(() => {
+        fitAndSendResize();
+        requestAnimationFrame(fitAndSendResize);
+      });
+    };
+    scheduleFit();
+
+    ws.addEventListener("open", () => {
+      const size = fitTerminal();
+      sendEnvelope(ws, "control.open", pane.sessionId!, streamId.current, size || { cols: term.cols, rows: term.rows });
+      if (size) lastSize.current = size;
       setStatus({ tone: "ok", title: `Attached ${pane.sessionId}`, detail: streamId.current });
+      scheduleFit();
     });
     ws.addEventListener("message", (event) => {
       const env = JSON.parse(event.data);
@@ -591,10 +617,7 @@ function TerminalPane({
     document.addEventListener("keydown", keyHandler, true);
 
     const observer = new ResizeObserver(() => {
-      fitAddon.fit();
-      if (ws.readyState === WebSocket.OPEN) {
-        sendEnvelope(ws, "terminal.resize", pane.sessionId!, streamId.current, { cols: term.cols, rows: term.rows });
-      }
+      scheduleFit();
     });
     observer.observe(terminalRef.current);
 
@@ -612,7 +635,7 @@ function TerminalPane({
 
   return (
     <div
-      className={cn("relative flex h-full min-h-0 flex-col border-l border-transparent bg-[#050607]", active && "border-l-primary")}
+      className={cn("relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
       onMouseDown={onFocus}
       onDragOver={(event) => {
         const payload = readDragPayload(event);
@@ -678,9 +701,9 @@ function TerminalPane({
           </Button>
         </div>
       </div>
-      <div className="min-h-0 flex-1 p-2">
+      <div className="min-h-0 min-w-0 flex-1 overflow-hidden p-2">
         {pane.sessionId ? (
-          <div ref={terminalRef} className="h-full w-full" />
+          <div ref={terminalRef} className="h-full w-full min-w-0 overflow-hidden" />
         ) : (
           <Card className="grid h-full place-items-center border-dashed bg-background">
             <div className="text-center text-sm text-muted-foreground">Select a session from the sidebar.</div>

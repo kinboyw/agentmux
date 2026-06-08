@@ -41,5 +41,18 @@ body {
 
 .xterm {
   height: 100%;
+  min-width: 0;
+  overflow: hidden;
   width: 100%;
+}
+
+.xterm .xterm-viewport,
+.xterm .xterm-screen,
+.xterm .xterm-helpers,
+.xterm .xterm-helper-textarea {
+  max-width: 100%;
+}
+
+.xterm .xterm-screen {
+  overflow: hidden;
 }
