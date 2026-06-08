@@ -1,8 +1,10 @@
 package hub
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -26,5 +28,46 @@ func TestAuthorized(t *testing.T) {
 func TestRemoteHost(t *testing.T) {
 	if got := remoteHost("127.0.0.1:1234"); got != "127.0.0.1" {
 		t.Fatalf("unexpected host: %q", got)
+	}
+}
+
+func TestHandleControlPage(t *testing.T) {
+	server := New(":0", "secret", nil)
+	req := httptest.NewRequest(http.MethodGet, "/control?token=secret", nil)
+	req.Host = "agentmux.test"
+	rec := httptest.NewRecorder()
+
+	server.handleControlPage(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "AgentMux Control") {
+		t.Fatalf("control page title missing: %s", body)
+	}
+	if !strings.Contains(body, "http://agentmux.test") {
+		t.Fatalf("base URL missing: %s", body)
+	}
+}
+
+func TestJoinTokenIncludesControlURL(t *testing.T) {
+	server := New(":0", "", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/join-tokens", nil)
+	req.Host = "agentmux.test"
+	rec := httptest.NewRecorder()
+
+	server.handleJoinTokens(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	controlURL, ok := payload["control_url"].(string)
+	if !ok || !strings.HasPrefix(controlURL, "http://agentmux.test/control?token=amx_join_") {
+		t.Fatalf("unexpected control_url: %#v", payload["control_url"])
 	}
 }

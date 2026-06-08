@@ -6,6 +6,7 @@ It is designed as one Go binary with three roles:
 - `hub`: public HTTPS/WSS entrypoint and routing layer.
 - `worker`: outbound connector that manages local tmux sessions.
 - `control`: CLI client for listing, creating, attaching, and sending input.
+  The product control surface is the hub-hosted browser page at `/control`.
 
 The agent is intentionally unaware of AgentMux. Codex, Claude, Gemini, OpenCode,
 or a shell simply run inside tmux. Worker observes and controls tmux.
@@ -25,6 +26,15 @@ This starts one tmux session named `agentmux-dev` with one window and three pane
 - `control`
 
 The default port is `8081` and the default token is `dev-token`.
+
+Browser control:
+
+```text
+http://127.0.0.1:8081/control?token=dev-token
+```
+
+The browser UI uses xterm.js for the terminal area and keeps session identity,
+connection state, and detach controls outside the remote terminal buffer.
 
 Terminal 1:
 

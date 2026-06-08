@@ -17,12 +17,45 @@ WebSocket endpoints accept either the same Authorization header or:
 
 ## HTTP API
 
+### `GET /control`
+
+Serves the browser control shell. Pass a shared token or short-lived join token
+as a query parameter for quick local use:
+
+```text
+http://127.0.0.1:8081/control?token=<token>
+```
+
+The page uses the same HTTP and WebSocket APIs documented below. Its session
+status bar lives outside the terminal buffer, so remote full-screen TUIs and
+local shell history do not share terminal state.
+
 ### `GET /health`
 
 Returns hub liveness.
 
 ```json
 {"status":"ok"}
+```
+
+### `POST /api/join-tokens`
+
+Mints a short-lived prototype join token. The landing page calls this endpoint
+without authentication.
+
+Response:
+
+```json
+{
+  "token": "amx_join_...",
+  "expires_at": "2026-06-08T12:10:00Z",
+  "uses_remaining": 2,
+  "reusable": true,
+  "scopes": ["worker:join", "control:join"],
+  "worker_command": "go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join 'amx_join_...' --name $(hostname)",
+  "control_command": "go run ./cmd/agentmux control list --hub http://127.0.0.1:8081 --join 'amx_join_...'",
+  "control_url": "http://127.0.0.1:8081/control?token=amx_join_..."
+}
 ```
 
 ### `GET /api/workers`

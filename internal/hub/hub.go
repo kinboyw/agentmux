@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,7 @@ func New(addr, token string, logger *slog.Logger) *Server {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleLanding)
+	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/join-tokens", s.handleJoinTokens)
 	mux.HandleFunc("/api/workers", s.requireAuth(s.handleWorkers))
@@ -101,6 +103,20 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	_ = landingTemplate.Execute(w, data)
 }
 
+func (s *Server) handleControlPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	baseURL := requestBaseURL(r)
+	data := controlPageData{
+		BaseURL: baseURL,
+		WSURL:   websocketBase(baseURL),
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = controlTemplate.Execute(w, data)
+}
+
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -120,6 +136,7 @@ func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
 		"scopes":          minted.Scopes,
 		"worker_command":  installWorkerCommand(baseURL, minted.Token),
 		"control_command": installControlCommand(baseURL, minted.Token),
+		"control_url":     controlPageURL(baseURL, minted.Token),
 	})
 }
 
@@ -528,6 +545,11 @@ type landingData struct {
 	WSURL   string
 }
 
+type controlPageData struct {
+	BaseURL string
+	WSURL   string
+}
+
 func requestBaseURL(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
@@ -538,6 +560,17 @@ func requestBaseURL(r *http.Request) string {
 		host = forwardedHost
 	}
 	return scheme + "://" + host
+}
+
+func controlPageURL(baseURL string, token string) string {
+	u, err := url.Parse(baseURL + "/control")
+	if err != nil {
+		return baseURL + "/control"
+	}
+	q := u.Query()
+	q.Set("token", token)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html>
@@ -582,6 +615,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       result.innerHTML =
         '<p><strong>Join token</strong><br><code>' + escapeHTML(data.token) + '</code></p>' +
         '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Prototype tokens are reusable until expiry.</p>' +
+        '<p><strong>Web Control</strong><br><a href="' + escapeAttr(data.control_url) + '">' + escapeHTML(data.control_url) + '</a></p>' +
         '<p><strong>Worker</strong></p>' +
         '<pre>' + escapeHTML(data.worker_command) + '</pre>' +
         '<p><strong>Control</strong></p>' +
@@ -589,6 +623,401 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     });
     function escapeHTML(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function escapeAttr(value) {
+      return escapeHTML(value);
+    }
+  </script>
+</body>
+</html>`))
+
+var controlTemplate = template.Must(template.New("control").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentMux Control</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm/css/xterm.css">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111315;
+      --panel: #181b1f;
+      --panel-2: #20252a;
+      --line: #343a40;
+      --text: #eef2f3;
+      --muted: #a8b0b8;
+      --accent: #35c98f;
+      --warn: #f2b84b;
+      --danger: #ff6b6b;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; background: var(--bg); color: var(--text); overflow: hidden; }
+    button, input, select { font: inherit; }
+    button {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 7px 10px;
+      cursor: pointer;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #07130e; font-weight: 650; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    input, select {
+      min-height: 34px;
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0d0f11;
+      color: var(--text);
+      padding: 7px 9px;
+    }
+    .app { display: grid; grid-template-columns: 320px minmax(0, 1fr); height: 100vh; min-height: 0; }
+    .sidebar { border-right: 1px solid var(--line); background: var(--panel); min-height: 0; display: flex; flex-direction: column; }
+    .brand { padding: 14px 14px 12px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .brand h1 { margin: 0; font-size: 16px; line-height: 1.2; letter-spacing: 0; }
+    .token { padding: 12px 14px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; }
+    .token label, .create label { font-size: 12px; color: var(--muted); }
+    .sessions { min-height: 0; overflow: auto; padding: 8px; }
+    .session {
+      width: 100%;
+      text-align: left;
+      display: grid;
+      gap: 3px;
+      margin-bottom: 6px;
+      background: transparent;
+      border-color: transparent;
+    }
+    .session:hover, .session.active { background: var(--panel-2); border-color: var(--line); }
+    .session strong { font-size: 13px; overflow-wrap: anywhere; }
+    .session span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .create { border-top: 1px solid var(--line); padding: 12px 14px 14px; display: grid; gap: 8px; }
+    .create .row { display: grid; gap: 6px; }
+    .terminal-shell { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+    .status {
+      min-height: 44px;
+      border-bottom: 1px solid var(--line);
+      background: #15181b;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 12px;
+    }
+    .status-main { min-width: 0; display: grid; gap: 2px; }
+    .status-title { font-size: 13px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+    .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--muted); }
+    .dot.ok { background: var(--accent); }
+    .dot.warn { background: var(--warn); }
+    .dot.err { background: var(--danger); }
+    .terminal-wrap { min-width: 0; min-height: 0; padding: 8px; background: #050607; }
+    #terminal { width: 100%; height: 100%; }
+    .empty {
+      height: 100%;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      border: 1px dashed #30363d;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    @media (max-width: 860px) {
+      .app { grid-template-columns: 1fr; grid-template-rows: 42vh minmax(0, 1fr); }
+      .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+      .create { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>AgentMux Control</h1>
+        <button id="refresh" title="Refresh sessions">Refresh</button>
+      </div>
+      <div class="token">
+        <label for="token">Token</label>
+        <input id="token" autocomplete="off" spellcheck="false" placeholder="amx_join_... or shared token">
+      </div>
+      <div id="sessions" class="sessions"></div>
+      <form id="create" class="create">
+        <div class="row">
+          <label for="worker">Worker</label>
+          <select id="worker"></select>
+        </div>
+        <div class="row">
+          <label for="name">Session</label>
+          <input id="name" value="demo" autocomplete="off">
+        </div>
+        <div class="row">
+          <label for="cwd">Working directory</label>
+          <input id="cwd" value=".">
+        </div>
+        <div class="row">
+          <label for="command">Command</label>
+          <input id="command" value="bash">
+        </div>
+        <button class="primary" type="submit">Create Session</button>
+      </form>
+    </aside>
+    <main class="terminal-shell">
+      <header class="status">
+        <div class="status-main">
+          <div id="statusTitle" class="status-title">No session attached</div>
+          <div id="statusSub" class="status-sub">Hub {{.BaseURL}}</div>
+        </div>
+        <div class="status-actions">
+          <span class="badge"><span id="dot" class="dot"></span><span id="state">idle</span></span>
+          <button id="detach" disabled>Detach</button>
+        </div>
+      </header>
+      <section class="terminal-wrap">
+        <div id="terminal"><div class="empty">Select or create a session.</div></div>
+      </section>
+    </main>
+  </div>
+  <script type="module">
+    import { Terminal } from 'https://cdn.jsdelivr.net/npm/@xterm/xterm/+esm';
+    import { FitAddon } from 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit/+esm';
+
+    const hubBase = '{{.BaseURL}}';
+    const wsBase = '{{.WSURL}}';
+    const tokenInput = document.getElementById('token');
+    const sessionsEl = document.getElementById('sessions');
+    const workerSelect = document.getElementById('worker');
+    const terminalEl = document.getElementById('terminal');
+    const statusTitle = document.getElementById('statusTitle');
+    const statusSub = document.getElementById('statusSub');
+    const stateEl = document.getElementById('state');
+    const dotEl = document.getElementById('dot');
+    const detachButton = document.getElementById('detach');
+
+    let sessions = [];
+    let workers = [];
+    let activeSession = '';
+    let term = null;
+    let fit = null;
+    let socket = null;
+    let streamId = '';
+    let resizeTimer = 0;
+
+    const initialToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('agentmux.token') || '';
+    tokenInput.value = initialToken;
+    if (initialToken) refreshAll();
+
+    tokenInput.addEventListener('change', () => {
+      localStorage.setItem('agentmux.token', tokenInput.value.trim());
+      refreshAll();
+    });
+    document.getElementById('refresh').addEventListener('click', refreshAll);
+    detachButton.addEventListener('click', detach);
+    window.addEventListener('beforeunload', detach);
+
+    document.getElementById('create').addEventListener('submit', async event => {
+      event.preventDefault();
+      const workerID = workerSelect.value;
+      if (!workerID) {
+        setStatus('No worker selected', 'Connect a worker before creating a session.', 'err');
+        return;
+      }
+      const payload = {
+        worker_id: workerID,
+        name: document.getElementById('name').value.trim(),
+        cwd: document.getElementById('cwd').value.trim() || '.',
+        command: document.getElementById('command').value.trim() || 'bash'
+      };
+      const res = await apiFetch('/api/sessions', { method: 'POST', body: JSON.stringify(payload) });
+      if (!res.ok) {
+        setStatus('Create failed', await res.text(), 'err');
+        return;
+      }
+      setStatus('Create queued', workerID + '/' + payload.name, 'warn');
+      setTimeout(refreshAll, 700);
+    });
+
+    async function refreshAll() {
+      localStorage.setItem('agentmux.token', tokenInput.value.trim());
+      await Promise.all([loadWorkers(), loadSessions()]);
+    }
+
+    async function loadWorkers() {
+      const res = await apiFetch('/api/workers');
+      if (!res.ok) {
+        workerSelect.innerHTML = '';
+        setStatus('Unauthorized or hub unavailable', await res.text(), 'err');
+        return;
+      }
+      const data = await res.json();
+      workers = data.workers || [];
+      workerSelect.innerHTML = workers.map(worker => '<option value="' + escapeAttr(worker.id) + '">' + escapeHTML(worker.id) + '</option>').join('');
+    }
+
+    async function loadSessions() {
+      const res = await apiFetch('/api/sessions');
+      if (!res.ok) {
+        sessionsEl.innerHTML = '<div class="session"><span>' + escapeHTML(await res.text()) + '</span></div>';
+        return;
+      }
+      const data = await res.json();
+      sessions = data.sessions || [];
+      renderSessions();
+      if (!activeSession) {
+        setStatus('No session attached', sessions.length ? 'Select a session from the left.' : 'No sessions reported by workers.', sessions.length ? 'warn' : '');
+      }
+    }
+
+    function renderSessions() {
+      if (!sessions.length) {
+        sessionsEl.innerHTML = '<div class="session"><span>No sessions.</span></div>';
+        return;
+      }
+      sessionsEl.innerHTML = sessions.map(session => {
+        const active = session.id === activeSession ? ' active' : '';
+        return '<button class="session' + active + '" data-id="' + escapeAttr(session.id) + '">' +
+          '<strong>' + escapeHTML(session.id) + '</strong>' +
+          '<span>' + escapeHTML(session.command || '') + ' · ' + escapeHTML(session.status || 'unknown') + '</span>' +
+          '<span>' + escapeHTML(session.cwd || '') + '</span>' +
+          '</button>';
+      }).join('');
+      sessionsEl.querySelectorAll('button[data-id]').forEach(button => {
+        button.addEventListener('click', () => attach(button.dataset.id));
+      });
+    }
+
+    async function attach(sessionID) {
+      detach();
+      activeSession = sessionID;
+      renderSessions();
+      terminalEl.innerHTML = '';
+      term = new Terminal({
+        cursorBlink: true,
+        convertEol: false,
+        scrollback: 5000,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        fontSize: 14,
+        theme: { background: '#050607', foreground: '#eef2f3', cursor: '#35c98f' }
+      });
+      fit = new FitAddon();
+      term.loadAddon(fit);
+      term.open(terminalEl);
+      fit.fit();
+      term.focus();
+      streamId = makeStreamID(sessionID);
+      const wsURL = wsBase + '/ws/control?token=' + encodeURIComponent(tokenInput.value.trim());
+      socket = new WebSocket(wsURL);
+      setStatus('Connecting ' + sessionID, 'Opening remote PTY stream.', 'warn');
+      detachButton.disabled = false;
+
+      socket.addEventListener('open', () => {
+        sendEnvelope('control.open', sessionID, { cols: term.cols, rows: term.rows });
+        setStatus('Attached ' + sessionID, 'stream ' + streamId, 'ok');
+      });
+      socket.addEventListener('message', event => handleMessage(event.data));
+      socket.addEventListener('close', () => {
+        detachButton.disabled = true;
+        if (activeSession === sessionID) setStatus('Detached ' + sessionID, 'The browser control stream is closed.', 'warn');
+      });
+      socket.addEventListener('error', () => setStatus('WebSocket error', sessionID, 'err'));
+
+      term.onData(data => sendEnvelope('control.input', sessionID, { data }));
+      window.addEventListener('resize', scheduleResize);
+      scheduleResize();
+    }
+
+    function handleMessage(raw) {
+      let env;
+      try {
+        env = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (env.type === 'terminal.output' && term) {
+        const payload = env.payload || {};
+        if (payload.encoding === 'base64') {
+          term.write(base64ToBytes(payload.data || ''));
+        } else {
+          term.write(payload.data || '');
+        }
+      } else if (env.type === 'error') {
+        const message = (env.payload && env.payload.message) || 'unknown error';
+        setStatus('Remote error', message, 'err');
+        if (term) term.write('\r\n[agentmux] ' + message + '\r\n');
+      }
+    }
+
+    function scheduleResize() {
+      if (!term || !fit) return;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        fit.fit();
+        sendEnvelope('terminal.resize', activeSession, { cols: term.cols, rows: term.rows });
+      }, 80);
+    }
+
+    function detach() {
+      const previousSession = activeSession;
+      window.removeEventListener('resize', scheduleResize);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        sendEnvelope('terminal.close', activeSession, {});
+      }
+      if (socket) socket.close();
+      socket = null;
+      streamId = '';
+      detachButton.disabled = true;
+      if (term) {
+        term.dispose();
+        term = null;
+        fit = null;
+      }
+      activeSession = '';
+      renderSessions();
+      if (previousSession) setStatus('Detached ' + previousSession, 'The browser control stream is closed.', 'warn');
+      terminalEl.innerHTML = '<div class="empty">Select or create a session.</div>';
+    }
+
+    function sendEnvelope(type, sessionID, payload) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type, session_id: sessionID, stream_id: streamId, payload }));
+    }
+
+    async function apiFetch(path, options = {}) {
+      const headers = new Headers(options.headers || {});
+      headers.set('Authorization', 'Bearer ' + tokenInput.value.trim());
+      if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      return fetch(hubBase + path, { ...options, headers });
+    }
+
+    function setStatus(title, subtitle, state) {
+      statusTitle.textContent = title;
+      statusSub.textContent = subtitle || ('Hub ' + hubBase);
+      stateEl.textContent = state || 'idle';
+      dotEl.className = 'dot' + (state ? ' ' + state : '');
+    }
+
+    function makeStreamID(sessionID) {
+      const id = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2);
+      return 'web-' + Date.now() + '-' + id + '|' + sessionID + '|';
+    }
+
+    function base64ToBytes(value) {
+      const text = atob(value);
+      const bytes = new Uint8Array(text.length);
+      for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+      return bytes;
+    }
+
+    function escapeHTML(value) {
+      return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function escapeAttr(value) {
+      return escapeHTML(value);
     }
   </script>
 </body>
