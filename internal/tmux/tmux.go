@@ -212,7 +212,7 @@ func (a Adapter) Capture(ctx context.Context, name string, lines int) (string, e
 	if lines <= 0 {
 		lines = 200
 	}
-	output, err := a.Runner.Run(ctx, "tmux", "capture-pane", "-t", name, "-p", "-S", "-"+strconv.Itoa(lines))
+	output, err := a.Runner.Run(ctx, "tmux", "capture-pane", "-t", name, "-p", "-e", "-S", "-"+strconv.Itoa(lines))
 	if err != nil {
 		return "", fmt.Errorf("tmux capture-pane: %w", err)
 	}

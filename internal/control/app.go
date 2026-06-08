@@ -29,6 +29,7 @@ type App struct {
 	preview  string
 
 	rawRestore func()
+	keys       appKeyReader
 }
 
 func NewApp(client Client, auth AppAuthResult, in *os.File, out io.Writer) *App {
@@ -47,6 +48,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	defer a.disableRaw()
 	term.EnterAlternateScreen(a.Out)
+	clear(a.Out)
 	defer func() {
 		term.ResetModes(a.Out)
 		term.ExitAlternateScreen(a.Out)
@@ -55,7 +57,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.refresh(ctx)
 	a.render()
 	for {
-		key, err := readAppKey(a.In)
+		key, err := a.keys.Read(a.In)
 		if err != nil {
 			return err
 		}
@@ -211,7 +213,9 @@ func (a *App) attach(ctx context.Context) error {
 	term.ResetModes(a.Out)
 	term.ExitAlternateScreen(a.Out)
 	err := a.Client.Attach(ctx, session.ID, a.In, a.Out)
+	term.ResetModes(a.Out)
 	term.EnterAlternateScreen(a.Out)
+	a.keys.Reset()
 	if rawErr := a.enableRaw(); rawErr != nil && err == nil {
 		err = rawErr
 	}
@@ -227,78 +231,98 @@ func (a *App) render() {
 	if err != nil {
 		cols, rows = 120, 36
 	}
+	a.renderWithSize(cols, rows)
+}
+
+func (a *App) renderWithSize(cols, rows int) {
 	clear(a.Out)
-	writeLine(a.Out, cols, styleTitle("AgentMux Control"))
 	source := a.Auth.Source
 	if source == "" {
 		source = "unknown"
 	}
-	meta := fmt.Sprintf("hub=%s auth=%s", a.Client.HubURL, source)
+	meta := fmt.Sprintf("%s  hub=%s  auth=%s", styleTitle("AgentMux"), a.Client.HubURL, source)
 	if a.Auth.TenantID != "" {
-		meta += " tenant=" + a.Auth.TenantID
+		meta += "  tenant=" + a.Auth.TenantID
 	}
-	writeLine(a.Out, cols, styleMuted(meta))
-	writeLine(a.Out, cols, styleMuted(strings.Repeat("-", min(cols, 100))))
-	workerSummary := styleHeader("Workers") + " "
+	writeLine(a.Out, cols, meta)
+	workerSummary := styleHeader("Workers") + ": "
 	if len(a.workers) == 0 {
 		workerSummary += styleMuted("none")
 	} else {
 		parts := make([]string, 0, len(a.workers))
 		for _, worker := range a.workers {
-			parts = append(parts, styleOK("●")+" "+worker.ID+styleMuted("("+worker.Name+")"))
+			parts = append(parts, styleOK("*")+" "+worker.ID+styleMuted("("+worker.Name+")"))
 		}
 		workerSummary += strings.Join(parts, ", ")
 	}
 	writeLine(a.Out, cols, workerSummary)
-	writeLine(a.Out, cols, "")
 	listWidth := cols
 	previewWidth := 0
 	if cols >= 100 {
-		listWidth = cols / 2
+		listWidth = min(max(38, cols*2/5), 48)
 		previewWidth = cols - listWidth - 3
 	}
-	writeLine(a.Out, cols, styleHeader("Sessions")+previewTitle(previewWidth))
-	limit := rows - 12
+	writeLine(a.Out, cols, styleHeader("Sessions")+previewTitle(listWidth, previewWidth))
+	limit := rows - 7
 	if limit < 4 {
 		limit = 4
 	}
 	start := scrollStart(a.selected, limit, len(a.sessions))
 	previewLines := splitPreviewLines(a.preview, limit)
-	for row := 0; row < limit; row++ {
-		sessionIndex := start + row
-		left := ""
-		if len(a.sessions) == 0 && row == 0 {
-			left = "  " + styleMuted("no sessions")
-		} else if sessionIndex < len(a.sessions) {
-			session := a.sessions[sessionIndex]
-			prefix := "  "
-			if sessionIndex == a.selected {
-				prefix = styleAccent("▶ ")
-			}
-			status := styleStatus(session.Status)
-			left = fmt.Sprintf("%s%-28s %-18s %-18s %s", prefix, session.ID, status, session.Command, styleMuted(session.CWD))
+	bodyStart := 4
+	if previewWidth > 0 {
+		a.renderSplitRows(bodyStart, limit, listWidth, previewWidth, start, previewLines)
+		moveCursor(a.Out, bodyStart+limit, 1)
+	} else {
+		for row := 0; row < limit; row++ {
+			sessionIndex := start + row
+			left := a.sessionListLine(row, sessionIndex, false)
+			writeLine(a.Out, cols, left)
 		}
-		line := left
-		if previewWidth > 0 {
-			right := previewLine(previewLines, row)
-			if len(a.preview) == 0 && row == 0 && len(a.sessions) > 0 {
-				right = styleMuted("no preview")
-			}
-			line = padVisible(left, listWidth) + styleMuted(" │ ") + right
-		}
-		writeLine(a.Out, cols, line)
 	}
-	writeLine(a.Out, cols, "")
 	selected := a.selectedSession()
+	footer := styleMuted("Status: ") + a.status
 	if selected.ID != "" {
-		writeLine(a.Out, cols, styleHeader("Selected")+" "+selected.ID+styleMuted("  worker="+selected.WorkerID+"  cwd="+selected.CWD))
+		footer += styleMuted("  |  ") + styleHeader("Selected ") + selected.ID
 	}
 	if a.err != nil {
-		writeLine(a.Out, cols, styleError("Error: "+a.err.Error()))
+		footer += styleMuted("  |  ") + styleError(a.err.Error())
 	}
-	writeLine(a.Out, cols, styleMuted("Status: ")+a.status)
-	writeLine(a.Out, cols, "")
-	writeLine(a.Out, cols, styleMuted("[Enter/a] attach  [c] create  [s] send  [x] stop  [r] refresh  [?] help  [q] quit"))
+	writeLine(a.Out, cols, footer)
+	writeLine(a.Out, cols, styleMuted("Enter/a attach  c create  s send  x stop  r refresh  ? help  q quit"))
+}
+
+func (a *App) renderSplitRows(bodyStart, limit, listWidth, previewWidth, start int, previewLines []string) {
+	for row := 0; row < limit; row++ {
+		screenRow := bodyStart + row
+		sessionIndex := start + row
+		left := a.sessionListLine(row, sessionIndex, true)
+		right := previewLine(previewLines, row)
+		if len(a.preview) == 0 && row == 0 && len(a.sessions) > 0 {
+			right = styleMuted("no preview")
+		}
+		writeAt(a.Out, screenRow, listWidth+4, truncateVisible(right, previewWidth))
+		writeAt(a.Out, screenRow, listWidth+1, " | ")
+		writeAt(a.Out, screenRow, 1, padPlain(left, listWidth))
+	}
+}
+
+func (a *App) sessionListLine(row, sessionIndex int, compact bool) string {
+	if len(a.sessions) == 0 && row == 0 {
+		return "  no sessions"
+	}
+	if sessionIndex >= len(a.sessions) {
+		return ""
+	}
+	session := a.sessions[sessionIndex]
+	prefix := "  "
+	if sessionIndex == a.selected {
+		prefix = "> "
+	}
+	if compact {
+		return compactSessionLine(prefix, session)
+	}
+	return fullSessionLine(prefix, session, styleStatus(session.Status))
 }
 
 func (a *App) promptLine(label, fallback string) string {
@@ -369,6 +393,20 @@ func (a *App) clampSelection() {
 }
 
 func readAppKey(in io.Reader) (string, error) {
+	var reader appKeyReader
+	return reader.Read(in)
+}
+
+type appKeyReader struct {
+	pending []byte
+}
+
+func (r *appKeyReader) Read(in io.Reader) (string, error) {
+	if len(r.pending) > 0 {
+		b := r.pending[0]
+		r.pending = r.pending[1:]
+		return keyFromByte(b), nil
+	}
 	var b [1]byte
 	for {
 		n, err := in.Read(b[:])
@@ -380,12 +418,21 @@ func readAppKey(in io.Reader) (string, error) {
 		}
 	}
 	switch b[0] {
-	case '\r', '\n':
-		return "enter", nil
 	case 0x1b:
-		var seq [2]byte
-		n, _ := in.Read(seq[:])
-		if n == 2 && seq[0] == '[' {
+		seq := make([]byte, 0, 2)
+		var next [1]byte
+		for len(seq) < 2 {
+			n, err := in.Read(next[:])
+			if n > 0 {
+				seq = append(seq, next[0])
+				continue
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return "", err
+			}
+			break
+		}
+		if len(seq) == 2 && (seq[0] == '[' || seq[0] == 'O') {
 			switch seq[1] {
 			case 'A':
 				return "up", nil
@@ -393,14 +440,45 @@ func readAppKey(in io.Reader) (string, error) {
 				return "down", nil
 			}
 		}
+		if len(seq) > 0 {
+			r.pending = append(r.pending, seq...)
+		}
 		return "unknown", nil
 	default:
-		return string(b[0]), nil
+		return keyFromByte(b[0]), nil
+	}
+}
+
+func (r *appKeyReader) Reset() {
+	r.pending = nil
+}
+
+func keyFromByte(b byte) string {
+	switch b {
+	case '\r', '\n':
+		return "enter"
+	default:
+		return string(b)
 	}
 }
 
 func clear(out io.Writer) {
 	_, _ = io.WriteString(out, "\x1b[H\x1b[2J")
+}
+
+func moveCursor(out io.Writer, row, col int) {
+	if row < 1 {
+		row = 1
+	}
+	if col < 1 {
+		col = 1
+	}
+	_, _ = fmt.Fprintf(out, "\x1b[%d;%dH", row, col)
+}
+
+func writeAt(out io.Writer, row, col int, value string) {
+	moveCursor(out, row, col)
+	_, _ = io.WriteString(out, value)
 }
 
 func writeLine(out io.Writer, cols int, line string) {
@@ -410,11 +488,60 @@ func writeLine(out io.Writer, cols int, line string) {
 	_, _ = io.WriteString(out, line+"\r\n")
 }
 
-func previewTitle(width int) string {
-	if width <= 0 {
+func previewTitle(listWidth, previewWidth int) string {
+	if previewWidth <= 0 {
 		return ""
 	}
-	return padVisible("", 52) + styleMuted(" │ ") + styleHeader("Preview")
+	return strings.Repeat(" ", max(0, listWidth-len("Sessions"))) + " | " + styleHeader("Preview")
+}
+
+func compactSessionLine(prefix string, session protocol.SessionView) string {
+	command := session.Command
+	if command == "" {
+		command = "-"
+	}
+	status := session.Status
+	if status == "" {
+		status = "unknown"
+	}
+	line := prefix +
+		padPlain(ellipsizePlain(session.ID, 20), 21) +
+		padPlain(ellipsizePlain(status, 9), 10) +
+		ellipsizePlain(command, 9)
+	return line
+}
+
+func padPlain(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	value = stripControl(value)
+	if len(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-len(value))
+}
+
+func ellipsizePlain(value string, limit int) string {
+	value = stripControl(value)
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= 1 {
+		return value[:limit]
+	}
+	return value[:limit-1] + "~"
+}
+
+func fullSessionLine(prefix string, session protocol.SessionView, status string) string {
+	return prefix +
+		padVisible(ellipsize(session.ID, 28), 29) +
+		padVisible(status, 14) +
+		padVisible(ellipsize(session.Command, 18), 19) +
+		styleMuted(session.CWD)
 }
 
 func splitPreviewLines(preview string, limit int) []string {
@@ -433,7 +560,7 @@ func previewLine(lines []string, index int) string {
 		return ""
 	}
 	line := strings.ReplaceAll(lines[index], "\t", "    ")
-	return stripControl(line)
+	return highlightPreviewLine(sanitizePreviewANSI(line))
 }
 
 func stripControl(value string) string {
@@ -452,6 +579,66 @@ func stripControl(value string) string {
 	return out.String()
 }
 
+func sanitizePreviewANSI(value string) string {
+	var out strings.Builder
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b == 0x1b {
+			end := skipEscape(value, i)
+			if isSGR(value, i, end) {
+				out.WriteString(value[i : end+1])
+			}
+			i = end
+			continue
+		}
+		if b < 0x20 && b != '\t' {
+			continue
+		}
+		out.WriteByte(b)
+	}
+	out.WriteString("\x1b[0m")
+	return out.String()
+}
+
+func highlightPreviewLine(value string) string {
+	if hasSGR(value) {
+		return value
+	}
+	plain := stripControl(value)
+	trimmed := strings.TrimSpace(plain)
+	lower := strings.ToLower(trimmed)
+	switch {
+	case trimmed == "":
+		return plain
+	case strings.Contains(lower, "error") || strings.Contains(lower, "failed") || strings.Contains(lower, "panic"):
+		return styleError(plain)
+	case strings.Contains(lower, "warning") || strings.Contains(lower, "warn"):
+		return styleWarn(plain)
+	case strings.Contains(lower, "success") || strings.Contains(lower, "ready") || strings.Contains(lower, "done"):
+		return styleOK(plain)
+	case strings.HasPrefix(trimmed, "$") || strings.HasPrefix(trimmed, ">") || strings.HasSuffix(trimmed, "%"):
+		return styleAccent(plain)
+	case strings.Contains(trimmed, "/") && !strings.Contains(trimmed, " "):
+		return styleMuted(plain)
+	default:
+		return plain
+	}
+}
+
+func hasSGR(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] != 0x1b {
+			continue
+		}
+		end := skipEscape(value, i)
+		if isSGR(value, i, end) {
+			return true
+		}
+		i = end
+	}
+	return false
+}
+
 func padVisible(value string, width int) string {
 	if width <= 0 {
 		return value
@@ -461,6 +648,19 @@ func padVisible(value string, width int) string {
 		return truncateVisible(value, width)
 	}
 	return value + strings.Repeat(" ", width-n)
+}
+
+func ellipsize(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if visibleLen(value) <= limit {
+		return value
+	}
+	if limit <= 1 {
+		return truncateVisible(value, limit)
+	}
+	return truncateVisible(value, limit-1) + "~"
 }
 
 func scrollStart(selected, limit, total int) int {
@@ -547,14 +747,18 @@ func styleError(value string) string {
 	return "\x1b[31m" + value + "\x1b[0m"
 }
 
+func styleWarn(value string) string {
+	return "\x1b[33m" + value + "\x1b[0m"
+}
+
 func styleStatus(status string) string {
 	switch strings.ToLower(status) {
 	case "active", "running":
-		return styleOK("● " + status)
+		return styleOK("* " + status)
 	case "stopped", "dead", "failed":
-		return styleError("■ " + status)
+		return styleError("! " + status)
 	default:
-		return styleAccent("◆ " + status)
+		return styleAccent("- " + status)
 	}
 }
 
@@ -612,8 +816,19 @@ func skipEscape(value string, start int) int {
 	return i
 }
 
+func isSGR(value string, start, end int) bool {
+	return start+2 <= end && end < len(value) && value[start+1] == '[' && value[end] == 'm'
+}
+
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b

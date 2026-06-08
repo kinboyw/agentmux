@@ -80,3 +80,23 @@ func TestCreateRejectsBadName(t *testing.T) {
 		t.Fatal("expected invalid name error")
 	}
 }
+
+func TestCapturePreservesEscapeSequences(t *testing.T) {
+	runner := &fakeRunner{output: "\x1b[31mred\x1b[0m"}
+	adapter := New(runner)
+	output, err := adapter.Capture(context.Background(), "demo", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != runner.output {
+		t.Fatalf("unexpected output: %q", output)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("expected one call, got %d", len(runner.calls))
+	}
+	got := strings.Join(runner.calls[0].args, " ")
+	want := "capture-pane -t demo -p -e -S -12"
+	if got != want {
+		t.Fatalf("unexpected capture call:\n got: %s\nwant: %s", got, want)
+	}
+}
