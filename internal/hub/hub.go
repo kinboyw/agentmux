@@ -919,9 +919,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       term.open(terminalEl);
       term.focus();
       watchTerminalSize();
-      refitTerminal(true);
-      setTimeout(() => refitTerminal(true), 0);
-      setTimeout(() => refitTerminal(true), 120);
+      fit.fit();
       streamId = makeStreamID(sessionID);
       const wsURL = wsBase + '/ws/control?token=' + encodeURIComponent(tokenInput.value.trim());
       socket = new WebSocket(wsURL);
@@ -932,6 +930,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
         fit.fit();
         lastSize = { cols: term.cols, rows: term.rows };
         sendEnvelope('control.open', sessionID, { cols: term.cols, rows: term.rows });
+        stabilizeInitialTerminalFit();
         setStatus('Attached ' + sessionID, 'stream ' + streamId, 'ok');
       });
       socket.addEventListener('message', event => handleMessage(event.data));
@@ -983,6 +982,14 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
         lastSize = { cols: term.cols, rows: term.rows };
         sendEnvelope('terminal.resize', activeSession, { cols: term.cols, rows: term.rows });
       }
+    }
+
+    function stabilizeInitialTerminalFit() {
+      requestAnimationFrame(() => refitTerminal(false));
+      requestAnimationFrame(() => requestAnimationFrame(() => refitTerminal(false)));
+      setTimeout(() => refitTerminal(false), 80);
+      setTimeout(() => refitTerminal(false), 240);
+      setTimeout(() => refitTerminal(false), 600);
     }
 
     function watchTerminalSize() {
