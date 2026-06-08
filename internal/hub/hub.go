@@ -356,8 +356,13 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, "invalid session_id")
 			return
 		}
+		var size protocol.TerminalSize
+		if err := env.DecodePayload(&size); err != nil {
+			sendError(control.send, env.SessionID, err.Error())
+			return
+		}
 		s.addSubscriber(env.StreamID, control)
-		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, map[string]string{"name": name}, name, env.SessionID, env.StreamID); err != nil {
+		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, size, name, env.SessionID, env.StreamID); err != nil {
 			sendError(control.send, env.SessionID, err.Error())
 		}
 	case protocol.TypeControlInput:
@@ -815,7 +820,9 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     let resizeObserver = null;
     let lastSize = { cols: 0, rows: 0 };
 
-    const initialToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('agentmux.token') || '';
+    const query = new URLSearchParams(location.search);
+    const debug = query.get('debug') === '1';
+    const initialToken = query.get('token') || localStorage.getItem('agentmux.token') || '';
     tokenInput.value = initialToken;
     if (initialToken) refreshAll();
 
@@ -931,6 +938,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       socket.addEventListener('open', () => {
         refitTerminal(false);
         lastSize = { cols: term.cols, rows: term.rows };
+        debugLayout('control.open');
         sendEnvelope('control.open', sessionID, { cols: term.cols, rows: term.rows });
         stabilizeInitialTerminalFit();
         setStatus('Attached ' + sessionID, 'stream ' + streamId, 'ok');
@@ -983,6 +991,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       const changed = term.cols !== lastSize.cols || term.rows !== lastSize.rows;
       if (force || changed) {
         lastSize = { cols: term.cols, rows: term.rows };
+        debugLayout('terminal.resize');
         sendEnvelope('terminal.resize', activeSession, { cols: term.cols, rows: term.rows });
       }
     }
@@ -1024,6 +1033,37 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       if (!width || !height) return;
       terminalEl.style.width = width + 'px';
       terminalEl.style.height = height + 'px';
+    }
+
+    function debugLayout(label) {
+      if (!debug || !term) return;
+      const wrap = rectInfo(terminalWrap);
+      const terminal = rectInfo(terminalEl);
+      const xterm = rectInfo(terminalEl.querySelector('.xterm'));
+      const screen = rectInfo(terminalEl.querySelector('.xterm-screen'));
+      console.debug('[agentmux]', label, {
+        wrap,
+        terminal,
+        xterm,
+        screen,
+        cols: term.cols,
+        rows: term.rows,
+        lastSize,
+        activeSession
+      });
+    }
+
+    function rectInfo(element) {
+      if (!element) return null;
+      const rect = element.getBoundingClientRect();
+      return {
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        clientWidth: element.clientWidth,
+        clientHeight: element.clientHeight,
+        offsetWidth: element.offsetWidth,
+        offsetHeight: element.offsetHeight
+      };
     }
 
     function detach() {
