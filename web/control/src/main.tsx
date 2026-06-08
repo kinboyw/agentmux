@@ -526,6 +526,9 @@ function TerminalPane({
   const socket = React.useRef<WebSocket | null>(null);
   const streamId = React.useRef("");
   const lastSize = React.useRef({ cols: 0, rows: 0 });
+  const composing = React.useRef(false);
+  const compositionText = React.useRef("");
+  const suppressNextText = React.useRef("");
 
   React.useEffect(() => {
     if (!pane.sessionId || !terminalRef.current) return;
@@ -591,7 +594,34 @@ function TerminalPane({
       }
     });
     ws.addEventListener("close", () => setStatus({ tone: "warn", title: `Detached ${pane.sessionId}`, detail: "The browser stream closed." }));
-    const dataDisposable = term.onData((data) => sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data }));
+    const helperTextarea = terminalRef.current.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    const onCompositionStart = () => {
+      composing.current = true;
+      compositionText.current = "";
+    };
+    const onCompositionUpdate = (event: CompositionEvent) => {
+      compositionText.current = event.data || "";
+    };
+    const onCompositionEnd = (event: CompositionEvent) => {
+      const data = event.data || compositionText.current;
+      composing.current = false;
+      compositionText.current = "";
+      suppressNextText.current = data;
+      if (data) sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+      if (helperTextarea) helperTextarea.value = "";
+    };
+    helperTextarea?.addEventListener("compositionstart", onCompositionStart);
+    helperTextarea?.addEventListener("compositionupdate", onCompositionUpdate);
+    helperTextarea?.addEventListener("compositionend", onCompositionEnd);
+    const dataDisposable = term.onData((data) => {
+      if (suppressNextText.current && data === suppressNextText.current) {
+        suppressNextText.current = "";
+        return;
+      }
+      if (composing.current && isPrintableText(data)) return;
+      suppressNextText.current = "";
+      sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+    });
     term.attachCustomKeyEventHandler((event) => {
       if (!shouldManuallyCaptureTerminalKey(event)) return true;
       const data = encodeKeyEvent(event);
@@ -609,6 +639,9 @@ function TerminalPane({
 
     return () => {
       dataDisposable.dispose();
+      helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
+      helperTextarea?.removeEventListener("compositionupdate", onCompositionUpdate);
+      helperTextarea?.removeEventListener("compositionend", onCompositionEnd);
       observer.disconnect();
       if (ws.readyState === WebSocket.OPEN) sendEnvelope(ws, "terminal.close", pane.sessionId!, streamId.current, {});
       ws.close();
@@ -879,6 +912,10 @@ function base64ToBytes(value: string) {
 function shouldManuallyCaptureTerminalKey(event: KeyboardEvent) {
   if (event.isComposing || event.metaKey) return false;
   return event.ctrlKey || event.altKey || event.key === "Tab";
+}
+
+function isPrintableText(value: string) {
+  return Array.from(value).some((char) => char >= " " && char !== "\x7f");
 }
 
 function encodeKeyEvent(event: KeyboardEvent) {
