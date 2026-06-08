@@ -3,7 +3,7 @@ import { cn } from "../../lib/utils";
 
 type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: "default" | "secondary" | "ghost" | "destructive";
-  size?: "sm" | "default" | "icon";
+  size?: "xs" | "sm" | "default" | "icon" | "icon-sm";
 };
 
 export function Button({ className, variant = "default", size = "default", ...props }: ButtonProps) {
@@ -17,7 +17,9 @@ export function Button({ className, variant = "default", size = "default", ...pr
         variant === "destructive" && "border-destructive bg-destructive text-destructive-foreground hover:bg-destructive/90",
         size === "default" && "h-9 px-3",
         size === "sm" && "h-8 px-2.5 text-xs",
+        size === "xs" && "h-7 px-2 text-xs",
         size === "icon" && "h-9 w-9",
+        size === "icon-sm" && "h-7 w-7",
         className,
       )}
       {...props}

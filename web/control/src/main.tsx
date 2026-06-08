@@ -238,10 +238,6 @@ function App() {
     setLayout((node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
   }
 
-  function splitPane(direction: SplitDirection) {
-    splitPaneById(activePane, direction);
-  }
-
   function splitPaneById(paneId: string, direction: SplitDirection) {
     const pane = newPane();
     setLayout((node) => splitPaneNode(node, paneId, direction, pane).node);
@@ -352,7 +348,7 @@ function App() {
             Refresh
           </Button>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto p-2">
+        <div className="min-h-0 flex-1 overflow-auto p-1.5">
           <div className="mb-2 px-1 text-xs font-medium uppercase text-muted-foreground">Sessions</div>
           <div className="space-y-1">
             {sessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions.</div> : null}
@@ -361,7 +357,7 @@ function App() {
                 key={session.id}
                 draggable
                 className={cn(
-                  "w-full rounded-md border border-transparent px-2 py-2 text-left hover:border-border hover:bg-secondary",
+                  "w-full rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-secondary",
                   activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
                 )}
                 onClick={() => attach(session.id)}
@@ -394,10 +390,10 @@ function App() {
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 items-center justify-between border-b border-border bg-card px-3">
+        <header className="flex h-11 items-center justify-between border-b border-border bg-card px-2">
           <div className="flex min-w-0 items-center gap-2">
             {!sidebarOpen ? (
-              <Button variant="ghost" size="icon" onClick={() => setSidebarOpen(true)} title="Show sidebar">
+              <Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(true)} title="Show sidebar">
                 <ChevronRight className="h-4 w-4" />
               </Button>
             ) : null}
@@ -409,14 +405,6 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
-            <Button variant="secondary" size="sm" onClick={() => splitPane("horizontal")} title="Split right">
-              <SplitSquareHorizontal className="h-4 w-4" />
-              Right
-            </Button>
-            <Button variant="secondary" size="sm" onClick={() => splitPane("vertical")} title="Split down">
-              <SplitSquareVertical className="h-4 w-4" />
-              Down
-            </Button>
           </div>
         </header>
         <div className="min-h-0 flex-1">
@@ -485,7 +473,7 @@ function LayoutRenderer({
             <PanelResizeHandle
               className={cn(
                 "bg-border transition-colors hover:bg-primary",
-                node.direction === "horizontal" ? "w-1" : "h-1",
+                node.direction === "horizontal" ? "w-0.5" : "h-0.5",
               )}
             />
           ) : null}
@@ -638,10 +626,9 @@ function TerminalPane({
       className={cn("relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
       onMouseDown={onFocus}
       onDragOver={(event) => {
-        const payload = readDragPayload(event);
-        if (!payload) return;
+        if (!hasAgentMuxDragPayload(event)) return;
         event.preventDefault();
-        event.dataTransfer.dropEffect = payload.kind === "pane" ? "move" : "copy";
+        event.dataTransfer.dropEffect = "move";
         onDropTarget({ paneId: pane.id, zone: dropZoneFromEvent(event) });
       }}
       onDragLeave={(event) => {
@@ -655,7 +642,7 @@ function TerminalPane({
         onDropPayload(dropZoneFromEvent(event), payload);
       }}
     >
-      <div className="flex h-9 items-center justify-between border-b border-border bg-card px-2">
+      <div className="flex h-7 items-center justify-between border-b border-border bg-card px-1.5">
         <div
           className="min-w-0 flex-1 cursor-grab truncate text-xs font-medium text-muted-foreground active:cursor-grabbing"
           draggable
@@ -668,7 +655,7 @@ function TerminalPane({
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
-            size="icon"
+            size="icon-sm"
             onClick={(event) => {
               event.stopPropagation();
               onSplit("horizontal");
@@ -679,7 +666,7 @@ function TerminalPane({
           </Button>
           <Button
             variant="ghost"
-            size="icon"
+            size="icon-sm"
             onClick={(event) => {
               event.stopPropagation();
               onSplit("vertical");
@@ -690,7 +677,7 @@ function TerminalPane({
           </Button>
           <Button
             variant="ghost"
-            size="icon"
+            size="icon-sm"
             onClick={(event) => {
               event.stopPropagation();
               onClose();
@@ -701,7 +688,7 @@ function TerminalPane({
           </Button>
         </div>
       </div>
-      <div className="min-h-0 min-w-0 flex-1 overflow-hidden p-2">
+      <div className="min-h-0 min-w-0 flex-1 overflow-hidden p-1">
         {pane.sessionId ? (
           <div ref={terminalRef} className="h-full w-full min-w-0 overflow-hidden" />
         ) : (
@@ -861,6 +848,10 @@ function readDragPayload(event: React.DragEvent): DragPayload | null {
     return null;
   }
   return null;
+}
+
+function hasAgentMuxDragPayload(event: React.DragEvent) {
+  return Array.from(event.dataTransfer.types).includes(dragMime);
 }
 
 function dropZoneFromEvent(event: React.DragEvent<HTMLElement>): DropZone {
