@@ -74,8 +74,8 @@ func TestHandleControlPage(t *testing.T) {
 	if !strings.Contains(body, "AgentMux Control") {
 		t.Fatalf("control page title missing: %s", body)
 	}
-	if !strings.Contains(body, "http://agentmux.test") {
-		t.Fatalf("base URL missing: %s", body)
+	if !strings.Contains(body, "/assets/") {
+		t.Fatalf("embedded control assets missing: %s", body)
 	}
 }
 
@@ -134,6 +134,28 @@ func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
 	server.requireRole("control", server.handleSessions)(apiRec, apiReq)
 	if apiRec.Code != http.StatusOK {
 		t.Fatalf("credential did not authorize api: %d body=%s", apiRec.Code, apiRec.Body.String())
+	}
+}
+
+func TestRegisterCredentialAuthorizesControlAPI(t *testing.T) {
+	server := New(":0", "", nil)
+	body := []byte(`{"email":"user@example.com","password":"password123","name":"User","device_name":"browser"}`)
+	registerReq := httptest.NewRequest(http.MethodPost, "/api/auth/register", bytes.NewReader(body))
+	registerRec := httptest.NewRecorder()
+	server.handleAuthRegister(registerRec, registerReq)
+	if registerRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected register status: %d body=%s", registerRec.Code, registerRec.Body.String())
+	}
+	var registerPayload map[string]any
+	if err := json.NewDecoder(registerRec.Body).Decode(&registerPayload); err != nil {
+		t.Fatal(err)
+	}
+	apiReq := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	apiReq.Header.Set("Authorization", "Bearer "+registerPayload["credential"].(string))
+	apiRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleSessions)(apiRec, apiReq)
+	if apiRec.Code != http.StatusOK {
+		t.Fatalf("registered credential did not authorize api: %d body=%s", apiRec.Code, apiRec.Body.String())
 	}
 }
 
@@ -215,5 +237,63 @@ func TestControlOpenForwardsInitialTerminalSize(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not receive terminal.open")
+	}
+}
+
+func TestSessionPreviewRequestForwardsToWorker(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 1),
+	}
+	server.workers[worker.id] = worker
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/local/demo/preview?lines=12", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.requireRole("control", server.handleSessionAction)(rec, req)
+		close(done)
+	}()
+
+	var requestID string
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeSessionPreview {
+			t.Fatalf("unexpected type: %s", env.Type)
+		}
+		requestID = env.ID
+		if env.SessionID != "local/demo" {
+			t.Fatalf("unexpected session id: %s", env.SessionID)
+		}
+		var payload protocol.SessionPreviewRequest
+		if err := env.DecodePayload(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Lines != 12 {
+			t.Fatalf("unexpected lines: %d", payload.Lines)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive preview request")
+	}
+
+	reply, err := protocol.NewEnvelope(protocol.TypeSessionPreview, protocol.SessionPreview{Data: "preview"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply.ID = requestID
+	server.handleWorkerMessage(worker, reply)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("preview request did not complete")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"data":"preview"`) {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
 	}
 }

@@ -14,6 +14,10 @@ const (
 )
 
 func MakeRaw(file *os.File) (func(), error) {
+	return MakeRawWithTimeout(file, 1, 0)
+}
+
+func MakeRawWithTimeout(file *os.File, min, timeout uint8) (func(), error) {
 	fd := file.Fd()
 	var old syscall.Termios
 	if err := ioctl(fd, tcgets, uintptr(unsafe.Pointer(&old))); err != nil {
@@ -24,8 +28,8 @@ func MakeRaw(file *os.File) (func(), error) {
 	raw.Oflag &^= syscall.OPOST
 	raw.Cflag |= syscall.CS8
 	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
-	raw.Cc[syscall.VMIN] = 1
-	raw.Cc[syscall.VTIME] = 0
+	raw.Cc[syscall.VMIN] = min
+	raw.Cc[syscall.VTIME] = timeout
 	if err := ioctl(fd, tcsets, uintptr(unsafe.Pointer(&raw))); err != nil {
 		return func() {}, err
 	}

@@ -55,6 +55,46 @@ Control is the user-facing client. It should have multiple implementations:
 The browser control should become the primary user experience because it can
 render with xterm.js and place UI outside the terminal buffer.
 
+### Web Control Direction
+
+The production web control should be a modern standalone frontend embedded by
+the Go Hub for one-command deployment.
+
+Stack:
+
+- React + TypeScript.
+- Tailwind CSS.
+- shadcn/ui-style primitives.
+- xterm.js for terminal rendering.
+- resizable pane layout for multi-session work.
+
+Expected UX:
+
+- Collapsible navigation/sidebar.
+- Multi-pane session layout with draggable resize handles.
+- Multiple concurrently attached sessions.
+- Login/register flow that returns scoped control credentials.
+- GitHub and Google OAuth entry points behind provider-specific API routes.
+- Workspace/tenant selector after registered-user auth lands.
+- UI status, auth, and session metadata outside terminal buffers.
+
+Deployment model:
+
+- `web/control` is the source frontend.
+- `web/control/dist` is copied into `internal/hub/webdist`.
+- Hub serves `/control` and `/assets/*` from embedded files.
+- Development can still run Vite with API/WS proxy to the local Hub.
+
+Current implementation boundary:
+
+- Registered users are stored in Hub memory.
+- Password hashing is a development placeholder using standard-library SHA-256.
+- GitHub/Google OAuth routes exist and return a structured "not configured"
+  response until provider config and callback handling are implemented.
+- Production auth should add persistent storage, password KDF such as Argon2id
+  or external identity only, secure cookies/session rotation, CSRF protection,
+  revocation, audit logs, and tenant/workspace policy enforcement.
+
 ## Onboarding Model
 
 ### Anonymous Flow
@@ -111,6 +151,17 @@ Capabilities:
 
 Registered users should still use short-lived join signals for new devices, but
 the resulting worker/control gets a durable device credential.
+
+The current prototype exposes:
+
+```text
+POST /api/auth/register
+POST /api/auth/login
+GET  /api/auth/oauth/{github|google}
+```
+
+Register/login issue control credentials for the user's tenant. OAuth routes are
+kept as stable frontend integration points before provider configuration lands.
 
 ### Signal Exchange
 

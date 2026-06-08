@@ -3,6 +3,7 @@ package hub
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -21,6 +22,7 @@ type authStore struct {
 	mu          sync.Mutex
 	signals     map[string]signalEntry
 	credentials map[string]credentialEntry
+	users       map[string]userEntry
 }
 
 type signalEntry struct {
@@ -55,6 +57,16 @@ type credentialEntry struct {
 	CreatedAt time.Time
 }
 
+type userEntry struct {
+	ID           string
+	TenantID     string
+	Email        string
+	Name         string
+	PasswordSalt string
+	PasswordHash string
+	CreatedAt    time.Time
+}
+
 type exchangedCredential struct {
 	Credential   string    `json:"credential"`
 	CredentialID string    `json:"credential_id"`
@@ -65,9 +77,42 @@ type exchangedCredential struct {
 	Scopes       []string  `json:"scopes"`
 }
 
+type authCredentialResponse struct {
+	Credential   string       `json:"credential"`
+	CredentialID string       `json:"credential_id"`
+	TenantID     string       `json:"tenant_id"`
+	Role         string       `json:"role"`
+	DeviceID     string       `json:"device_id"`
+	ExpiresAt    time.Time    `json:"expires_at"`
+	Scopes       []string     `json:"scopes"`
+	User         authUserView `json:"user"`
+}
+
+type authUserView struct {
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+}
+
 type exchangeRequest struct {
 	Signal     string `json:"signal"`
 	Role       string `json:"role"`
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+}
+
+type registerRequest struct {
+	Email      string `json:"email"`
+	Password   string `json:"password"`
+	Name       string `json:"name"`
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+}
+
+type loginRequest struct {
+	Email      string `json:"email"`
+	Password   string `json:"password"`
 	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
 }
@@ -76,6 +121,7 @@ func newAuthStore() *authStore {
 	return &authStore{
 		signals:     map[string]signalEntry{},
 		credentials: map[string]credentialEntry{},
+		users:       map[string]userEntry{},
 	}
 }
 
@@ -166,6 +212,75 @@ func (s *authStore) Exchange(req exchangeRequest) (exchangedCredential, error) {
 	}, nil
 }
 
+func (s *authStore) Register(req registerRequest) (authCredentialResponse, error) {
+	email := normalizeEmail(req.Email)
+	if email == "" {
+		return authCredentialResponse{}, fmt.Errorf("email is required")
+	}
+	if len(req.Password) < 8 {
+		return authCredentialResponse{}, fmt.Errorf("password must be at least 8 characters")
+	}
+	salt, hash, err := passwordDigest(req.Password)
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	now := time.Now().UTC()
+	user := userEntry{
+		ID: "usr_" + randomID(), TenantID: "tenant_" + randomID(), Email: email,
+		Name: strings.TrimSpace(req.Name), PasswordSalt: salt, PasswordHash: hash, CreatedAt: now,
+	}
+	if user.Name == "" {
+		user.Name = email
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	if _, exists := s.users[email]; exists {
+		return authCredentialResponse{}, fmt.Errorf("user already exists")
+	}
+	s.users[email] = user
+	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
+}
+
+func (s *authStore) Login(req loginRequest) (authCredentialResponse, error) {
+	email := normalizeEmail(req.Email)
+	if email == "" || req.Password == "" {
+		return authCredentialResponse{}, fmt.Errorf("email and password are required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	user, ok := s.users[email]
+	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
+		return authCredentialResponse{}, fmt.Errorf("invalid email or password")
+	}
+	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
+}
+
+func (s *authStore) issueCredentialLocked(user userEntry, role, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
+	credential, err := randomToken("amx_cred_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		deviceID = "dev_" + randomID()
+	}
+	entry := credentialEntry{
+		Hash: tokenHash(credential), ID: "cred_" + randomID(), TenantID: user.TenantID,
+		Role: role, DeviceID: deviceID, Name: strings.TrimSpace(deviceName),
+		Scopes: credentialScopes(role), ExpiresAt: now.Add(defaultCredentialTTL), CreatedAt: now,
+	}
+	s.credentials[entry.Hash] = entry
+	return authCredentialResponse{
+		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
+		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
+		Scopes: append([]string(nil), entry.Scopes...),
+		User:   authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+	}, nil
+}
+
 func (s *authStore) Credential(token string) (credentialEntry, bool) {
 	if token == "" {
 		return credentialEntry{}, false
@@ -243,4 +358,27 @@ func websocketBase(baseURL string) string {
 
 func shellQuote(value string) string {
 	return "'" + value + "'"
+}
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func passwordDigest(password string) (string, string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", "", err
+	}
+	salt := base64.RawURLEncoding.EncodeToString(raw[:])
+	return salt, passwordHash(password, salt), nil
+}
+
+func passwordHash(password, salt string) string {
+	sum := sha256.Sum256([]byte(salt + "\x00" + password))
+	return hex.EncodeToString(sum[:])
+}
+
+func passwordMatches(password, salt, expected string) bool {
+	actual := passwordHash(password, salt)
+	return subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
 }

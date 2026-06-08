@@ -1,3 +1,5 @@
 /agentmux
 /dist/
 /.tmp/
+web/control/node_modules/
+web/control/dist/

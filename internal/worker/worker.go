@@ -137,6 +137,23 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			}
 			w.stopSessionStreams(protocol.SessionID(w.ID, name))
 			_ = w.sendSnapshot(ctx, conn)
+		case protocol.TypeSessionPreview:
+			_, name, ok := protocol.SplitSessionID(env.SessionID)
+			if !ok {
+				name = payloadName(env)
+			}
+			var req protocol.SessionPreviewRequest
+			_ = env.DecodePayload(&req)
+			data, err := w.Adapter.Capture(ctx, name, req.Lines)
+			if err != nil {
+				w.sendRequestError(conn, env.ID, env.SessionID, err.Error())
+				continue
+			}
+			reply, _ := protocol.NewEnvelope(protocol.TypeSessionPreview, protocol.SessionPreview{Data: data})
+			reply.ID = env.ID
+			reply.WorkerID = w.ID
+			reply.SessionID = env.SessionID
+			_ = writeEnvelope(conn, reply)
 		case protocol.TypeTerminalInput:
 			_, name, ok := protocol.SplitSessionID(env.SessionID)
 			if !ok {
@@ -303,6 +320,14 @@ func (w *Worker) stopAllStreams() {
 
 func (w *Worker) sendError(conn *ws.Conn, sessionID, message string) {
 	env, _ := protocol.NewEnvelope(protocol.TypeError, protocol.ErrorPayload{Message: message})
+	env.WorkerID = w.ID
+	env.SessionID = sessionID
+	_ = writeEnvelope(conn, env)
+}
+
+func (w *Worker) sendRequestError(conn *ws.Conn, requestID, sessionID, message string) {
+	env, _ := protocol.NewEnvelope(protocol.TypeError, protocol.ErrorPayload{Message: message})
+	env.ID = requestID
 	env.WorkerID = w.ID
 	env.SessionID = sessionID
 	_ = writeEnvelope(conn, env)

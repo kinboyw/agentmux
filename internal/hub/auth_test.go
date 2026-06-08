@@ -33,6 +33,36 @@ func TestAuthStoreSignalExchange(t *testing.T) {
 	}
 }
 
+func TestAuthStoreRegisterLogin(t *testing.T) {
+	store := newAuthStore()
+	registered, err := store.Register(registerRequest{
+		Email: "User@Example.com", Password: "password123", Name: "User",
+		DeviceName: "browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.Credential == "" || registered.User.Email != "user@example.com" || registered.TenantID == "" {
+		t.Fatalf("unexpected registration response: %+v", registered)
+	}
+	if _, ok := store.Credential(registered.Credential); !ok {
+		t.Fatal("expected registered credential to authorize")
+	}
+	if _, err := store.Register(registerRequest{Email: "user@example.com", Password: "password123"}); err == nil {
+		t.Fatal("expected duplicate registration to fail")
+	}
+	if _, err := store.Login(loginRequest{Email: "user@example.com", Password: "wrong-password"}); err == nil {
+		t.Fatal("expected wrong password to fail")
+	}
+	loggedIn, err := store.Login(loginRequest{Email: "user@example.com", Password: "password123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loggedIn.Credential == "" || loggedIn.Credential == registered.Credential || loggedIn.TenantID != registered.TenantID {
+		t.Fatalf("unexpected login response: %+v", loggedIn)
+	}
+}
+
 func TestWebSocketBase(t *testing.T) {
 	if got := websocketBase("https://hub.example.com"); got != "wss://hub.example.com" {
 		t.Fatalf("unexpected wss base: %q", got)

@@ -35,6 +35,14 @@ http://127.0.0.1:8081/control?token=dev-token
 
 The browser UI uses xterm.js for the terminal area and keeps session identity,
 connection state, and detach controls outside the remote terminal buffer.
+The modern Web control source lives in `web/control` and is embedded into the
+Hub from `internal/hub/webdist`.
+
+The Web control also has a development-stage registered-user flow. Register or
+sign in from the sidebar to receive a scoped `amx_cred_...` control credential.
+Current credentials and users are in-memory; restarting the Hub clears them.
+GitHub and Google buttons are wired to OAuth provider endpoints, but providers
+are not configured yet.
 
 Signal-based onboarding:
 

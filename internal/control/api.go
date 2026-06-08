@@ -14,29 +14,45 @@ import (
 )
 
 func (c Client) ListWorkers(ctx context.Context, out io.Writer) error {
-	var payload struct {
-		Workers []protocol.WorkerView `json:"workers"`
-	}
-	if err := c.doJSON(ctx, http.MethodGet, "/api/workers", nil, &payload); err != nil {
+	workers, err := c.Workers(ctx)
+	if err != nil {
 		return err
 	}
-	for _, worker := range payload.Workers {
+	for _, worker := range workers {
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", worker.ID, worker.Name, worker.Addr, worker.LastSeen.Format("2006-01-02T15:04:05Z07:00"))
 	}
 	return nil
 }
 
 func (c Client) ListSessions(ctx context.Context, out io.Writer) error {
+	sessions, err := c.Sessions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", session.ID, session.Status, session.Command, session.CWD)
+	}
+	return nil
+}
+
+func (c Client) Workers(ctx context.Context) ([]protocol.WorkerView, error) {
+	var payload struct {
+		Workers []protocol.WorkerView `json:"workers"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/api/workers", nil, &payload); err != nil {
+		return nil, err
+	}
+	return payload.Workers, nil
+}
+
+func (c Client) Sessions(ctx context.Context) ([]protocol.SessionView, error) {
 	var payload struct {
 		Sessions []protocol.SessionView `json:"sessions"`
 	}
 	if err := c.doJSON(ctx, http.MethodGet, "/api/sessions", nil, &payload); err != nil {
-		return err
+		return nil, err
 	}
-	for _, session := range payload.Sessions {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", session.ID, session.Status, session.Command, session.CWD)
-	}
-	return nil
+	return payload.Sessions, nil
 }
 
 func (c Client) CreateSession(ctx context.Context, req protocol.CreateSession) error {
@@ -62,6 +78,22 @@ func (c Client) StopSession(ctx context.Context, sessionID string) error {
 	path := fmt.Sprintf("/api/sessions/%s/%s", url.PathEscape(workerID), url.PathEscape(name))
 	var payload map[string]string
 	return c.doJSON(ctx, http.MethodDelete, path, nil, &payload)
+}
+
+func (c Client) SessionPreview(ctx context.Context, sessionID string, lines int) (string, error) {
+	workerID, name, ok := protocol.SplitSessionID(sessionID)
+	if !ok {
+		return "", fmt.Errorf("invalid session id %q; expected worker/name", sessionID)
+	}
+	if lines <= 0 {
+		lines = 80
+	}
+	path := fmt.Sprintf("/api/sessions/%s/%s/preview?lines=%d", url.PathEscape(workerID), url.PathEscape(name), lines)
+	var payload protocol.SessionPreview
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &payload); err != nil {
+		return "", err
+	}
+	return payload.Data, nil
 }
 
 func (c Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, deviceName string) (string, error) {

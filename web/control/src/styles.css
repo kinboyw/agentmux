@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --background: 210 12% 7%;
+  --foreground: 180 12% 94%;
+  --card: 210 11% 10%;
+  --card-foreground: 180 12% 94%;
+  --primary: 155 56% 50%;
+  --primary-foreground: 160 70% 7%;
+  --secondary: 210 10% 15%;
+  --secondary-foreground: 180 12% 94%;
+  --muted: 210 10% 18%;
+  --muted-foreground: 210 8% 67%;
+  --destructive: 0 72% 58%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 210 10% 22%;
+  --input: 210 10% 22%;
+  --ring: 155 56% 50%;
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  overflow: hidden;
+}
+
+.xterm {
+  height: 100%;
+  width: 100%;
+}

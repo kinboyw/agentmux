@@ -86,6 +86,23 @@ func runControl(ctx context.Context, args []string) {
 		os.Exit(2)
 	}
 	switch args[0] {
+	case "app":
+		fs := flag.NewFlagSet("app", flag.ExitOnError)
+		common := addControlCommon(fs)
+		deviceID := fs.String("device-id", "", "stable control device id")
+		deviceName := fs.String("device-name", hostname(), "control device display name")
+		_ = fs.Parse(args[1:])
+		auth, err := control.ResolveAppAuth(ctx, control.AppAuthOptions{
+			HubURL: common.hub, Token: common.token, Join: common.join,
+			DeviceID: *deviceID, DeviceName: *deviceName,
+		})
+		if err != nil {
+			fatal(err)
+		}
+		app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
+		if err := app.Run(ctx); err != nil && err != context.Canceled {
+			fatal(err)
+		}
 	case "workers":
 		fs := controlFlags("workers", args[1:])
 		client := newControlClient(ctx, fs)
@@ -191,7 +208,7 @@ func usage() {
 }
 
 func controlUsage() {
-	fmt.Fprintln(os.Stderr, "usage: agentmux control <workers|list|create|send|stop|attach> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentmux control <app|workers|list|create|send|stop|attach> [options]")
 }
 
 func fatal(err error) {

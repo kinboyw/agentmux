@@ -2,13 +2,17 @@ package hub
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +20,9 @@ import (
 	"private/agentmux/internal/protocol"
 	"private/agentmux/internal/ws"
 )
+
+//go:embed webdist
+var webDist embed.FS
 
 type Server struct {
 	addr   string
@@ -26,6 +33,7 @@ type Server struct {
 	workers     map[string]*workerConn
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
+	previews    map[string]chan protocol.Envelope
 	auth        *authStore
 }
 
@@ -64,6 +72,7 @@ func New(addr, token string, logger *slog.Logger) *Server {
 		workers:     map[string]*workerConn{},
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
+		previews:    map[string]chan protocol.Envelope{},
 		auth:        newAuthStore(),
 	}
 }
@@ -72,10 +81,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleLanding)
 	mux.HandleFunc("/control", s.handleControlPage)
+	mux.HandleFunc("/assets/", s.handleWebAssets)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/signals", s.handleSignals)
 	mux.HandleFunc("/api/join-tokens", s.handleJoinTokens)
 	mux.HandleFunc("/api/exchange", s.handleExchange)
+	mux.HandleFunc("/api/auth/register", s.handleAuthRegister)
+	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/oauth/", s.handleAuthOAuth)
 	mux.HandleFunc("/api/workers", s.requireRole("control", s.handleWorkers))
 	mux.HandleFunc("/api/sessions", s.requireRole("control", s.handleSessions))
 	mux.HandleFunc("/api/sessions/", s.requireRole("control", s.handleSessionAction))
@@ -120,6 +133,9 @@ func (s *Server) handleControlPage(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if serveEmbeddedControl(w, r) {
+		return
+	}
 	baseURL := requestBaseURL(r)
 	data := controlPageData{
 		BaseURL: baseURL,
@@ -127,6 +143,15 @@ func (s *Server) handleControlPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = controlTemplate.Execute(w, data)
+}
+
+func (s *Server) handleWebAssets(w http.ResponseWriter, r *http.Request) {
+	dist, err := fs.Sub(webDist, "webdist")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.FileServer(http.FS(dist)).ServeHTTP(w, r)
 }
 
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +200,54 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req registerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	credential, err := s.auth.Register(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	credential, err := s.auth.Login(req)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleAuthOAuth(w http.ResponseWriter, r *http.Request) {
+	provider := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/auth/oauth/"), "/")
+	if provider != "github" && provider != "google" {
+		writeError(w, http.StatusNotFound, "unsupported oauth provider")
+		return
+	}
+	writeJSON(w, http.StatusNotImplemented, map[string]string{
+		"error":    "oauth provider is not configured",
+		"provider": provider,
+	})
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
@@ -257,6 +330,16 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+		return
+	}
+	if r.Method == http.MethodGet && len(parts) == 3 && parts[2] == "preview" {
+		lines := safeQueryInt(r.URL.Query().Get("lines"), 80)
+		preview, err := s.requestSessionPreview(r.Context(), workerID, name, sessionID, lines)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, preview)
 		return
 	}
 	if r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "input" {
@@ -377,7 +460,12 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 		s.updateSessions(worker.id, snapshot.Sessions)
 	case protocol.TypeTerminalOutput:
 		s.publish(env.StreamID, env)
+	case protocol.TypeSessionPreview:
+		s.completePreview(env)
 	case protocol.TypeError:
+		if env.ID != "" && s.completePreview(env) {
+			return
+		}
 		s.publish(env.StreamID, env)
 	}
 }
@@ -507,7 +595,64 @@ func (s *Server) publish(streamID string, env protocol.Envelope) {
 	}
 }
 
+func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sessionID string, lines int) (protocol.SessionPreview, error) {
+	requestID := "preview_" + randomID()
+	reply := make(chan protocol.Envelope, 1)
+	s.mu.Lock()
+	s.previews[requestID] = reply
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.previews, requestID)
+		s.mu.Unlock()
+	}()
+
+	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionPreview, protocol.SessionPreviewRequest{Lines: lines}, name, sessionID, requestID); err != nil {
+		return protocol.SessionPreview{}, err
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return protocol.SessionPreview{}, ctx.Err()
+	case <-timer.C:
+		return protocol.SessionPreview{}, fmt.Errorf("session preview timed out")
+	case env := <-reply:
+		if env.Type == protocol.TypeError {
+			var payload protocol.ErrorPayload
+			_ = env.DecodePayload(&payload)
+			return protocol.SessionPreview{}, errors.New(payload.Message)
+		}
+		var preview protocol.SessionPreview
+		if err := env.DecodePayload(&preview); err != nil {
+			return protocol.SessionPreview{}, err
+		}
+		return preview, nil
+	}
+}
+
+func (s *Server) completePreview(env protocol.Envelope) bool {
+	if env.ID == "" {
+		return false
+	}
+	s.mu.RLock()
+	reply := s.previews[env.ID]
+	s.mu.RUnlock()
+	if reply == nil {
+		return false
+	}
+	select {
+	case reply <- env:
+	default:
+	}
+	return true
+}
+
 func (s *Server) sendToWorker(workerID, messageType string, payload any, name, sessionID string, streamID ...string) error {
+	return s.sendToWorkerWithID(workerID, messageType, payload, name, sessionID, "", streamID...)
+}
+
+func (s *Server) sendToWorkerWithID(workerID, messageType string, payload any, name, sessionID, requestID string, streamID ...string) error {
 	raw, err := protocol.MarshalPayload(payload)
 	if err != nil {
 		return err
@@ -518,7 +663,7 @@ func (s *Server) sendToWorker(workerID, messageType string, payload any, name, s
 	if worker == nil {
 		return fmt.Errorf("worker not connected: %s", workerID)
 	}
-	env := protocol.Envelope{Type: messageType, WorkerID: workerID, SessionID: sessionID, Payload: raw}
+	env := protocol.Envelope{Type: messageType, ID: requestID, WorkerID: workerID, SessionID: sessionID, Payload: raw}
 	if len(streamID) > 0 {
 		env.StreamID = streamID[0]
 	}
@@ -604,6 +749,17 @@ func authTenantID(auth authContext) string {
 		return "admin"
 	}
 	return auth.Credential.TenantID
+}
+
+func safeQueryInt(value string, fallback int) int {
+	if value == "" {
+		return fallback
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil || number <= 0 {
+		return fallback
+	}
+	return number
 }
 
 func bearerOrQueryToken(r *http.Request) string {
@@ -699,6 +855,20 @@ func controlPageURL(baseURL string, token string) string {
 	q.Set("signal", token)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func serveEmbeddedControl(w http.ResponseWriter, r *http.Request) bool {
+	dist, err := fs.Sub(webDist, "webdist")
+	if err != nil {
+		return false
+	}
+	index, err := fs.ReadFile(dist, "index.html")
+	if err != nil {
+		return false
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(index)
+	return true
 }
 
 var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html>

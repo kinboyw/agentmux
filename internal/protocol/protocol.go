@@ -11,6 +11,7 @@ const (
 	TypeWorkerHello     = "worker.hello"
 	TypeWorkerHeartbeat = "worker.heartbeat"
 	TypeSessionSnapshot = "session.snapshot"
+	TypeSessionPreview  = "session.preview"
 	TypeSessionCreate   = "session.create"
 	TypeSessionKill     = "session.kill"
 	TypeTerminalOpen    = "terminal.open"
@@ -89,6 +90,14 @@ type SessionView struct {
 
 type SessionSnapshot struct {
 	Sessions []Session `json:"sessions"`
+}
+
+type SessionPreviewRequest struct {
+	Lines int `json:"lines"`
+}
+
+type SessionPreview struct {
+	Data string `json:"data"`
 }
 
 type CreateSession struct {
