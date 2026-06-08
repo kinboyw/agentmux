@@ -910,13 +910,6 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       });
       fit = new FitAddon();
       term.loadAddon(fit);
-      term.attachCustomKeyEventHandler(event => {
-        if (event.type === 'keydown' && shouldCaptureKey(event)) {
-          event.preventDefault();
-          event.stopPropagation();
-        }
-        return true;
-      });
       term.open(terminalEl);
       fit.fit();
       term.focus();
@@ -994,12 +987,14 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     }
 
     function capturePageKey(event) {
-      if (!term || !activeSession || event.defaultPrevented || isTerminalEvent(event)) return;
+      if (!term || !activeSession || event.defaultPrevented) return;
       if (!shouldCaptureKey(event)) return;
+      if (isTerminalEvent(event) && !shouldManuallyCaptureTerminalKey(event)) return;
       const data = encodeKeyEvent(event);
       if (!data) return;
       event.preventDefault();
       event.stopPropagation();
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
       term.focus();
       sendEnvelope('control.input', activeSession, { data });
     }
@@ -1011,6 +1006,10 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     function shouldCaptureKey(event) {
       if (event.isComposing) return false;
       return !event.metaKey;
+    }
+
+    function shouldManuallyCaptureTerminalKey(event) {
+      return event.ctrlKey || event.altKey || event.key === 'Tab';
     }
 
     function encodeKeyEvent(event) {
