@@ -819,6 +819,10 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     document.getElementById('refresh').addEventListener('click', refreshAll);
     detachButton.addEventListener('click', detach);
     window.addEventListener('beforeunload', detach);
+    document.addEventListener('keydown', capturePageKey, true);
+    terminalEl.addEventListener('pointerdown', () => {
+      if (term) term.focus();
+    });
 
     document.getElementById('create').addEventListener('submit', async event => {
       event.preventDefault();
@@ -906,6 +910,13 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       });
       fit = new FitAddon();
       term.loadAddon(fit);
+      term.attachCustomKeyEventHandler(event => {
+        if (event.type === 'keydown' && shouldCaptureKey(event)) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return true;
+      });
       term.open(terminalEl);
       fit.fit();
       term.focus();
@@ -980,6 +991,80 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       renderSessions();
       if (previousSession) setStatus('Detached ' + previousSession, 'The browser control stream is closed.', 'warn');
       terminalEl.innerHTML = '<div class="empty">Select or create a session.</div>';
+    }
+
+    function capturePageKey(event) {
+      if (!term || !activeSession || event.defaultPrevented || isTerminalEvent(event)) return;
+      if (!shouldCaptureKey(event)) return;
+      const data = encodeKeyEvent(event);
+      if (!data) return;
+      event.preventDefault();
+      event.stopPropagation();
+      term.focus();
+      sendEnvelope('control.input', activeSession, { data });
+    }
+
+    function isTerminalEvent(event) {
+      return event.target instanceof Node && terminalEl.contains(event.target);
+    }
+
+    function shouldCaptureKey(event) {
+      if (event.isComposing) return false;
+      return !event.metaKey;
+    }
+
+    function encodeKeyEvent(event) {
+      const key = event.key;
+      if (key === 'Enter') return '\r';
+      if (key === 'Tab') return event.shiftKey ? '\x1b[Z' : '\t';
+      if (key === 'Backspace') return '\x7f';
+      if (key === 'Escape') return '\x1b';
+      if (key === 'Delete') return '\x1b[3~';
+      if (key === 'Insert') return '\x1b[2~';
+      if (key === 'Home') return '\x1b[H';
+      if (key === 'End') return '\x1b[F';
+      if (key === 'PageUp') return '\x1b[5~';
+      if (key === 'PageDown') return '\x1b[6~';
+      if (key === 'ArrowUp') return '\x1b[A';
+      if (key === 'ArrowDown') return '\x1b[B';
+      if (key === 'ArrowRight') return '\x1b[C';
+      if (key === 'ArrowLeft') return '\x1b[D';
+      if (/^F([1-9]|1[0-2])$/.test(key)) return functionKeySequence(key);
+      if (event.ctrlKey && !event.altKey) return controlSequence(key);
+      if (event.altKey && key.length === 1) return '\x1b' + key;
+      if (!event.ctrlKey && !event.altKey && key.length === 1) return key;
+      return '';
+    }
+
+    function controlSequence(key) {
+      if (key === ' ') return '\x00';
+      if (key === '[') return '\x1b';
+      if (key === '\\') return '\x1c';
+      if (key === ']') return '\x1d';
+      if (key === '^') return '\x1e';
+      if (key === '_' || key === '-') return '\x1f';
+      if (key.length === 1) {
+        const code = key.toUpperCase().charCodeAt(0);
+        if (code >= 65 && code <= 90) return String.fromCharCode(code - 64);
+      }
+      return '';
+    }
+
+    function functionKeySequence(key) {
+      return ({
+        F1: '\x1bOP',
+        F2: '\x1bOQ',
+        F3: '\x1bOR',
+        F4: '\x1bOS',
+        F5: '\x1b[15~',
+        F6: '\x1b[17~',
+        F7: '\x1b[18~',
+        F8: '\x1b[19~',
+        F9: '\x1b[20~',
+        F10: '\x1b[21~',
+        F11: '\x1b[23~',
+        F12: '\x1b[24~'
+      })[key] || '';
     }
 
     function sendEnvelope(type, sessionID, payload) {
