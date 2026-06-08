@@ -79,6 +79,7 @@ type Session struct {
 
 type SessionView struct {
 	ID       string `json:"id"`
+	TenantID string `json:"tenant_id,omitempty"`
 	WorkerID string `json:"worker_id"`
 	Name     string `json:"name"`
 	CWD      string `json:"cwd"`
@@ -113,6 +114,7 @@ type TerminalOutput struct {
 
 type WorkerView struct {
 	ID       string    `json:"id"`
+	TenantID string    `json:"tenant_id,omitempty"`
 	Name     string    `json:"name"`
 	Addr     string    `json:"addr"`
 	LastSeen time.Time `json:"last_seen"`

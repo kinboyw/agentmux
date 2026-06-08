@@ -54,17 +54,23 @@ func runWorker(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	hubURL := fs.String("hub", "ws://127.0.0.1:8080", "hub URL")
 	token := fs.String("token", os.Getenv("AGENTMUX_TOKEN"), "shared auth token")
-	join := fs.String("join", "", "short-lived join token")
+	join := fs.String("join", "", "short-lived signal token")
 	id := fs.String("id", "", "stable worker id")
 	name := fs.String("name", hostname(), "worker display name")
 	interval := fs.Duration("interval", time.Second, "terminal capture interval")
 	_ = fs.Parse(args)
-	if *join != "" {
-		*token = *join
-	}
 	workerID := *id
 	if workerID == "" {
 		workerID = *name
+	}
+	if *join != "" {
+		credential, deviceID, err := worker.ExchangeSignal(ctx, *hubURL, *join, workerID, *name)
+		if err != nil {
+			fatal(err)
+		}
+		*token = credential
+		workerID = deviceID
+		slog.Default().Info("worker signal exchanged", "device_id", deviceID)
 	}
 	w := worker.New(*hubURL, *token, workerID, *name, tmux.New(nil), slog.Default())
 	w.Interval = *interval
@@ -82,13 +88,13 @@ func runControl(ctx context.Context, args []string) {
 	switch args[0] {
 	case "workers":
 		fs := controlFlags("workers", args[1:])
-		client := control.New(fs.hub, fs.authToken())
+		client := newControlClient(ctx, fs)
 		if err := client.ListWorkers(ctx, os.Stdout); err != nil {
 			fatal(err)
 		}
 	case "list":
 		fs := controlFlags("list", args[1:])
-		client := control.New(fs.hub, fs.authToken())
+		client := newControlClient(ctx, fs)
 		if err := client.ListSessions(ctx, os.Stdout); err != nil {
 			fatal(err)
 		}
@@ -100,7 +106,7 @@ func runControl(ctx context.Context, args []string) {
 		cwd := fs.String("cwd", ".", "working directory")
 		command := fs.String("command", "bash", "command to run in tmux")
 		_ = fs.Parse(args[1:])
-		client := control.New(common.hub, common.authToken())
+		client := newControlClient(ctx, *common)
 		if err := client.CreateSession(ctx, protocol.CreateSession{WorkerID: *workerID, Name: *name, CWD: *cwd, Command: *command}); err != nil {
 			fatal(err)
 		}
@@ -110,7 +116,7 @@ func runControl(ctx context.Context, args []string) {
 		session := fs.String("session", "", "session id worker/name")
 		text := fs.String("text", "", "text to send")
 		_ = fs.Parse(args[1:])
-		client := control.New(common.hub, common.authToken())
+		client := newControlClient(ctx, *common)
 		if err := client.SendInput(ctx, *session, *text+"\n"); err != nil {
 			fatal(err)
 		}
@@ -119,7 +125,7 @@ func runControl(ctx context.Context, args []string) {
 		common := addControlCommon(fs)
 		session := fs.String("session", "", "session id worker/name")
 		_ = fs.Parse(args[1:])
-		client := control.New(common.hub, common.authToken())
+		client := newControlClient(ctx, *common)
 		if err := client.StopSession(ctx, *session); err != nil {
 			fatal(err)
 		}
@@ -128,7 +134,7 @@ func runControl(ctx context.Context, args []string) {
 		common := addControlCommon(fs)
 		session := fs.String("session", "", "session id worker/name")
 		_ = fs.Parse(args[1:])
-		client := control.New(common.hub, common.authToken())
+		client := newControlClient(ctx, *common)
 		in, out := control.DefaultIO()
 		if err := client.Attach(ctx, *session, in, out); err != nil && err != context.Canceled {
 			fatal(err)
@@ -156,15 +162,20 @@ func addControlCommon(fs *flag.FlagSet) *commonControlFlags {
 	common := &commonControlFlags{}
 	fs.StringVar(&common.hub, "hub", "http://127.0.0.1:8080", "hub URL")
 	fs.StringVar(&common.token, "token", os.Getenv("AGENTMUX_TOKEN"), "shared auth token")
-	fs.StringVar(&common.join, "join", "", "short-lived join token")
+	fs.StringVar(&common.join, "join", "", "short-lived signal token")
 	return common
 }
 
-func (f commonControlFlags) authToken() string {
-	if f.join != "" {
-		return f.join
+func newControlClient(ctx context.Context, flags commonControlFlags) control.Client {
+	if flags.join == "" {
+		return control.New(flags.hub, flags.token)
 	}
-	return f.token
+	client := control.New(flags.hub, "")
+	credential, err := client.ExchangeSignal(ctx, flags.join, "control", "", hostname())
+	if err != nil {
+		fatal(err)
+	}
+	return control.New(flags.hub, credential)
 }
 
 func hostname() string {

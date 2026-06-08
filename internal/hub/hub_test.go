@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,30 @@ func TestAuthorized(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
 	if server.authorized(req) {
 		t.Fatal("missing token should not authorize")
+	}
+	minted, err := server.auth.MintSignal(time.Minute, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+minted.Signal)
+	if server.authorized(req) {
+		t.Fatal("raw signal should not authorize normal APIs")
+	}
+	exchanged, err := server.auth.Exchange(exchangeRequest{Signal: minted.Signal, Role: "control"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+exchanged.Credential)
+	if !server.authorized(req) {
+		t.Fatal("exchanged credential should authorize")
+	}
+	if !server.authorizedRole(req, "control") {
+		t.Fatal("control credential should authorize control routes")
+	}
+	if server.authorizedRole(req, "worker") {
+		t.Fatal("control credential should not authorize worker routes")
 	}
 }
 
@@ -54,13 +79,13 @@ func TestHandleControlPage(t *testing.T) {
 	}
 }
 
-func TestJoinTokenIncludesControlURL(t *testing.T) {
+func TestSignalIncludesControlURL(t *testing.T) {
 	server := New(":0", "", nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/join-tokens", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
 	req.Host = "agentmux.test"
 	rec := httptest.NewRecorder()
 
-	server.handleJoinTokens(rec, req)
+	server.handleSignals(rec, req)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -70,8 +95,89 @@ func TestJoinTokenIncludesControlURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	controlURL, ok := payload["control_url"].(string)
-	if !ok || !strings.HasPrefix(controlURL, "http://agentmux.test/control?token=amx_join_") {
+	if !ok || !strings.HasPrefix(controlURL, "http://agentmux.test/control?signal=amx_sig_") {
 		t.Fatalf("unexpected control_url: %#v", payload["control_url"])
+	}
+	signal, ok := payload["signal"].(string)
+	if !ok || !strings.HasPrefix(signal, "amx_sig_") {
+		t.Fatalf("unexpected signal: %#v", payload["signal"])
+	}
+}
+
+func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
+	server := New(":0", "", nil)
+	signalReq := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	signalReq.Host = "agentmux.test"
+	signalRec := httptest.NewRecorder()
+	server.handleSignals(signalRec, signalReq)
+	if signalRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected signal status: %d", signalRec.Code)
+	}
+	var signalPayload map[string]any
+	if err := json.NewDecoder(signalRec.Body).Decode(&signalPayload); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"signal":"` + signalPayload["signal"].(string) + `","role":"control","device_name":"test"}`)
+	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/exchange", bytes.NewReader(body))
+	exchangeRec := httptest.NewRecorder()
+	server.handleExchange(exchangeRec, exchangeReq)
+	if exchangeRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected exchange status: %d body=%s", exchangeRec.Code, exchangeRec.Body.String())
+	}
+	var exchangePayload map[string]any
+	if err := json.NewDecoder(exchangeRec.Body).Decode(&exchangePayload); err != nil {
+		t.Fatal(err)
+	}
+	apiReq := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	apiReq.Header.Set("Authorization", "Bearer "+exchangePayload["credential"].(string))
+	apiRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleSessions)(apiRec, apiReq)
+	if apiRec.Code != http.StatusOK {
+		t.Fatalf("credential did not authorize api: %d body=%s", apiRec.Code, apiRec.Body.String())
+	}
+}
+
+func TestControlCredentialSeesOnlyTenantWorkers(t *testing.T) {
+	server := New(":0", "", nil)
+	mintedA, err := server.auth.MintSignal(time.Minute, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCredA, err := server.auth.Exchange(exchangeRequest{Signal: mintedA.Signal, Role: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlCredA, err := server.auth.Exchange(exchangeRequest{Signal: mintedA.Signal, Role: "control"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mintedB, err := server.auth.MintSignal(time.Minute, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCredB, err := server.auth.Exchange(exchangeRequest{Signal: mintedB.Signal, Role: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.workers["a"] = &workerConn{id: "a", tenantID: workerCredA.TenantID, send: make(chan protocol.Envelope, 1)}
+	server.workers["b"] = &workerConn{id: "b", tenantID: workerCredB.TenantID, send: make(chan protocol.Envelope, 1)}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/workers", nil)
+	req.Header.Set("Authorization", "Bearer "+controlCredA.Credential)
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkers)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	var payload struct {
+		Workers []protocol.WorkerView `json:"workers"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Workers) != 1 || payload.Workers[0].ID != "a" {
+		t.Fatalf("expected only tenant A worker, got %+v", payload.Workers)
 	}
 }
 

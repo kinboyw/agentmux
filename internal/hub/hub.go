@@ -26,11 +26,12 @@ type Server struct {
 	workers     map[string]*workerConn
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
-	joinTokens  *joinTokenStore
+	auth        *authStore
 }
 
 type workerConn struct {
 	id       string
+	tenantID string
 	name     string
 	addr     string
 	lastSeen time.Time
@@ -39,9 +40,18 @@ type workerConn struct {
 }
 
 type controlConn struct {
-	conn *ws.Conn
-	send chan protocol.Envelope
+	conn     *ws.Conn
+	send     chan protocol.Envelope
+	tenantID string
+	admin    bool
 }
+
+type authContext struct {
+	Admin      bool
+	Credential credentialEntry
+}
+
+type authContextKey struct{}
 
 func New(addr, token string, logger *slog.Logger) *Server {
 	if logger == nil {
@@ -54,7 +64,7 @@ func New(addr, token string, logger *slog.Logger) *Server {
 		workers:     map[string]*workerConn{},
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
-		joinTokens:  newJoinTokenStore(),
+		auth:        newAuthStore(),
 	}
 }
 
@@ -63,10 +73,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/", s.handleLanding)
 	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/signals", s.handleSignals)
 	mux.HandleFunc("/api/join-tokens", s.handleJoinTokens)
-	mux.HandleFunc("/api/workers", s.requireAuth(s.handleWorkers))
-	mux.HandleFunc("/api/sessions", s.requireAuth(s.handleSessions))
-	mux.HandleFunc("/api/sessions/", s.requireAuth(s.handleSessionAction))
+	mux.HandleFunc("/api/exchange", s.handleExchange)
+	mux.HandleFunc("/api/workers", s.requireRole("control", s.handleWorkers))
+	mux.HandleFunc("/api/sessions", s.requireRole("control", s.handleSessions))
+	mux.HandleFunc("/api/sessions/", s.requireRole("control", s.handleSessionAction))
 	mux.HandleFunc("/ws/worker", s.handleWorkerWS)
 	mux.HandleFunc("/ws/control", s.handleControlWS)
 
@@ -118,34 +130,64 @@ func (s *Server) handleControlPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
+	s.handleSignals(w, r)
+}
+
+func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	minted, err := s.joinTokens.Mint(defaultJoinTokenTTL, 2, nil)
+	minted, err := s.auth.MintSignal(defaultSignalTTL, 0, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	baseURL := requestBaseURL(r)
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"token":           minted.Token,
+		"token":           minted.Signal,
+		"signal":          minted.Signal,
+		"signal_id":       minted.ID,
+		"tenant_id":       minted.TenantID,
 		"expires_at":      minted.ExpiresAt,
 		"uses_remaining":  minted.UsesRemaining,
-		"reusable":        true,
+		"reusable":        minted.UsesRemaining < 0,
 		"scopes":          minted.Scopes,
-		"worker_command":  installWorkerCommand(baseURL, minted.Token),
-		"control_command": installControlCommand(baseURL, minted.Token),
-		"control_url":     controlPageURL(baseURL, minted.Token),
+		"worker_command":  installWorkerCommand(baseURL, minted.Signal),
+		"control_command": installControlCommand(baseURL, minted.Signal),
+		"control_url":     controlPageURL(baseURL, minted.Signal),
 	})
 }
 
-func (s *Server) handleWorkers(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req exchangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	credential, err := s.auth.Exchange(req)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
+	auth := requestAuth(r)
 	s.mu.RLock()
 	workers := make([]protocol.WorkerView, 0, len(s.workers))
 	for _, worker := range s.workers {
+		if !auth.Admin && worker.tenantID != auth.Credential.TenantID {
+			continue
+		}
 		workers = append(workers, protocol.WorkerView{
 			ID:       worker.id,
+			TenantID: worker.tenantID,
 			Name:     worker.name,
 			Addr:     worker.addr,
 			LastSeen: worker.lastSeen,
@@ -158,14 +200,19 @@ func (s *Server) handleWorkers(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		auth := requestAuth(r)
 		s.mu.RLock()
 		sessions := make([]protocol.SessionView, 0, len(s.sessions))
 		for _, session := range s.sessions {
+			if !auth.Admin && session.TenantID != auth.Credential.TenantID {
+				continue
+			}
 			sessions = append(sessions, session)
 		}
 		s.mu.RUnlock()
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 	case http.MethodPost:
+		auth := requestAuth(r)
 		var req protocol.CreateSession
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -173,6 +220,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Command) == "" {
 			writeError(w, http.StatusBadRequest, "worker_id, name and command are required")
+			return
+		}
+		if !auth.Admin && !s.workerInTenant(req.WorkerID, auth.Credential.TenantID) {
+			writeError(w, http.StatusForbidden, "worker is not in credential tenant")
 			return
 		}
 		if err := s.sendToWorker(req.WorkerID, protocol.TypeSessionCreate, protocol.Session{
@@ -188,6 +239,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
+	auth := requestAuth(r)
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/")
 	if len(parts) < 2 {
 		writeError(w, http.StatusNotFound, "session path must be /api/sessions/{worker}/{name}")
@@ -195,6 +247,10 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 	}
 	workerID, name := parts[0], parts[1]
 	sessionID := protocol.SessionID(workerID, name)
+	if !auth.Admin && !s.workerInTenant(workerID, auth.Credential.TenantID) {
+		writeError(w, http.StatusForbidden, "worker is not in credential tenant")
+		return
+	}
 	if r.Method == http.MethodDelete {
 		if err := s.sendToWorker(workerID, protocol.TypeSessionKill, map[string]string{"name": name}, "", sessionID); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -220,7 +276,8 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	auth, ok := s.authenticateRole(r, "worker")
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -239,6 +296,7 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	addr := remoteHost(r.RemoteAddr)
 	worker := &workerConn{
 		id:       first.WorkerID,
+		tenantID: authTenantID(auth),
 		name:     hello.Name,
 		addr:     addr,
 		lastSeen: time.Now().UTC(),
@@ -259,7 +317,8 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	auth, ok := s.authenticateRole(r, "control")
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -268,7 +327,7 @@ func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("control websocket upgrade failed", "error", err)
 		return
 	}
-	control := &controlConn{conn: conn, send: make(chan protocol.Envelope, 64)}
+	control := &controlConn{conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin}
 	defer s.removeControl(control)
 	go writeLoop(conn, control.send)
 	for {
@@ -332,8 +391,9 @@ func (s *Server) updateSessions(workerID string, sessions []protocol.Session) {
 	}
 	for _, session := range sessions {
 		id := protocol.SessionID(workerID, session.Name)
+		tenantID := s.workerTenantIDLocked(workerID)
 		s.sessions[id] = protocol.SessionView{
-			ID: id, WorkerID: workerID, Name: session.Name,
+			ID: id, TenantID: tenantID, WorkerID: workerID, Name: session.Name,
 			CWD: session.CWD, Command: session.Command, Status: session.Status,
 		}
 	}
@@ -356,6 +416,10 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, "invalid session_id")
 			return
 		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
+			return
+		}
 		var size protocol.TerminalSize
 		if err := env.DecodePayload(&size); err != nil {
 			sendError(control.send, env.SessionID, err.Error())
@@ -371,6 +435,10 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, "invalid session_id")
 			return
 		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
+			return
+		}
 		var input protocol.TerminalInput
 		if err := env.DecodePayload(&input); err != nil {
 			sendError(control.send, env.SessionID, err.Error())
@@ -383,6 +451,10 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
 		if !ok {
 			sendError(control.send, env.SessionID, "invalid session_id")
+			return
+		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
 			return
 		}
 		var size protocol.TerminalSize
@@ -461,26 +533,77 @@ func (s *Server) sendToWorker(workerID, messageType string, payload any, name, s
 	}
 }
 
+func (s *Server) workerInTenant(workerID, tenantID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	worker := s.workers[workerID]
+	return worker != nil && worker.tenantID == tenantID
+}
+
+func (s *Server) workerTenantIDLocked(workerID string) string {
+	worker := s.workers[workerID]
+	if worker == nil {
+		return ""
+	}
+	return worker.tenantID
+}
+
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.authorized(r) {
+		auth, ok := s.authenticateRole(r, "")
+		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+	}
+}
+
+func (s *Server) requireRole(role string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth, ok := s.authenticateRole(r, role)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
 	}
 }
 
 func (s *Server) authorized(r *http.Request) bool {
-	if s.token == "" {
-		token := bearerOrQueryToken(r)
-		return token == "" || s.joinTokens.Valid(token)
-	}
+	return s.authorizedRole(r, "")
+}
+
+func (s *Server) authorizedRole(r *http.Request, role string) bool {
+	_, ok := s.authenticateRole(r, role)
+	return ok
+}
+
+func (s *Server) authenticateRole(r *http.Request, role string) (authContext, bool) {
 	token := bearerOrQueryToken(r)
-	if token == s.token {
-		return true
+	if s.token != "" && token == s.token {
+		return authContext{Admin: true}, true
 	}
-	return s.joinTokens.Valid(token)
+	credential, ok := s.auth.Credential(token)
+	if !ok {
+		return authContext{}, false
+	}
+	if role != "" && credential.Role != role {
+		return authContext{}, false
+	}
+	return authContext{Credential: credential}, true
+}
+
+func requestAuth(r *http.Request) authContext {
+	auth, _ := r.Context().Value(authContextKey{}).(authContext)
+	return auth
+}
+
+func authTenantID(auth authContext) string {
+	if auth.Admin {
+		return "admin"
+	}
+	return auth.Credential.TenantID
 }
 
 func bearerOrQueryToken(r *http.Request) string {
@@ -573,7 +696,7 @@ func controlPageURL(baseURL string, token string) string {
 		return baseURL + "/control"
 	}
 	q := u.Query()
-	q.Set("token", token)
+	q.Set("signal", token)
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -611,15 +734,15 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     const result = document.getElementById('result');
     document.getElementById('mint').addEventListener('click', async () => {
       result.textContent = 'Generating...';
-      const res = await fetch('/api/join-tokens', { method: 'POST' });
+      const res = await fetch('/api/signals', { method: 'POST' });
       if (!res.ok) {
         result.textContent = 'Failed: ' + await res.text();
         return;
       }
       const data = await res.json();
       result.innerHTML =
-        '<p><strong>Join token</strong><br><code>' + escapeHTML(data.token) + '</code></p>' +
-        '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Prototype tokens are reusable until expiry.</p>' +
+        '<p><strong>Signal</strong><br><code>' + escapeHTML(data.signal || data.token) + '</code></p>' +
+        '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Signals are exchanged for scoped credentials.</p>' +
         '<p><strong>Web Control</strong><br><a href="' + escapeAttr(data.control_url) + '">' + escapeHTML(data.control_url) + '</a></p>' +
         '<p><strong>Worker</strong></p>' +
         '<pre>' + escapeHTML(data.worker_command) + '</pre>' +
@@ -752,8 +875,8 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
         <button id="refresh" title="Refresh sessions">Refresh</button>
       </div>
       <div class="token">
-        <label for="token">Token</label>
-        <input id="token" autocomplete="off" spellcheck="false" placeholder="amx_join_... or shared token">
+        <label for="token">Credential</label>
+        <input id="token" autocomplete="off" spellcheck="false" placeholder="amx_cred_... or dev token">
       </div>
       <div id="sessions" class="sessions"></div>
       <form id="create" class="create">
@@ -822,9 +945,14 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
 
     const query = new URLSearchParams(location.search);
     const debug = query.get('debug') === '1';
+    const initialSignal = query.get('signal') || '';
     const initialToken = query.get('token') || localStorage.getItem('agentmux.token') || '';
     tokenInput.value = initialToken;
-    if (initialToken) refreshAll();
+    if (initialSignal) {
+      exchangeSignal(initialSignal);
+    } else if (initialToken) {
+      refreshAll();
+    }
 
     tokenInput.addEventListener('change', () => {
       localStorage.setItem('agentmux.token', tokenInput.value.trim());
@@ -859,6 +987,30 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       setStatus('Create queued', workerID + '/' + payload.name, 'warn');
       setTimeout(refreshAll, 700);
     });
+
+    async function exchangeSignal(signal) {
+      setStatus('Exchanging signal', 'Requesting a scoped browser credential.', 'warn');
+      const res = await fetch(hubBase + '/api/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          signal,
+          role: 'control',
+          device_name: navigator.userAgent,
+          device_id: localStorage.getItem('agentmux.control_device_id') || ''
+        })
+      });
+      if (!res.ok) {
+        setStatus('Signal exchange failed', await res.text(), 'err');
+        return;
+      }
+      const data = await res.json();
+      tokenInput.value = data.credential;
+      localStorage.setItem('agentmux.token', data.credential);
+      localStorage.setItem('agentmux.control_device_id', data.device_id);
+      setStatus('Credential ready', data.credential_id + ' · ' + data.tenant_id, 'ok');
+      await refreshAll();
+    }
 
     async function refreshAll() {
       localStorage.setItem('agentmux.token', tokenInput.value.trim());

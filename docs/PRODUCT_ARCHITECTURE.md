@@ -69,17 +69,18 @@ Properties:
 - No durable account ownership.
 - Good for local demos, trusted personal machines, and quick trials.
 
-Suggested signal shape:
+Signal shape:
 
 ```text
-amx_join_<random>
+amx_sig_<random>
 ```
 
-Hub stores only a hash of the join token plus metadata:
+Hub stores only a hash of the signal token plus metadata:
 
 ```text
 id
 token_hash
+tenant_id
 expires_at
 uses_remaining
 scopes
@@ -111,6 +112,37 @@ Capabilities:
 Registered users should still use short-lived join signals for new devices, but
 the resulting worker/control gets a durable device credential.
 
+### Signal Exchange
+
+Signals are bootstrap material only. Worker and control clients must exchange a
+signal for a scoped credential before using normal HTTP or WebSocket APIs.
+
+```text
+POST /api/exchange
+{
+  "signal": "amx_sig_xxx",
+  "role": "worker|control",
+  "device_name": "laptop",
+  "device_id": "optional-stable-device-id"
+}
+```
+
+Response:
+
+```json
+{
+  "credential": "amx_cred_...",
+  "credential_id": "cred_...",
+  "role": "worker",
+  "tenant_id": "anon_...",
+  "expires_at": "2026-06-09T12:00:00Z"
+}
+```
+
+The current in-memory implementation may issue reusable credentials for a short
+period. Production credentials should be revocable, auditable, tenant-scoped,
+and persisted.
+
 ## Deployment Command
 
 The landing page should generate commands similar to ZeroTier's join flow.
@@ -120,7 +152,7 @@ Worker:
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- worker \
   --hub wss://hub.example.com \
-  --join amx_join_xxx \
+  --join amx_sig_xxx \
   --name "$(hostname)"
 ```
 
@@ -129,29 +161,21 @@ Control CLI:
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- control \
   --hub https://hub.example.com \
-  --join amx_join_xxx
+  --join amx_sig_xxx
 ```
 
 For local development:
 
 ```bash
-go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join amx_join_xxx --name local
+go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join amx_sig_xxx --name local
 ```
 
-The first prototype can use the join token directly as the runtime bearer token.
-Production should exchange the join token for a durable device credential.
+`--join` performs signal exchange and uses the returned credential as the
+runtime bearer token. `--token` remains as a local development/admin override.
 
 ## Trust and Token Model
 
-### Prototype
-
-- `--token` remains for local development.
-- Hub landing page can mint ephemeral tokens.
-- Worker/control can pass `--token` or later `--join`.
-
-### Product
-
-Use two token classes:
+Use three token classes:
 
 1. Join signal
    - short-lived
@@ -162,6 +186,45 @@ Use two token classes:
    - long-lived
    - scoped to worker/control
    - revocable from Hub
+
+3. Hub admin token
+   - deployment/local-development control plane override
+   - never shown in anonymous landing URLs
+   - not a normal worker/control runtime credential
+
+## Multi-Tenant Model
+
+Every signal, credential, worker, control, and session should carry a
+`tenant_id`.
+
+Anonymous onboarding creates a temporary tenant:
+
+```text
+tenant_id = anon_<random>
+expires_at = signal expiry or short anonymous workspace TTL
+```
+
+Registered onboarding attaches signals and credentials to a durable tenant:
+
+```text
+tenant_id = org_<id>
+user_id = usr_<id>
+```
+
+The immediate implementation can keep this in memory, but the API and data
+model should avoid assuming a single global namespace.
+
+## TODO
+
+- Persist signals, credentials, tenants, workers, and audit events in SQLite.
+- Add explicit scopes to every API and WebSocket route.
+- Add credential revocation and expiry cleanup.
+- Vendor xterm.js assets into Go embed; remove CDN dependency.
+- Split Web control code into static files before it grows further.
+- Add worker policy: allowed commands, allowed working directories, max sessions.
+- Add session ownership/audit events.
+- Add registered-user auth and tenant selection.
+- Add direct-mode signaling after relay mode is stable.
 
 ## Routing Modes
 
@@ -232,12 +295,12 @@ The Go CLI should remain a debug tool. The product-grade control should be web.
 
 ## Initial Implementation Plan
 
-1. Add Hub landing page.
-2. Add anonymous join-token generation endpoint.
-3. Show one-line worker and control commands.
-4. Add `--join` alias to worker/control CLI.
-5. Add basic in-memory join-token store.
-6. Later persist token/device state in SQLite.
-7. Add browser control shell with xterm.js.
-8. Add headless terminal state sidecar.
-
+1. Add Hub landing page. Done.
+2. Add anonymous signal generation endpoint. Done.
+3. Show one-line worker and control commands. Done.
+4. Add `--join` exchange flow to worker/control CLI. Done.
+5. Add basic in-memory signal and credential stores. Done.
+6. Add browser control shell with xterm.js. Done.
+7. Vendor web assets and split static files.
+8. Persist auth/device state in SQLite.
+9. Add headless terminal state sidecar.

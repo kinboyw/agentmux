@@ -1,12 +1,14 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -314,6 +316,45 @@ func (w *Worker) sendStreamError(conn *ws.Conn, streamID, sessionID, message str
 	_ = writeEnvelope(conn, env)
 }
 
+func ExchangeSignal(ctx context.Context, hubURL, signal, deviceID, deviceName string) (string, string, error) {
+	base, err := httpBaseURL(hubURL)
+	if err != nil {
+		return "", "", err
+	}
+	req := map[string]string{
+		"signal":      signal,
+		"role":        "worker",
+		"device_id":   deviceID,
+		"device_name": deviceName,
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return "", "", err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/exchange", bytes.NewReader(raw))
+	if err != nil {
+		return "", "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", "", fmt.Errorf("POST /api/exchange failed: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	var payload struct {
+		Credential string `json:"credential"`
+		DeviceID   string `json:"device_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", "", err
+	}
+	return payload.Credential, payload.DeviceID, nil
+}
+
 func workerURL(hubURL, token string) (string, error) {
 	value := strings.TrimRight(hubURL, "/")
 	if strings.HasPrefix(value, "http://") {
@@ -336,6 +377,27 @@ func workerURL(hubURL, token string) (string, error) {
 		parsed.RawQuery = q.Encode()
 	}
 	return parsed.String(), nil
+}
+
+func httpBaseURL(hubURL string) (string, error) {
+	value := strings.TrimRight(hubURL, "/")
+	if strings.HasPrefix(value, "ws://") {
+		value = "http://" + strings.TrimPrefix(value, "ws://")
+	}
+	if strings.HasPrefix(value, "wss://") {
+		value = "https://" + strings.TrimPrefix(value, "wss://")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("hub URL must use http(s) or ws(s)")
+	}
+	parsed.Path = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func payloadName(env protocol.Envelope) string {

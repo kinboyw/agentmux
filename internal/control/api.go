@@ -64,6 +64,25 @@ func (c Client) StopSession(ctx context.Context, sessionID string) error {
 	return c.doJSON(ctx, http.MethodDelete, path, nil, &payload)
 }
 
+func (c Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, deviceName string) (string, error) {
+	var payload struct {
+		Credential string `json:"credential"`
+		DeviceID   string `json:"device_id"`
+	}
+	req := map[string]string{
+		"signal":      signal,
+		"role":        role,
+		"device_id":   deviceID,
+		"device_name": deviceName,
+	}
+	client := c
+	client.Token = ""
+	if err := client.doJSON(ctx, http.MethodPost, "/api/exchange", req, &payload); err != nil {
+		return "", err
+	}
+	return payload.Credential, nil
+}
+
 func (c Client) doJSON(ctx context.Context, method, path string, body any, target any) error {
 	var reader io.Reader
 	if body != nil {

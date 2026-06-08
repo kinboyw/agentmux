@@ -19,11 +19,12 @@ WebSocket endpoints accept either the same Authorization header or:
 
 ### `GET /control`
 
-Serves the browser control shell. Pass a shared token or short-lived join token
-as a query parameter for quick local use:
+Serves the browser control shell. Pass either a development/admin token or a
+short-lived signal:
 
 ```text
 http://127.0.0.1:8081/control?token=<token>
+http://127.0.0.1:8081/control?signal=<amx_sig_...>
 ```
 
 The page uses the same HTTP and WebSocket APIs documented below. Its session
@@ -38,23 +39,58 @@ Returns hub liveness.
 {"status":"ok"}
 ```
 
-### `POST /api/join-tokens`
+### `POST /api/signals`
 
-Mints a short-lived prototype join token. The landing page calls this endpoint
-without authentication.
+Mints a short-lived bootstrap signal. The landing page calls this endpoint
+without authentication. A signal cannot call normal API or WebSocket routes
+directly; worker and control clients must exchange it for a credential.
 
 Response:
 
 ```json
 {
-  "token": "amx_join_...",
-  "expires_at": "2026-06-08T12:10:00Z",
-  "uses_remaining": 2,
+  "token": "amx_sig_...",
+  "signal": "amx_sig_...",
+  "signal_id": "sig_...",
+  "tenant_id": "anon_...",
+  "expires_at": "2026-06-09T12:10:00Z",
+  "uses_remaining": -1,
   "reusable": true,
   "scopes": ["worker:join", "control:join"],
-  "worker_command": "go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join 'amx_join_...' --name $(hostname)",
-  "control_command": "go run ./cmd/agentmux control list --hub http://127.0.0.1:8081 --join 'amx_join_...'",
-  "control_url": "http://127.0.0.1:8081/control?token=amx_join_..."
+  "worker_command": "go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join 'amx_sig_...' --name $(hostname)",
+  "control_command": "go run ./cmd/agentmux control list --hub http://127.0.0.1:8081 --join 'amx_sig_...'",
+  "control_url": "http://127.0.0.1:8081/control?signal=amx_sig_..."
+}
+```
+
+`POST /api/join-tokens` remains as a compatibility alias for now.
+
+### `POST /api/exchange`
+
+Exchanges a signal for a scoped runtime credential.
+
+Request:
+
+```json
+{
+  "signal": "amx_sig_...",
+  "role": "worker",
+  "device_id": "optional-stable-device-id",
+  "device_name": "laptop"
+}
+```
+
+Response:
+
+```json
+{
+  "credential": "amx_cred_...",
+  "credential_id": "cred_...",
+  "tenant_id": "anon_...",
+  "role": "worker",
+  "device_id": "dev_...",
+  "expires_at": "2026-06-10T12:00:00Z",
+  "scopes": ["worker:connect", "session:report", "terminal:stream"]
 }
 ```
 

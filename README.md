@@ -36,6 +36,16 @@ http://127.0.0.1:8081/control?token=dev-token
 The browser UI uses xterm.js for the terminal area and keeps session identity,
 connection state, and detach controls outside the remote terminal buffer.
 
+Signal-based onboarding:
+
+1. Open `http://127.0.0.1:8081/`.
+2. Generate a signal.
+3. Run the generated worker command.
+4. Open the generated Web Control URL.
+
+Signals look like `amx_sig_...` and are exchanged for scoped `amx_cred_...`
+credentials before normal API or WebSocket access.
+
 Terminal 1:
 
 ```bash

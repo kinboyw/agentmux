@@ -28,7 +28,39 @@ Add a browser control surface using xterm.js.
 
 This should become the preferred UI for phones and laptops.
 
-## Phase 3: Headless Terminal State
+## Phase 3: Signal Exchange And Tenant-Aware Auth
+
+Replace prototype direct join-token auth with a bootstrap exchange model.
+
+- Landing page mints `amx_sig_...` signals.
+- Worker/control exchange signals through `POST /api/exchange`.
+- Hub returns scoped `amx_cred_...` credentials.
+- HTTP and WebSocket routes accept credentials, not raw signals.
+- `--token` remains as a development/admin override.
+- All issued credentials carry role, scope, tenant id, expiry, and device id.
+- Anonymous signals create temporary tenants.
+- Registered-user signals later attach to durable tenants.
+
+Implementation order:
+
+1. Add in-memory `SignalStore` and `CredentialStore`.
+2. Add `POST /api/signals` and keep `/api/join-tokens` as a compatibility alias.
+3. Add `POST /api/exchange`.
+4. Update worker `--join` to exchange before opening `/ws/worker`.
+5. Update control CLI `--join` to exchange before API/WS calls.
+6. Update Web `/control?signal=...` to exchange in-browser and store the credential.
+7. Add tests that raw signals cannot access normal API/WS routes.
+
+## Phase 4: Persistence And Policy
+
+- Move signal/credential/worker/session metadata from memory to SQLite.
+- Add expiry cleanup.
+- Add credential revocation.
+- Add audit events for exchange, connect, create, attach, resize, input, kill.
+- Add worker policies for command allowlist, cwd roots, and session limits.
+- Add tenant-level limits for anonymous mode.
+
+## Phase 5: Headless Terminal State
 
 Add a server-side terminal emulator so reconnecting controls can restore current
 screen state instead of only receiving future bytes.
