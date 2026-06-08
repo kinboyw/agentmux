@@ -11,6 +11,7 @@ import {
   Plus,
   RefreshCw,
   SplitSquareHorizontal,
+  SplitSquareVertical,
   TerminalSquare,
   UserPlus,
   X,
@@ -43,10 +44,22 @@ type SessionView = {
   status: string;
 };
 
-type Pane = {
+type SplitDirection = "horizontal" | "vertical";
+
+type PaneNode = {
+  type: "pane";
   id: string;
   sessionId?: string;
 };
+
+type SplitNode = {
+  type: "split";
+  id: string;
+  direction: SplitDirection;
+  children: LayoutNode[];
+};
+
+type LayoutNode = PaneNode | SplitNode;
 
 type Status = {
   tone: "idle" | "ok" | "warn" | "err";
@@ -70,6 +83,7 @@ type AuthCredentialPayload = {
 const query = new URLSearchParams(window.location.search);
 const initialSignal = query.get("signal") || "";
 const initialToken = query.get("token") || localStorage.getItem("agentmux.token") || "";
+const initialPaneId = crypto.randomUUID();
 
 function App() {
   const [token, setToken] = React.useState(initialToken);
@@ -78,8 +92,8 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
   const [authMode, setAuthMode] = React.useState<AuthMode>("login");
   const [authForm, setAuthForm] = React.useState({ email: "", password: "", name: "" });
-  const [panes, setPanes] = React.useState<Pane[]>([{ id: crypto.randomUUID() }]);
-  const [activePane, setActivePane] = React.useState(panes[0].id);
+  const [layout, setLayout] = React.useState<LayoutNode>({ type: "pane", id: initialPaneId });
+  const [activePane, setActivePane] = React.useState<string>(initialPaneId);
   const [status, setStatus] = React.useState<Status>({
     tone: "idle",
     title: "No session attached",
@@ -203,24 +217,31 @@ function App() {
   }
 
   function attach(sessionId: string) {
-    setPanes((items) => items.map((pane) => (pane.id === activePane ? { ...pane, sessionId } : pane)));
+    setLayout((node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
   }
 
-  function splitPane() {
-    const pane = { id: crypto.randomUUID() };
-    setPanes((items) => [...items, pane]);
+  function splitPane(direction: SplitDirection) {
+    splitPaneById(activePane, direction);
+  }
+
+  function splitPaneById(paneId: string, direction: SplitDirection) {
+    const pane = newPane();
+    setLayout((node) => splitPaneNode(node, paneId, direction, pane).node);
     setActivePane(pane.id);
   }
 
   function closePane(id: string) {
-    setPanes((items) => {
-      const next = items.length > 1 ? items.filter((pane) => pane.id !== id) : [{ id: crypto.randomUUID() }];
-      if (!next.some((pane) => pane.id === activePane)) setActivePane(next[0].id);
+    setLayout((node) => {
+      const result = removePane(node, id);
+      const next = result.node || newPane();
+      if (id === activePane || !findPane(next, activePane)) {
+        setActivePane(firstPaneId(next));
+      }
       return next;
     });
   }
 
-  const activeSessionIds = new Set(panes.map((pane) => pane.sessionId).filter(Boolean));
+  const activeSessionIds = new Set(collectPanes(layout).map((pane) => pane.sessionId).filter(Boolean));
 
   return (
     <div className="flex h-screen bg-background text-foreground">
@@ -341,31 +362,88 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
-            <Button variant="secondary" size="sm" onClick={splitPane}>
+            <Button variant="secondary" size="sm" onClick={() => splitPane("horizontal")} title="Split right">
               <SplitSquareHorizontal className="h-4 w-4" />
-              Split
+              Right
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => splitPane("vertical")} title="Split down">
+              <SplitSquareVertical className="h-4 w-4" />
+              Down
             </Button>
           </div>
         </header>
-        <PanelGroup direction="horizontal" className="min-h-0 flex-1">
-          {panes.map((pane, index) => (
-            <React.Fragment key={pane.id}>
-              {index > 0 ? <PanelResizeHandle className="w-1 bg-border transition-colors hover:bg-primary" /> : null}
-              <Panel minSize={20}>
-                <TerminalPane
-                  pane={pane}
-                  active={pane.id === activePane}
-                  token={token}
-                  onFocus={() => setActivePane(pane.id)}
-                  onClose={() => closePane(pane.id)}
-                  setStatus={setStatus}
-                />
-              </Panel>
-            </React.Fragment>
-          ))}
-        </PanelGroup>
+        <div className="min-h-0 flex-1">
+          <LayoutRenderer
+            node={layout}
+            activePane={activePane}
+            token={token}
+            onFocusPane={setActivePane}
+            onSplitPane={splitPaneById}
+            onClosePane={closePane}
+            setStatus={setStatus}
+          />
+        </div>
       </main>
     </div>
+  );
+}
+
+function LayoutRenderer({
+  node,
+  activePane,
+  token,
+  onFocusPane,
+  onSplitPane,
+  onClosePane,
+  setStatus,
+}: {
+  node: LayoutNode;
+  activePane: string;
+  token: string;
+  onFocusPane: (id: string) => void;
+  onSplitPane: (paneId: string, direction: SplitDirection) => void;
+  onClosePane: (id: string) => void;
+  setStatus: React.Dispatch<React.SetStateAction<Status>>;
+}) {
+  if (node.type === "pane") {
+    return (
+      <TerminalPane
+        pane={node}
+        active={node.id === activePane}
+        token={token}
+        onFocus={() => onFocusPane(node.id)}
+        onSplit={(direction) => onSplitPane(node.id, direction)}
+        onClose={() => onClosePane(node.id)}
+        setStatus={setStatus}
+      />
+    );
+  }
+  return (
+    <PanelGroup direction={node.direction} className="h-full w-full min-h-0">
+      {node.children.map((child, index) => (
+        <React.Fragment key={child.id}>
+          {index > 0 ? (
+            <PanelResizeHandle
+              className={cn(
+                "bg-border transition-colors hover:bg-primary",
+                node.direction === "horizontal" ? "w-1" : "h-1",
+              )}
+            />
+          ) : null}
+          <Panel minSize={15}>
+            <LayoutRenderer
+              node={child}
+              activePane={activePane}
+              token={token}
+              onFocusPane={onFocusPane}
+              onSplitPane={onSplitPane}
+              onClosePane={onClosePane}
+              setStatus={setStatus}
+            />
+          </Panel>
+        </React.Fragment>
+      ))}
+    </PanelGroup>
   );
 }
 
@@ -374,13 +452,15 @@ function TerminalPane({
   active,
   token,
   onFocus,
+  onSplit,
   onClose,
   setStatus,
 }: {
-  pane: Pane;
+  pane: PaneNode;
   active: boolean;
   token: string;
   onFocus: () => void;
+  onSplit: (direction: SplitDirection) => void;
   onClose: () => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
@@ -466,9 +546,41 @@ function TerminalPane({
     <div className={cn("flex h-full min-h-0 flex-col border-l border-transparent bg-[#050607]", active && "border-l-primary")} onMouseDown={onFocus}>
       <div className="flex h-9 items-center justify-between border-b border-border bg-card px-2">
         <div className="truncate text-xs font-medium text-muted-foreground">{pane.sessionId || "Empty pane"}</div>
-        <Button variant="ghost" size="icon" onClick={onClose} title="Close pane">
-          <X className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={(event) => {
+              event.stopPropagation();
+              onSplit("horizontal");
+            }}
+            title="Split right"
+          >
+            <SplitSquareHorizontal className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={(event) => {
+              event.stopPropagation();
+              onSplit("vertical");
+            }}
+            title="Split down"
+          >
+            <SplitSquareVertical className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={(event) => {
+              event.stopPropagation();
+              onClose();
+            }}
+            title="Close pane"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
       <div className="min-h-0 flex-1 p-2">
         {pane.sessionId ? (
@@ -481,6 +593,66 @@ function TerminalPane({
       </div>
     </div>
   );
+}
+
+function newPane(sessionId?: string): PaneNode {
+  return { type: "pane", id: crypto.randomUUID(), sessionId };
+}
+
+function updatePane(node: LayoutNode, paneId: string, update: (pane: PaneNode) => PaneNode): LayoutNode {
+  if (node.type === "pane") {
+    return node.id === paneId ? update(node) : node;
+  }
+  return { ...node, children: node.children.map((child) => updatePane(child, paneId, update)) };
+}
+
+function splitPaneNode(node: LayoutNode, paneId: string, direction: SplitDirection, pane: PaneNode): { node: LayoutNode; found: boolean } {
+  if (node.type === "pane") {
+    if (node.id !== paneId) return { node, found: false };
+    return { node: { type: "split", id: crypto.randomUUID(), direction, children: [node, pane] }, found: true };
+  }
+  let found = false;
+  const children = node.children.map((child) => {
+    if (found) return child;
+    const result = splitPaneNode(child, paneId, direction, pane);
+    found = result.found;
+    return result.node;
+  });
+  return { node: { ...node, children }, found };
+}
+
+function removePane(node: LayoutNode, paneId: string): { node?: LayoutNode; removed: boolean } {
+  if (node.type === "pane") {
+    return node.id === paneId ? { removed: true } : { node, removed: false };
+  }
+  let removed = false;
+  const children = node.children.flatMap((child) => {
+    const result = removePane(child, paneId);
+    if (result.removed) removed = true;
+    return result.node ? [result.node] : [];
+  });
+  if (!removed) return { node, removed: false };
+  if (children.length === 0) return { removed: true };
+  if (children.length === 1) return { node: children[0], removed: true };
+  return { node: { ...node, children }, removed: true };
+}
+
+function collectPanes(node: LayoutNode): PaneNode[] {
+  if (node.type === "pane") return [node];
+  return node.children.flatMap(collectPanes);
+}
+
+function findPane(node: LayoutNode, paneId: string): PaneNode | undefined {
+  if (node.type === "pane") return node.id === paneId ? node : undefined;
+  for (const child of node.children) {
+    const pane = findPane(child, paneId);
+    if (pane) return pane;
+  }
+  return undefined;
+}
+
+function firstPaneId(node: LayoutNode): string {
+  return node.type === "pane" ? node.id : firstPaneId(node.children[0]);
 }
 
 function sendEnvelope(ws: WebSocket, type: string, sessionId: string, streamId: string, payload: unknown) {
