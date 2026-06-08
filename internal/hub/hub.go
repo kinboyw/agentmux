@@ -797,6 +797,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     const sessionsEl = document.getElementById('sessions');
     const workerSelect = document.getElementById('worker');
     const terminalEl = document.getElementById('terminal');
+    const terminalWrap = terminalEl.parentElement;
     const statusTitle = document.getElementById('statusTitle');
     const statusSub = document.getElementById('statusSub');
     const stateEl = document.getElementById('state');
@@ -916,6 +917,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       });
       fit = new FitAddon();
       term.loadAddon(fit);
+      syncTerminalElementSize();
       term.open(terminalEl);
       term.focus();
       watchTerminalSize();
@@ -927,7 +929,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       detachButton.disabled = false;
 
       socket.addEventListener('open', () => {
-        fit.fit();
+        refitTerminal(false);
         lastSize = { cols: term.cols, rows: term.rows };
         sendEnvelope('control.open', sessionID, { cols: term.cols, rows: term.rows });
         stabilizeInitialTerminalFit();
@@ -975,6 +977,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
 
     function refitTerminal(force) {
       if (!term || !fit) return;
+      syncTerminalElementSize();
       fit.fit();
       if (!term.cols || !term.rows) return;
       const changed = term.cols !== lastSize.cols || term.rows !== lastSize.rows;
@@ -999,7 +1002,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
         return;
       }
       resizeObserver = new ResizeObserver(() => scheduleResize());
-      resizeObserver.observe(terminalEl);
+      resizeObserver.observe(terminalWrap);
     }
 
     function stopWatchingTerminalSize() {
@@ -1008,6 +1011,19 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
         resizeObserver.disconnect();
         resizeObserver = null;
       }
+    }
+
+    function syncTerminalElementSize() {
+      if (!terminalWrap) return;
+      const rect = terminalWrap.getBoundingClientRect();
+      const style = getComputedStyle(terminalWrap);
+      const horizontalPadding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+      const verticalPadding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      const width = Math.max(0, Math.floor(rect.width - horizontalPadding));
+      const height = Math.max(0, Math.floor(rect.height - verticalPadding));
+      if (!width || !height) return;
+      terminalEl.style.width = width + 'px';
+      terminalEl.style.height = height + 'px';
     }
 
     function detach() {
