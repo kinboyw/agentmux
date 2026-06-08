@@ -53,5 +53,6 @@ alive. `Ctrl-C` is forwarded to the remote agent.
 ## Documents
 
 - [Design](docs/DESIGN.md)
+- [Product Architecture](docs/PRODUCT_ARCHITECTURE.md)
 - [API](docs/API.md)
 - [Roadmap](docs/ROADMAP.md)

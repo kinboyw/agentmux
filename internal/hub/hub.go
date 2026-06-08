@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ type Server struct {
 	workers     map[string]*workerConn
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
+	joinTokens  *joinTokenStore
 }
 
 type workerConn struct {
@@ -51,12 +53,15 @@ func New(addr, token string, logger *slog.Logger) *Server {
 		workers:     map[string]*workerConn{},
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
+		joinTokens:  newJoinTokenStore(),
 	}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleLanding)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/join-tokens", s.handleJoinTokens)
 	mux.HandleFunc("/api/workers", s.requireAuth(s.handleWorkers))
 	mux.HandleFunc("/api/sessions", s.requireAuth(s.handleSessions))
 	mux.HandleFunc("/api/sessions/", s.requireAuth(s.handleSessionAction))
@@ -80,6 +85,41 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	baseURL := requestBaseURL(r)
+	data := landingData{
+		BaseURL: baseURL,
+		WSURL:   websocketBase(baseURL),
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = landingTemplate.Execute(w, data)
+}
+
+func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	minted, err := s.joinTokens.Mint(defaultJoinTokenTTL, 2, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	baseURL := requestBaseURL(r)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"token":           minted.Token,
+		"expires_at":      minted.ExpiresAt,
+		"uses_remaining":  minted.UsesRemaining,
+		"scopes":          minted.Scopes,
+		"worker_command":  installWorkerCommand(baseURL, minted.Token),
+		"control_command": installControlCommand(baseURL, minted.Token),
+	})
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, _ *http.Request) {
@@ -410,14 +450,26 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) authorized(r *http.Request) bool {
 	if s.token == "" {
+		token := bearerOrQueryToken(r)
+		return token == "" || s.joinTokens.Valid(token)
+	}
+	token := bearerOrQueryToken(r)
+	if token == s.token {
 		return true
 	}
-	if r.URL.Query().Get("token") == s.token {
-		return true
+	return s.joinTokens.Valid(token)
+}
+
+func bearerOrQueryToken(r *http.Request) string {
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token
 	}
 	header := r.Header.Get("Authorization")
 	scheme, token, ok := strings.Cut(header, " ")
-	return ok && strings.EqualFold(scheme, "Bearer") && token == s.token
+	if ok && strings.EqualFold(scheme, "Bearer") {
+		return token
+	}
+	return ""
 }
 
 func readEnvelope(conn *ws.Conn) (protocol.Envelope, error) {
@@ -469,3 +521,74 @@ func remoteHost(addr string) string {
 	}
 	return host
 }
+
+type landingData struct {
+	BaseURL string
+	WSURL   string
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	host := r.Host
+	if forwardedHost := r.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
+		host = forwardedHost
+	}
+	return scheme + "://" + host
+}
+
+var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentMux Hub</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: Canvas; color: CanvasText; }
+    main { max-width: 980px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 36px; margin: 0 0 12px; }
+    p { color: color-mix(in srgb, CanvasText 70%, Canvas 30%); line-height: 1.5; }
+    .panel { border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas 82%); border-radius: 8px; padding: 20px; margin-top: 24px; }
+    button { font: inherit; padding: 10px 14px; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas 75%); background: CanvasText; color: Canvas; cursor: pointer; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre { overflow-x: auto; padding: 14px; border-radius: 6px; background: color-mix(in srgb, CanvasText 8%, Canvas 92%); }
+    .muted { font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AgentMux Hub</h1>
+    <p>Generate a short-lived join signal, connect a worker, then control long-lived agent sessions through this hub.</p>
+    <div class="panel">
+      <p class="muted">Hub: <code>{{.BaseURL}}</code><br>Worker WebSocket: <code>{{.WSURL}}</code></p>
+      <button id="mint">Generate join signal</button>
+      <div id="result"></div>
+    </div>
+  </main>
+  <script>
+    const result = document.getElementById('result');
+    document.getElementById('mint').addEventListener('click', async () => {
+      result.textContent = 'Generating...';
+      const res = await fetch('/api/join-tokens', { method: 'POST' });
+      if (!res.ok) {
+        result.textContent = 'Failed: ' + await res.text();
+        return;
+      }
+      const data = await res.json();
+      result.innerHTML =
+        '<p><strong>Join token</strong><br><code>' + escapeHTML(data.token) + '</code></p>' +
+        '<p class="muted">Expires at ' + escapeHTML(data.expires_at) + '. Uses remaining: ' + escapeHTML(String(data.uses_remaining)) + '.</p>' +
+        '<p><strong>Worker</strong></p>' +
+        '<pre>' + escapeHTML(data.worker_command) + '</pre>' +
+        '<p><strong>Control</strong></p>' +
+        '<pre>' + escapeHTML(data.control_command) + '</pre>';
+    });
+    function escapeHTML(value) {
+      return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+  </script>
+</body>
+</html>`))
