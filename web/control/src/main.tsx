@@ -45,6 +45,7 @@ type SessionView = {
 };
 
 type SplitDirection = "horizontal" | "vertical";
+type DropZone = "left" | "right" | "top" | "bottom" | "center";
 
 type PaneNode = {
   type: "pane";
@@ -80,6 +81,22 @@ type AuthCredentialPayload = {
   };
 };
 
+type DragPayload =
+  | {
+      kind: "session";
+      sessionId: string;
+    }
+  | {
+      kind: "pane";
+      paneId: string;
+    };
+
+type DropTarget = {
+  paneId: string;
+  zone: DropZone;
+};
+
+const dragMime = "application/x-agentmux-drag";
 const query = new URLSearchParams(window.location.search);
 const initialSignal = query.get("signal") || "";
 const initialToken = query.get("token") || localStorage.getItem("agentmux.token") || "";
@@ -94,6 +111,7 @@ function App() {
   const [authForm, setAuthForm] = React.useState({ email: "", password: "", name: "" });
   const [layout, setLayout] = React.useState<LayoutNode>({ type: "pane", id: initialPaneId });
   const [activePane, setActivePane] = React.useState<string>(initialPaneId);
+  const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
   const [status, setStatus] = React.useState<Status>({
     tone: "idle",
     title: "No session attached",
@@ -230,6 +248,32 @@ function App() {
     setActivePane(pane.id);
   }
 
+  function dropOnPane(targetPaneId: string, zone: DropZone, payload: DragPayload) {
+    setDropTarget(null);
+    if (payload.kind === "session") {
+      const pane = zone === "center" ? undefined : newPane(payload.sessionId);
+      setLayout((node) => {
+        if (zone === "center") return updatePane(node, targetPaneId, (pane) => ({ ...pane, sessionId: payload.sessionId }));
+        return insertPaneRelative(node, targetPaneId, zone, pane!).node;
+      });
+      setActivePane(pane?.id || targetPaneId);
+      return;
+    }
+    if (payload.paneId === targetPaneId) return;
+    if (zone === "center") {
+      setLayout((node) => swapPaneSessions(node, payload.paneId, targetPaneId));
+      setActivePane(targetPaneId);
+      return;
+    }
+    setLayout((node) => {
+      const extracted = extractPane(node, payload.paneId);
+      if (!extracted.pane || !extracted.node || !findPane(extracted.node, targetPaneId)) return node;
+      const inserted = insertPaneRelative(extracted.node, targetPaneId, zone, extracted.pane);
+      return inserted.inserted ? inserted.node : node;
+    });
+    setActivePane(payload.paneId);
+  }
+
   function closePane(id: string) {
     setLayout((node) => {
       const result = removePane(node, id);
@@ -315,11 +359,14 @@ function App() {
             {sessions.map((session) => (
               <button
                 key={session.id}
+                draggable
                 className={cn(
                   "w-full rounded-md border border-transparent px-2 py-2 text-left hover:border-border hover:bg-secondary",
                   activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
                 )}
                 onClick={() => attach(session.id)}
+                onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
+                onDragEnd={() => setDropTarget(null)}
               >
                 <div className="truncate text-sm font-medium">{session.id}</div>
                 <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
@@ -380,6 +427,9 @@ function App() {
             onFocusPane={setActivePane}
             onSplitPane={splitPaneById}
             onClosePane={closePane}
+            dropTarget={dropTarget}
+            onDropTarget={setDropTarget}
+            onDropPayload={dropOnPane}
             setStatus={setStatus}
           />
         </div>
@@ -395,6 +445,9 @@ function LayoutRenderer({
   onFocusPane,
   onSplitPane,
   onClosePane,
+  dropTarget,
+  onDropTarget,
+  onDropPayload,
   setStatus,
 }: {
   node: LayoutNode;
@@ -403,6 +456,9 @@ function LayoutRenderer({
   onFocusPane: (id: string) => void;
   onSplitPane: (paneId: string, direction: SplitDirection) => void;
   onClosePane: (id: string) => void;
+  dropTarget: DropTarget | null;
+  onDropTarget: (target: DropTarget | null) => void;
+  onDropPayload: (paneId: string, zone: DropZone, payload: DragPayload) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
   if (node.type === "pane") {
@@ -414,6 +470,9 @@ function LayoutRenderer({
         onFocus={() => onFocusPane(node.id)}
         onSplit={(direction) => onSplitPane(node.id, direction)}
         onClose={() => onClosePane(node.id)}
+        dropTarget={dropTarget?.paneId === node.id ? dropTarget : null}
+        onDropTarget={onDropTarget}
+        onDropPayload={(zone, payload) => onDropPayload(node.id, zone, payload)}
         setStatus={setStatus}
       />
     );
@@ -438,6 +497,9 @@ function LayoutRenderer({
               onFocusPane={onFocusPane}
               onSplitPane={onSplitPane}
               onClosePane={onClosePane}
+              dropTarget={dropTarget}
+              onDropTarget={onDropTarget}
+              onDropPayload={onDropPayload}
               setStatus={setStatus}
             />
           </Panel>
@@ -454,6 +516,9 @@ function TerminalPane({
   onFocus,
   onSplit,
   onClose,
+  dropTarget,
+  onDropTarget,
+  onDropPayload,
   setStatus,
 }: {
   pane: PaneNode;
@@ -462,6 +527,9 @@ function TerminalPane({
   onFocus: () => void;
   onSplit: (direction: SplitDirection) => void;
   onClose: () => void;
+  dropTarget: DropTarget | null;
+  onDropTarget: (target: DropTarget | null) => void;
+  onDropPayload: (zone: DropZone, payload: DragPayload) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
   const terminalRef = React.useRef<HTMLDivElement | null>(null);
@@ -543,9 +611,37 @@ function TerminalPane({
   }, [pane.sessionId, token, setStatus]);
 
   return (
-    <div className={cn("flex h-full min-h-0 flex-col border-l border-transparent bg-[#050607]", active && "border-l-primary")} onMouseDown={onFocus}>
+    <div
+      className={cn("relative flex h-full min-h-0 flex-col border-l border-transparent bg-[#050607]", active && "border-l-primary")}
+      onMouseDown={onFocus}
+      onDragOver={(event) => {
+        const payload = readDragPayload(event);
+        if (!payload) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = payload.kind === "pane" ? "move" : "copy";
+        onDropTarget({ paneId: pane.id, zone: dropZoneFromEvent(event) });
+      }}
+      onDragLeave={(event) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        onDropTarget(null);
+      }}
+      onDrop={(event) => {
+        const payload = readDragPayload(event);
+        if (!payload) return;
+        event.preventDefault();
+        onDropPayload(dropZoneFromEvent(event), payload);
+      }}
+    >
       <div className="flex h-9 items-center justify-between border-b border-border bg-card px-2">
-        <div className="truncate text-xs font-medium text-muted-foreground">{pane.sessionId || "Empty pane"}</div>
+        <div
+          className="min-w-0 flex-1 cursor-grab truncate text-xs font-medium text-muted-foreground active:cursor-grabbing"
+          draggable
+          onDragStart={(event) => setDragPayload(event, { kind: "pane", paneId: pane.id })}
+          onDragEnd={() => onDropTarget(null)}
+          title="Drag pane"
+        >
+          {pane.sessionId || "Empty pane"}
+        </div>
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
@@ -591,6 +687,25 @@ function TerminalPane({
           </Card>
         )}
       </div>
+      <DropIndicator zone={dropTarget?.zone} />
+    </div>
+  );
+}
+
+function DropIndicator({ zone }: { zone?: DropZone }) {
+  if (!zone) return null;
+  return (
+    <div className="pointer-events-none absolute inset-0 z-10">
+      <div
+        className={cn(
+          "absolute rounded-sm border border-primary bg-primary/20",
+          zone === "center" && "inset-3",
+          zone === "left" && "inset-y-2 left-2 w-1/3",
+          zone === "right" && "inset-y-2 right-2 w-1/3",
+          zone === "top" && "inset-x-2 top-2 h-1/3",
+          zone === "bottom" && "inset-x-2 bottom-2 h-1/3",
+        )}
+      />
     </div>
   );
 }
@@ -621,6 +736,26 @@ function splitPaneNode(node: LayoutNode, paneId: string, direction: SplitDirecti
   return { node: { ...node, children }, found };
 }
 
+function insertPaneRelative(node: LayoutNode, paneId: string, zone: DropZone, pane: PaneNode): { node: LayoutNode; inserted: boolean } {
+  if (zone === "center") {
+    return { node: updatePane(node, paneId, () => pane), inserted: true };
+  }
+  const direction = zone === "left" || zone === "right" ? "horizontal" : "vertical";
+  if (node.type === "pane") {
+    if (node.id !== paneId) return { node, inserted: false };
+    const children = zone === "left" || zone === "top" ? [pane, node] : [node, pane];
+    return { node: { type: "split", id: crypto.randomUUID(), direction, children }, inserted: true };
+  }
+  let inserted = false;
+  const children = node.children.map((child) => {
+    if (inserted) return child;
+    const result = insertPaneRelative(child, paneId, zone, pane);
+    inserted = result.inserted;
+    return result.node;
+  });
+  return { node: { ...node, children }, inserted };
+}
+
 function removePane(node: LayoutNode, paneId: string): { node?: LayoutNode; removed: boolean } {
   if (node.type === "pane") {
     return node.id === paneId ? { removed: true } : { node, removed: false };
@@ -635,6 +770,37 @@ function removePane(node: LayoutNode, paneId: string): { node?: LayoutNode; remo
   if (children.length === 0) return { removed: true };
   if (children.length === 1) return { node: children[0], removed: true };
   return { node: { ...node, children }, removed: true };
+}
+
+function extractPane(node: LayoutNode, paneId: string): { node?: LayoutNode; pane?: PaneNode; removed: boolean } {
+  if (node.type === "pane") {
+    return node.id === paneId ? { pane: node, removed: true } : { node, removed: false };
+  }
+  let removed = false;
+  let pane: PaneNode | undefined;
+  const children = node.children.flatMap((child) => {
+    const result = extractPane(child, paneId);
+    if (result.removed) {
+      removed = true;
+      pane = result.pane;
+    }
+    return result.node ? [result.node] : [];
+  });
+  if (!removed) return { node, removed: false };
+  if (children.length === 0) return { pane, removed: true };
+  if (children.length === 1) return { node: children[0], pane, removed: true };
+  return { node: { ...node, children }, pane, removed: true };
+}
+
+function swapPaneSessions(node: LayoutNode, sourcePaneId: string, targetPaneId: string): LayoutNode {
+  const source = findPane(node, sourcePaneId);
+  const target = findPane(node, targetPaneId);
+  if (!source || !target) return node;
+  return updatePane(
+    updatePane(node, sourcePaneId, (pane) => ({ ...pane, sessionId: target.sessionId })),
+    targetPaneId,
+    (pane) => ({ ...pane, sessionId: source.sessionId }),
+  );
 }
 
 function collectPanes(node: LayoutNode): PaneNode[] {
@@ -653,6 +819,37 @@ function findPane(node: LayoutNode, paneId: string): PaneNode | undefined {
 
 function firstPaneId(node: LayoutNode): string {
   return node.type === "pane" ? node.id : firstPaneId(node.children[0]);
+}
+
+function setDragPayload(event: React.DragEvent, payload: DragPayload) {
+  event.dataTransfer.effectAllowed = payload.kind === "pane" ? "move" : "copyMove";
+  event.dataTransfer.setData(dragMime, JSON.stringify(payload));
+  event.dataTransfer.setData("text/plain", payload.kind === "session" ? payload.sessionId : payload.paneId);
+}
+
+function readDragPayload(event: React.DragEvent): DragPayload | null {
+  const value = event.dataTransfer.getData(dragMime);
+  if (!value) return null;
+  try {
+    const payload = JSON.parse(value) as DragPayload;
+    if (payload.kind === "session" && payload.sessionId) return payload;
+    if (payload.kind === "pane" && payload.paneId) return payload;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function dropZoneFromEvent(event: React.DragEvent<HTMLElement>): DropZone {
+  const rect = event.currentTarget.getBoundingClientRect();
+  const x = (event.clientX - rect.left) / Math.max(rect.width, 1);
+  const y = (event.clientY - rect.top) / Math.max(rect.height, 1);
+  const edge = 0.28;
+  if (x < edge) return "left";
+  if (x > 1 - edge) return "right";
+  if (y < edge) return "top";
+  if (y > 1 - edge) return "bottom";
+  return "center";
 }
 
 function sendEnvelope(ws: WebSocket, type: string, sessionId: string, streamId: string, payload: unknown) {
