@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -74,6 +75,9 @@ func (a Adapter) List(ctx context.Context) ([]Session, error) {
 	for _, session := range seen {
 		sessions = append(sessions, session)
 	}
+	slices.SortFunc(sessions, func(a, b Session) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 	return sessions, nil
 }
 

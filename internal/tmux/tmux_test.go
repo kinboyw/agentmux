@@ -31,9 +31,18 @@ func TestListParsesTmuxPanes(t *testing.T) {
 	if len(sessions) != 2 {
 		t.Fatalf("expected 2 sessions, got %d", len(sessions))
 	}
-	if sessions[1].Status != "attached" {
-		t.Fatalf("unexpected status: %+v", sessions[1])
+	if sessionByName(sessions, "attached").Status != "attached" {
+		t.Fatalf("unexpected status: %+v", sessions)
 	}
+}
+
+func sessionByName(sessions []Session, name string) Session {
+	for _, session := range sessions {
+		if session.Name == name {
+			return session
+		}
+	}
+	return Session{}
 }
 
 func TestSendInputSplitsNewline(t *testing.T) {
