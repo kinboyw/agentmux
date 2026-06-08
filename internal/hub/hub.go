@@ -718,7 +718,11 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     .dot.warn { background: var(--warn); }
     .dot.err { background: var(--danger); }
     .terminal-wrap { min-width: 0; min-height: 0; padding: 8px; background: #050607; }
-    #terminal { width: 100%; height: 100%; }
+    #terminal { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+    #terminal .xterm { width: 100%; height: 100%; }
+    #terminal .xterm-viewport { width: 100% !important; }
+    #terminal .xterm-screen { width: 100%; height: 100%; }
+    #terminal .xterm-helper-textarea { left: 0; top: 0; }
     .empty {
       height: 100%;
       display: grid;
@@ -807,6 +811,8 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
     let socket = null;
     let streamId = '';
     let resizeTimer = 0;
+    let resizeObserver = null;
+    let lastSize = { cols: 0, rows: 0 };
 
     const initialToken = new URLSearchParams(location.search).get('token') || localStorage.getItem('agentmux.token') || '';
     tokenInput.value = initialToken;
@@ -911,8 +917,11 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       fit = new FitAddon();
       term.loadAddon(fit);
       term.open(terminalEl);
-      fit.fit();
       term.focus();
+      watchTerminalSize();
+      refitTerminal(true);
+      setTimeout(() => refitTerminal(true), 0);
+      setTimeout(() => refitTerminal(true), 120);
       streamId = makeStreamID(sessionID);
       const wsURL = wsBase + '/ws/control?token=' + encodeURIComponent(tokenInput.value.trim());
       socket = new WebSocket(wsURL);
@@ -920,6 +929,8 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       detachButton.disabled = false;
 
       socket.addEventListener('open', () => {
+        fit.fit();
+        lastSize = { cols: term.cols, rows: term.rows };
         sendEnvelope('control.open', sessionID, { cols: term.cols, rows: term.rows });
         setStatus('Attached ' + sessionID, 'stream ' + streamId, 'ok');
       });
@@ -931,7 +942,6 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       socket.addEventListener('error', () => setStatus('WebSocket error', sessionID, 'err'));
 
       term.onData(data => sendEnvelope('control.input', sessionID, { data }));
-      window.addEventListener('resize', scheduleResize);
       scheduleResize();
     }
 
@@ -960,14 +970,44 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
       if (!term || !fit) return;
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
-        fit.fit();
-        sendEnvelope('terminal.resize', activeSession, { cols: term.cols, rows: term.rows });
+        refitTerminal(false);
       }, 80);
+    }
+
+    function refitTerminal(force) {
+      if (!term || !fit) return;
+      fit.fit();
+      if (!term.cols || !term.rows) return;
+      const changed = term.cols !== lastSize.cols || term.rows !== lastSize.rows;
+      if (force || changed) {
+        lastSize = { cols: term.cols, rows: term.rows };
+        sendEnvelope('terminal.resize', activeSession, { cols: term.cols, rows: term.rows });
+      }
+    }
+
+    function watchTerminalSize() {
+      stopWatchingTerminalSize();
+      if (!('ResizeObserver' in window)) {
+        window.addEventListener('resize', scheduleResize);
+        return;
+      }
+      resizeObserver = new ResizeObserver(() => scheduleResize());
+      resizeObserver.observe(terminalEl);
+    }
+
+    function stopWatchingTerminalSize() {
+      window.removeEventListener('resize', scheduleResize);
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+        resizeObserver = null;
+      }
     }
 
     function detach() {
       const previousSession = activeSession;
-      window.removeEventListener('resize', scheduleResize);
+      stopWatchingTerminalSize();
+      clearTimeout(resizeTimer);
+      lastSize = { cols: 0, rows: 0 };
       if (socket && socket.readyState === WebSocket.OPEN) {
         sendEnvelope('terminal.close', activeSession, {});
       }
