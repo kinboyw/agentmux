@@ -70,7 +70,6 @@ func ResetModes(out io.Writer) {
 			"\x1b[?1006l"+ // SGR mouse mode
 			"\x1b[?1015l"+ // urxvt mouse mode
 			"\x1b[?2004l"+ // bracketed paste
-			"\x1b[?1049l"+ // alternate screen
 			"\x1b[?25h"+ // show cursor
 			"\x1b[0m", // reset attributes
 	)
