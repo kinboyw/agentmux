@@ -11,10 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"private/agentmux/internal/appconfig"
 	"private/agentmux/internal/control"
 	"private/agentmux/internal/credentialcache"
 	"private/agentmux/internal/hub"
 	"private/agentmux/internal/protocol"
+	"private/agentmux/internal/ptybackend"
+	"private/agentmux/internal/sessionbackend"
 	"private/agentmux/internal/term"
 	"private/agentmux/internal/tmux"
 	"private/agentmux/internal/worker"
@@ -58,13 +61,15 @@ func runDefault(ctx context.Context) {
 	}
 	switch entry.Role {
 	case "worker":
-		runWorkerWithAuth(ctx, entry.HubURL, entry.Credential, entry.DeviceID, entry.DeviceName, time.Second, "cache")
+		runWorkerWithAuth(ctx, entry.HubURL, entry.Credential, entry.DeviceID, entry.DeviceName, time.Second, "cache", "")
 	case "control":
 		defer term.ResetModes(os.Stdout)
+		client := control.New(entry.HubURL, entry.Credential).WithCacheEntry(entry)
 		auth := control.AppAuthResult{
-			Client: control.New(entry.HubURL, entry.Credential), CredentialID: entry.CredentialID,
+			Client: client, CredentialID: entry.CredentialID,
 			TenantID: entry.TenantID, DeviceID: entry.DeviceID, Role: entry.Role,
-			ExpiresAt: entry.ExpiresAt, Source: "cache",
+			ExpiresAt: entry.ExpiresAt, RefreshToken: entry.RefreshToken,
+			RefreshExpiresAt: entry.RefreshExpiresAt, Source: "cache",
 		}
 		app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
 		if err := app.Run(ctx); err != nil && err != context.Canceled {
@@ -99,11 +104,16 @@ func runTUI(ctx context.Context, args []string) {
 		fmt.Fprintln(os.Stderr, "control credential saved")
 		return
 	}
-	auth, err := resolveControlAppAuth(ctx, args)
+	auth, err := resolveControlAppAuthWithLogin(ctx, args, false)
+	var app *control.App
 	if err != nil {
-		fatal(err)
+		app = control.NewUnauthApp(os.Stdin, os.Stdout, err)
+		if hubURL := controlHubArg(args); hubURL != "" {
+			app.Client = control.New(hubURL, "")
+		}
+	} else {
+		app = control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
 	}
-	app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
 	if err := app.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
 	}
@@ -150,7 +160,7 @@ func runWorker(ctx context.Context, args []string) {
 			runWorkerForeground(ctx, args[1:])
 			return
 		case "start":
-			runWorkerStart(ctx)
+			runWorkerStart(ctx, args[1:]...)
 			return
 		case "stop":
 			runWorkerStop(ctx)
@@ -160,6 +170,9 @@ func runWorker(ctx context.Context, args []string) {
 			return
 		case "logs":
 			runWorkerLogs(ctx, args[1:])
+			return
+		case "config":
+			runWorkerConfig(args[1:])
 			return
 		default:
 			workerUsage()
@@ -181,6 +194,7 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	id := fs.String("id", "", "stable worker id")
 	name := fs.String("name", hostname(), "worker display name")
 	interval := fs.Duration("interval", time.Second, "terminal capture interval")
+	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
 	_ = fs.Parse(args)
 	if *hubURL == "" && (*token != "" || *join != "") {
 		*hubURL = "ws://127.0.0.1:8080"
@@ -196,7 +210,7 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	runWorkerWithAuth(ctx, auth.HubURL, auth.Token, workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name), *interval, auth.Source)
+	runWorkerWithAuth(ctx, auth.HubURL, auth.Token, workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name), *interval, auth.Source, *backend)
 }
 
 func runWorkerJoin(ctx context.Context, args []string) {
@@ -206,6 +220,7 @@ func runWorkerJoin(ctx context.Context, args []string) {
 	id := fs.String("id", "", "stable worker id")
 	name := fs.String("name", hostname(), "worker display name")
 	start := fs.Bool("start", true, "start background worker service after saving credential")
+	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
 	_ = fs.Parse(args)
 	if *hubURL == "" {
 		*hubURL = "ws://127.0.0.1:8080"
@@ -224,21 +239,30 @@ func runWorkerJoin(ctx context.Context, args []string) {
 		fatal(err)
 	}
 	slog.Default().Info("worker signal exchanged", "device_id", auth.DeviceID)
+	if flagProvided(args, "--backend") {
+		saveWorkerBackendConfig(*backend)
+	}
 	if !*start {
 		return
 	}
-	if err := tmux.CheckAvailable(); err != nil {
+	if _, err := selectWorkerBackend(*backend); err != nil {
 		fatal(err)
 	}
-	result, err := workerservice.Start(ctx, executablePath())
+	result, err := workerservice.Restart(ctx, executablePath())
 	if err != nil {
 		fatal(err)
 	}
-	slog.Default().Info("worker service started", "backend", result.Backend, "detail", result.Detail)
+	slog.Default().Info("worker service restarted", "backend", result.Backend, "detail", result.Detail)
 }
 
-func runWorkerStart(ctx context.Context) {
-	if err := tmux.CheckAvailable(); err != nil {
+func runWorkerStart(ctx context.Context, args ...string) {
+	fs := flag.NewFlagSet("start", flag.ExitOnError)
+	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
+	_ = fs.Parse(args)
+	if flagProvided(args, "--backend") {
+		saveWorkerBackendConfig(*backend)
+	}
+	if _, err := selectWorkerBackend(*backend); err != nil {
 		fatal(err)
 	}
 	if _, ok := credentialcache.LoadLatest("worker", ""); !ok {
@@ -278,8 +302,25 @@ func runWorkerLogs(ctx context.Context, args []string) {
 	fmt.Fprint(os.Stdout, out)
 }
 
-func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string, interval time.Duration, source string) {
-	if err := tmux.CheckAvailable(); err != nil {
+func runWorkerConfig(args []string) {
+	fs := flag.NewFlagSet("config", flag.ExitOnError)
+	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
+	_ = fs.Parse(args)
+	if flagProvided(args, "--backend") {
+		saveWorkerBackendConfig(*backend)
+	}
+	cfg, err := appconfig.Load()
+	if err != nil {
+		fatal(err)
+	}
+	path, _ := appconfig.Path()
+	resolved, source := resolveWorkerBackendPreference("")
+	fmt.Fprintf(os.Stdout, "config=%s\nworker_backend=%s\nresolved_backend=%s\nsource=%s\n", path, cfg.WorkerBackend, resolved, source)
+}
+
+func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string, interval time.Duration, source string, backendPreference string) {
+	backend, err := selectWorkerBackend(backendPreference)
+	if err != nil {
 		fatal(err)
 	}
 	switch source {
@@ -288,10 +329,76 @@ func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string
 	case "cache":
 		slog.Default().Info("worker credential loaded", "device_id", workerID)
 	}
-	w := worker.New(hubURL, token, workerID, name, tmux.New(nil), slog.Default())
+	w := worker.New(hubURL, token, workerID, name, backend, slog.Default())
 	w.Interval = interval
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
+	}
+}
+
+func selectWorkerBackend(preference string) (sessionbackend.Backend, error) {
+	value, source := resolveWorkerBackendPreference(preference)
+	switch value {
+	case "", "auto":
+		if err := tmux.CheckAvailable(); err == nil {
+			return tmux.New(nil), nil
+		} else {
+			warnPtyFallback(err, source)
+			return ptybackend.New(), nil
+		}
+	case "tmux":
+		if err := tmux.CheckAvailable(); err != nil {
+			return nil, err
+		}
+		return tmux.New(nil), nil
+	case "pty", "builtin", "builtin-pty":
+		return ptybackend.New(), nil
+	default:
+		return nil, fmt.Errorf("invalid worker backend %q; expected auto, tmux, or pty", value)
+	}
+}
+
+func resolveWorkerBackendPreference(cliValue string) (string, string) {
+	if value := strings.TrimSpace(cliValue); value != "" {
+		return strings.ToLower(value), "flag"
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENTMUX_WORKER_BACKEND")); value != "" {
+		return strings.ToLower(value), "env"
+	}
+	cfg, err := appconfig.Load()
+	if err == nil && strings.TrimSpace(cfg.WorkerBackend) != "" {
+		return strings.ToLower(strings.TrimSpace(cfg.WorkerBackend)), "config"
+	}
+	return "auto", "default"
+}
+
+func saveWorkerBackendConfig(value string) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "auto", "tmux", "pty", "builtin", "builtin-pty":
+	default:
+		fatal(fmt.Errorf("invalid worker backend %q; expected auto, tmux, or pty", value))
+	}
+	if value == "builtin" || value == "builtin-pty" {
+		value = "pty"
+	}
+	if err := appconfig.SaveWorkerBackend(value); err != nil {
+		fatal(err)
+	}
+	path, _ := appconfig.Path()
+	fmt.Fprintf(os.Stderr, "worker backend saved: %s (%s)\n", value, path)
+}
+
+func warnPtyFallback(tmuxErr error, source string) {
+	path, _ := appconfig.Path()
+	fmt.Fprintf(os.Stderr, "warning: tmux is unavailable, falling back to built-in PTY backend (%s preference).\n", source)
+	fmt.Fprintln(os.Stderr, "warning: built-in PTY sessions survive Control detach/re-attach but are lost when the worker process stops.")
+	fmt.Fprintf(os.Stderr, "warning: install tmux for durable sessions, then run: agentmux worker config --backend auto\n")
+	if path != "" {
+		fmt.Fprintf(os.Stderr, "warning: worker backend config path: %s\n", path)
+	}
+	if tmuxErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: tmux check: %s\n", compactError(tmuxErr))
 	}
 }
 
@@ -343,9 +450,9 @@ func runControl(ctx context.Context, args []string) {
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
 		common := addControlCommon(fs)
 		workerID := fs.String("worker", "", "target worker id")
-		name := fs.String("name", "", "tmux session name")
+		name := fs.String("name", "", "session name")
 		cwd := fs.String("cwd", ".", "working directory")
-		command := fs.String("command", "bash", "command to run in tmux")
+		command := fs.String("command", "bash", "command to run in the session")
 		_ = fs.Parse(args[1:])
 		client := newControlClient(ctx, *common)
 		if err := client.CreateSession(ctx, protocol.CreateSession{WorkerID: *workerID, Name: *name, CWD: *cwd, Command: *command}); err != nil {
@@ -387,6 +494,10 @@ func runControl(ctx context.Context, args []string) {
 }
 
 func resolveControlAppAuth(ctx context.Context, args []string) (control.AppAuthResult, error) {
+	return resolveControlAppAuthWithLogin(ctx, args, true)
+}
+
+func resolveControlAppAuthWithLogin(ctx context.Context, args []string, login bool) (control.AppAuthResult, error) {
 	fs := flag.NewFlagSet("app", flag.ExitOnError)
 	common := addControlCommon(fs)
 	deviceID := fs.String("device-id", "", "stable control device id")
@@ -395,13 +506,20 @@ func resolveControlAppAuth(ctx context.Context, args []string) (control.AppAuthR
 	if common.hub == "" && (common.token != "" || common.join != "") {
 		common.hub = "http://127.0.0.1:8080"
 	}
-	if common.hub == "" {
-		common.hub = "http://127.0.0.1:8080"
-	}
 	return control.ResolveAppAuth(ctx, control.AppAuthOptions{
 		HubURL: common.hub, Token: common.token, Join: common.join,
-		DeviceID: *deviceID, DeviceName: *deviceName, Login: true,
+		DeviceID: *deviceID, DeviceName: *deviceName, Login: login,
 	})
+}
+
+func controlHubArg(args []string) string {
+	fs := flag.NewFlagSet("app", flag.ExitOnError)
+	common := addControlCommon(fs)
+	_ = fs.Parse(args)
+	if common.hub == "" && (common.token != "" || common.join != "") {
+		common.hub = "http://127.0.0.1:8080"
+	}
+	return common.hub
 }
 
 func runControlLogin(ctx context.Context, args []string) {
@@ -484,6 +602,28 @@ func hasJoinArg(args []string) bool {
 	return false
 }
 
+func flagProvided(args []string, name string) bool {
+	name = strings.TrimLeft(name, "-")
+	for _, arg := range args {
+		arg = strings.TrimLeft(arg, "-")
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func compactError(err error) string {
+	if err == nil {
+		return ""
+	}
+	value := err.Error()
+	if index := strings.Index(value, "\n"); index >= 0 {
+		return value[:index]
+	}
+	return value
+}
+
 func executablePath() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -511,7 +651,7 @@ func controlUsage() {
 }
 
 func workerUsage() {
-	fmt.Fprintln(os.Stderr, "usage: agentmux worker <join|run|start|stop|status|logs> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentmux worker <join|run|start|stop|status|logs|config> [options]")
 }
 
 func fatal(err error) {

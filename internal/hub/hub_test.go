@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -324,8 +325,8 @@ func TestControlCredentialSeesOnlyTenantWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.workers["a"] = &workerConn{id: "a", tenantID: workerCredA.TenantID, send: make(chan protocol.Envelope, 1)}
-	server.workers["b"] = &workerConn{id: "b", tenantID: workerCredB.TenantID, send: make(chan protocol.Envelope, 1)}
+	server.registerWorker(&workerConn{id: "a", tenantID: workerCredA.TenantID, send: make(chan protocol.Envelope, 1)})
+	server.registerWorker(&workerConn{id: "b", tenantID: workerCredB.TenantID, send: make(chan protocol.Envelope, 1)})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/workers", nil)
 	req.Header.Set("Authorization", "Bearer "+controlCredA.Credential)
@@ -343,6 +344,41 @@ func TestControlCredentialSeesOnlyTenantWorkers(t *testing.T) {
 	}
 	if len(payload.Workers) != 1 || payload.Workers[0].ID != "a" {
 		t.Fatalf("expected only tenant A worker, got %+v", payload.Workers)
+	}
+}
+
+func TestWorkerDisconnectKeepsRegisteredWorkerView(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:       "local",
+		tenantID: "tenant_test",
+		name:     "Laptop",
+		addr:     "127.0.0.1",
+		lastSeen: time.Now().UTC().Add(-time.Minute),
+		send:     make(chan protocol.Envelope, 1),
+	}
+	server.registerWorker(worker)
+	server.unregisterWorker(worker)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/workers", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkers)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	var payload struct {
+		Workers []protocol.WorkerView `json:"workers"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Workers) != 1 {
+		t.Fatalf("expected disconnected worker to remain visible, got %+v", payload.Workers)
+	}
+	if payload.Workers[0].ID != "local" || payload.Workers[0].Online || payload.Workers[0].Status != "offline" {
+		t.Fatalf("unexpected worker view: %+v", payload.Workers[0])
 	}
 }
 
@@ -414,6 +450,18 @@ func TestDeviceLoginEndpoints(t *testing.T) {
 	if !strings.HasPrefix(start.VerificationURLComplete, "http://agentmux.test/device?user_code=") {
 		t.Fatalf("unexpected verification URL: %s", start.VerificationURLComplete)
 	}
+	pageReq := httptest.NewRequest(http.MethodGet, "/device?user_code="+url.QueryEscape(start.UserCode), nil)
+	pageRec := httptest.NewRecorder()
+	server.handleDevicePage(pageRec, pageReq)
+	if pageRec.Code != http.StatusOK {
+		t.Fatalf("unexpected device page status: %d body=%s", pageRec.Code, pageRec.Body.String())
+	}
+	if pageRec.Header().Get("Referrer-Policy") != "no-referrer" || pageRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("missing device page security headers: %+v", pageRec.Header())
+	}
+	if body := pageRec.Body.String(); !strings.Contains(body, "CLI") || !strings.Contains(body, "history.replaceState") || !strings.Contains(body, "Continue with GitHub") {
+		t.Fatalf("device page missing context or OAuth placeholders: %s", body)
+	}
 
 	approveBody := []byte(`{"user_code":"` + start.UserCode + `","email":"device@example.com","password":"password123"}`)
 	approveReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/approve", bytes.NewReader(approveBody))
@@ -445,7 +493,7 @@ func TestControlOpenForwardsInitialTerminalSize(t *testing.T) {
 		id:   "local",
 		send: make(chan protocol.Envelope, 1),
 	}
-	server.workers[worker.id] = worker
+	server.registerWorker(worker)
 	control := &controlConn{send: make(chan protocol.Envelope, 1)}
 	payload, err := protocol.MarshalPayload(protocol.TerminalSize{Cols: 132, Rows: 41})
 	if err != nil {
@@ -482,7 +530,7 @@ func TestSessionPreviewRequestForwardsToWorker(t *testing.T) {
 		id:   "local",
 		send: make(chan protocol.Envelope, 1),
 	}
-	server.workers[worker.id] = worker
+	server.registerWorker(worker)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/sessions/local/demo/preview?lines=12", nil)
 	req.Header.Set("Authorization", "Bearer secret")

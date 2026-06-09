@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"private/agentmux/internal/sessionbackend"
 )
 
 type call struct {
@@ -36,13 +38,13 @@ func TestListParsesTmuxPanes(t *testing.T) {
 	}
 }
 
-func sessionByName(sessions []Session, name string) Session {
+func sessionByName(sessions []sessionbackend.Session, name string) sessionbackend.Session {
 	for _, session := range sessions {
 		if session.Name == name {
 			return session
 		}
 	}
-	return Session{}
+	return sessionbackend.Session{}
 }
 
 func TestSendInputSplitsNewline(t *testing.T) {

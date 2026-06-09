@@ -26,7 +26,13 @@ type StreamEvent struct {
 	Err  error
 }
 
-func (c Client) OpenStream(ctx context.Context, sessionID string, size protocol.TerminalSize) (*Stream, error) {
+func (c *Client) OpenStream(ctx context.Context, sessionID string, size protocol.TerminalSize) (*Stream, error) {
+	if c == nil {
+		return nil, fmt.Errorf("control client is nil")
+	}
+	if err := c.EnsureFresh(ctx); err != nil {
+		return nil, err
+	}
 	target, err := controlURL(c.HubURL, c.Token)
 	if err != nil {
 		return nil, err

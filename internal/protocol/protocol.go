@@ -11,6 +11,7 @@ const (
 	TypeWorkerHello     = "worker.hello"
 	TypeWorkerHeartbeat = "worker.heartbeat"
 	TypeSessionSnapshot = "session.snapshot"
+	TypeSessionSync     = "session.sync"
 	TypeSessionPreview  = "session.preview"
 	TypeSessionCreate   = "session.create"
 	TypeSessionKill     = "session.kill"
@@ -127,6 +128,8 @@ type WorkerView struct {
 	Name     string    `json:"name"`
 	Addr     string    `json:"addr"`
 	LastSeen time.Time `json:"last_seen"`
+	Status   string    `json:"status,omitempty"`
+	Online   bool      `json:"online"`
 }
 
 type ErrorPayload struct {

@@ -14,15 +14,22 @@ import (
 )
 
 const (
-	defaultSignalTTL     = 10 * time.Minute
-	defaultCredentialTTL = 24 * time.Hour
-	defaultDeviceAuthTTL = 10 * time.Minute
+	defaultSignalTTL          = 10 * time.Minute
+	defaultCredentialTTL      = 24 * time.Hour
+	defaultControlAccessTTL   = 15 * time.Minute
+	defaultRefreshTokenTTL    = 7 * 24 * time.Hour
+	defaultDeviceAuthTTL      = 10 * time.Minute
+	devicePollIntervalSeconds = 2
+	deviceSlowDownSeconds     = 5
+	maxDeviceApproveFailures  = 8
+	minDevicePollInterval     = devicePollIntervalSeconds * time.Second
 )
 
 type authStore struct {
 	mu          sync.Mutex
 	signals     map[string]signalEntry
 	credentials map[string]credentialEntry
+	refreshes   map[string]refreshTokenEntry
 	users       map[string]userEntry
 	devices     map[string]deviceAuthEntry
 }
@@ -33,9 +40,11 @@ type AuthStore interface {
 	Exchange(req exchangeRequest) (exchangedCredential, error)
 	Register(req registerRequest) (authCredentialResponse, error)
 	Login(req loginRequest) (authCredentialResponse, error)
+	Refresh(req refreshRequest) (authCredentialResponse, error)
 	StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error)
 	ApproveDeviceAuth(req deviceApproveRequest) (authCredentialResponse, error)
 	PollDeviceAuth(req devicePollRequest) (devicePollResponse, error)
+	DeviceAuthInfo(userCode string) (deviceAuthInfo, bool)
 	Credential(token string) (credentialEntry, bool)
 }
 
@@ -63,12 +72,27 @@ type credentialEntry struct {
 	Hash      string
 	ID        string
 	TenantID  string
+	UserEmail string
 	Role      string
 	DeviceID  string
 	Name      string
 	Scopes    []string
 	ExpiresAt time.Time
 	CreatedAt time.Time
+}
+
+type refreshTokenEntry struct {
+	Hash       string
+	ID         string
+	UserEmail  string
+	TenantID   string
+	Role       string
+	DeviceID   string
+	DeviceName string
+	Status     string
+	ExpiresAt  time.Time
+	CreatedAt  time.Time
+	LastUsedAt time.Time
 }
 
 type userEntry struct {
@@ -90,9 +114,13 @@ type deviceAuthEntry struct {
 	Status         string
 	UserEmail      string
 	Credential     string
+	RefreshToken   string
+	AttemptCount   int
 	ExpiresAt      time.Time
 	CreatedAt      time.Time
 	ApprovedAt     time.Time
+	LastAttemptAt  time.Time
+	LastPollAt     time.Time
 }
 
 type exchangedCredential struct {
@@ -106,14 +134,16 @@ type exchangedCredential struct {
 }
 
 type authCredentialResponse struct {
-	Credential   string       `json:"credential"`
-	CredentialID string       `json:"credential_id"`
-	TenantID     string       `json:"tenant_id"`
-	Role         string       `json:"role"`
-	DeviceID     string       `json:"device_id"`
-	ExpiresAt    time.Time    `json:"expires_at"`
-	Scopes       []string     `json:"scopes"`
-	User         authUserView `json:"user"`
+	Credential       string       `json:"credential"`
+	CredentialID     string       `json:"credential_id"`
+	TenantID         string       `json:"tenant_id"`
+	Role             string       `json:"role"`
+	DeviceID         string       `json:"device_id"`
+	ExpiresAt        time.Time    `json:"expires_at"`
+	Scopes           []string     `json:"scopes"`
+	RefreshToken     string       `json:"refresh_token,omitempty"`
+	RefreshExpiresAt time.Time    `json:"refresh_expires_at,omitempty"`
+	User             authUserView `json:"user"`
 }
 
 type authUserView struct {
@@ -143,6 +173,10 @@ type loginRequest struct {
 	Password   string `json:"password"`
 	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
+}
+
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }
 
 type deviceStartRequest struct {
@@ -176,10 +210,20 @@ type devicePollResponse struct {
 	ExpiresAt  time.Time               `json:"expires_at,omitempty"`
 }
 
+type deviceAuthInfo struct {
+	UserCode   string    `json:"user_code"`
+	DeviceID   string    `json:"device_id"`
+	DeviceName string    `json:"device_name"`
+	Status     string    `json:"status"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 func newAuthStore() *authStore {
 	return &authStore{
 		signals:     map[string]signalEntry{},
 		credentials: map[string]credentialEntry{},
+		refreshes:   map[string]refreshTokenEntry{},
 		users:       map[string]userEntry{},
 		devices:     map[string]deviceAuthEntry{},
 	}
@@ -307,7 +351,7 @@ func (s *authStore) Register(req registerRequest) (authCredentialResponse, error
 		return authCredentialResponse{}, fmt.Errorf("user already exists")
 	}
 	s.users[email] = user
-	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
+	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
 }
 
 func (s *authStore) Login(req loginRequest) (authCredentialResponse, error) {
@@ -323,7 +367,27 @@ func (s *authStore) Login(req loginRequest) (authCredentialResponse, error) {
 	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
 		return authCredentialResponse{}, fmt.Errorf("invalid email or password")
 	}
-	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
+	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
+}
+
+func (s *authStore) Refresh(req refreshRequest) (authCredentialResponse, error) {
+	if req.RefreshToken == "" {
+		return authCredentialResponse{}, fmt.Errorf("refresh token is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	refresh, ok := s.refreshes[tokenHash(req.RefreshToken)]
+	if !ok || now.After(refresh.ExpiresAt) || refresh.Status != "active" {
+		return authCredentialResponse{}, fmt.Errorf("invalid or expired refresh token")
+	}
+	user, ok := s.users[refresh.UserEmail]
+	if !ok {
+		return authCredentialResponse{}, fmt.Errorf("refresh user is missing")
+	}
+	delete(s.refreshes, refresh.Hash)
+	return s.issueControlCredentialLocked(user, refresh.DeviceID, refresh.DeviceName, now)
 }
 
 func (s *authStore) StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error) {
@@ -356,7 +420,7 @@ func (s *authStore) StartDeviceAuth(req deviceStartRequest) (deviceStartResponse
 	s.mu.Unlock()
 	return deviceStartResponse{
 		DeviceCode: deviceCode, UserCode: userCode,
-		ExpiresAt: entry.ExpiresAt, Interval: 2,
+		ExpiresAt: entry.ExpiresAt, Interval: devicePollIntervalSeconds,
 	}, nil
 }
 
@@ -373,10 +437,6 @@ func (s *authStore) ApproveDeviceAuth(req deviceApproveRequest) (authCredentialR
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
-	user, ok := s.users[email]
-	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
-		return authCredentialResponse{}, fmt.Errorf("invalid email or password")
-	}
 	var deviceHash string
 	var device deviceAuthEntry
 	for hash, entry := range s.devices {
@@ -387,18 +447,34 @@ func (s *authStore) ApproveDeviceAuth(req deviceApproveRequest) (authCredentialR
 		}
 	}
 	if deviceHash == "" || now.After(device.ExpiresAt) {
-		return authCredentialResponse{}, fmt.Errorf("invalid or expired device code")
+		return authCredentialResponse{}, fmt.Errorf("authorization failed")
 	}
 	if device.Status != "pending" {
 		return authCredentialResponse{}, fmt.Errorf("device authorization is %s", device.Status)
 	}
-	credential, err := s.issueCredentialLocked(user, "control", device.DeviceID, device.DeviceName, now)
+	if device.AttemptCount >= maxDeviceApproveFailures {
+		device.Status = "blocked"
+		s.devices[deviceHash] = device
+		return authCredentialResponse{}, fmt.Errorf("device authorization is blocked")
+	}
+	user, ok := s.users[email]
+	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
+		device.AttemptCount++
+		device.LastAttemptAt = now
+		if device.AttemptCount >= maxDeviceApproveFailures {
+			device.Status = "blocked"
+		}
+		s.devices[deviceHash] = device
+		return authCredentialResponse{}, fmt.Errorf("authorization failed")
+	}
+	credential, err := s.issueControlCredentialLocked(user, device.DeviceID, device.DeviceName, now)
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
 	device.Status = "approved"
 	device.UserEmail = user.Email
 	device.Credential = credential.Credential
+	device.RefreshToken = credential.RefreshToken
 	device.ApprovedAt = now
 	s.devices[deviceHash] = device
 	return credential, nil
@@ -417,7 +493,12 @@ func (s *authStore) PollDeviceAuth(req devicePollRequest) (devicePollResponse, e
 		return devicePollResponse{Status: "expired"}, nil
 	}
 	if device.Status != "approved" {
-		return devicePollResponse{Status: device.Status, Interval: 2, ExpiresAt: device.ExpiresAt}, nil
+		if device.Status == "pending" && !device.LastPollAt.IsZero() && now.Sub(device.LastPollAt) < minDevicePollInterval {
+			return devicePollResponse{Status: "slow_down", Interval: deviceSlowDownSeconds, ExpiresAt: device.ExpiresAt}, nil
+		}
+		device.LastPollAt = now
+		s.devices[tokenHash(req.DeviceCode)] = device
+		return devicePollResponse{Status: device.Status, Interval: devicePollIntervalSeconds, ExpiresAt: device.ExpiresAt}, nil
 	}
 	credential, ok := s.credentials[tokenHash(device.Credential)]
 	if !ok {
@@ -427,18 +508,44 @@ func (s *authStore) PollDeviceAuth(req devicePollRequest) (devicePollResponse, e
 	if !ok {
 		return devicePollResponse{}, fmt.Errorf("approved user is missing")
 	}
+	refresh, ok := s.refreshes[tokenHash(device.RefreshToken)]
+	if !ok {
+		return devicePollResponse{}, fmt.Errorf("approved refresh token is missing")
+	}
 	response := authCredentialResponse{
 		Credential: device.Credential, CredentialID: credential.ID, TenantID: credential.TenantID,
 		Role: credential.Role, DeviceID: credential.DeviceID, ExpiresAt: credential.ExpiresAt,
-		Scopes: append([]string(nil), credential.Scopes...),
-		User:   authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		Scopes: append([]string(nil), credential.Scopes...), RefreshToken: device.RefreshToken,
+		RefreshExpiresAt: refresh.ExpiresAt,
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
 	}
 	delete(s.devices, tokenHash(req.DeviceCode))
 	return devicePollResponse{Status: "approved", Credential: &response}, nil
 }
 
-func (s *authStore) issueCredentialLocked(user userEntry, role, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
+func (s *authStore) DeviceAuthInfo(userCode string) (deviceAuthInfo, bool) {
+	code := normalizeUserCode(userCode)
+	if code == "" {
+		return deviceAuthInfo{}, false
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	for _, entry := range s.devices {
+		if entry.UserCodeHash == tokenHash(code) {
+			return deviceInfoFromEntry(entry), true
+		}
+	}
+	return deviceAuthInfo{}, false
+}
+
+func (s *authStore) issueControlCredentialLocked(user userEntry, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
 	credential, err := randomToken("amx_cred_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	refreshToken, err := randomToken("amx_ref_")
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
@@ -446,17 +553,25 @@ func (s *authStore) issueCredentialLocked(user userEntry, role, deviceID, device
 	if deviceID == "" {
 		deviceID = "dev_" + randomID()
 	}
+	deviceName = strings.TrimSpace(deviceName)
 	entry := credentialEntry{
 		Hash: tokenHash(credential), ID: "cred_" + randomID(), TenantID: user.TenantID,
-		Role: role, DeviceID: deviceID, Name: strings.TrimSpace(deviceName),
-		Scopes: credentialScopes(role), ExpiresAt: now.Add(defaultCredentialTTL), CreatedAt: now,
+		UserEmail: user.Email, Role: "control", DeviceID: deviceID, Name: deviceName,
+		Scopes: credentialScopes("control"), ExpiresAt: now.Add(defaultControlAccessTTL), CreatedAt: now,
 	}
 	s.credentials[entry.Hash] = entry
+	refresh := refreshTokenEntry{
+		Hash: tokenHash(refreshToken), ID: "ref_" + randomID(), UserEmail: user.Email,
+		TenantID: user.TenantID, Role: "control", DeviceID: deviceID, DeviceName: deviceName,
+		Status: "active", ExpiresAt: now.Add(defaultRefreshTokenTTL), CreatedAt: now,
+	}
+	s.refreshes[refresh.Hash] = refresh
 	return authCredentialResponse{
 		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
 		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
-		Scopes: append([]string(nil), entry.Scopes...),
-		User:   authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
+		RefreshExpiresAt: refresh.ExpiresAt,
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
 	}, nil
 }
 
@@ -487,10 +602,26 @@ func (s *authStore) cleanupLocked(now time.Time) {
 			delete(s.credentials, hash)
 		}
 	}
+	for hash, entry := range s.refreshes {
+		if now.After(entry.ExpiresAt) || entry.Status != "active" {
+			delete(s.refreshes, hash)
+		}
+	}
 	for hash, entry := range s.devices {
 		if now.After(entry.ExpiresAt) {
 			delete(s.devices, hash)
 		}
+	}
+}
+
+func deviceInfoFromEntry(entry deviceAuthEntry) deviceAuthInfo {
+	deviceName := strings.TrimSpace(entry.DeviceName)
+	if deviceName == "" {
+		deviceName = entry.DeviceID
+	}
+	return deviceAuthInfo{
+		UserCode: entry.UserCode, DeviceID: entry.DeviceID, DeviceName: deviceName,
+		Status: entry.Status, ExpiresAt: entry.ExpiresAt, CreatedAt: entry.CreatedAt,
 	}
 }
 
@@ -518,18 +649,28 @@ func randomID() string {
 }
 
 func randomUserCode() (string, error) {
-	var raw [5]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", err
-	}
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-	out := make([]byte, 9)
-	for i := range out {
-		if i == 4 {
-			out[i] = '-'
-			continue
+	const codeLength = 16
+	raw := make([]byte, codeLength)
+	for i := range raw {
+		for {
+			var b [1]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				return "", err
+			}
+			if int(b[0]) >= 256-(256%len(alphabet)) {
+				continue
+			}
+			raw[i] = alphabet[int(b[0])%len(alphabet)]
+			break
 		}
-		out[i] = alphabet[int(raw[i%len(raw)])%len(alphabet)]
+	}
+	out := make([]byte, 0, codeLength+3)
+	for i, b := range raw {
+		if i > 0 && i%4 == 0 {
+			out = append(out, '-')
+		}
+		out = append(out, b)
 	}
 	return string(out), nil
 }
@@ -568,10 +709,18 @@ func normalizeEmail(email string) string {
 func normalizeUserCode(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	code = strings.ReplaceAll(code, "-", "")
-	if len(code) > 4 {
-		code = code[:4] + "-" + code[4:]
+	code = strings.ReplaceAll(code, " ", "")
+	if code == "" {
+		return ""
 	}
-	return code
+	var builder strings.Builder
+	for i, r := range code {
+		if i > 0 && i%4 == 0 {
+			builder.WriteByte('-')
+		}
+		builder.WriteRune(r)
+	}
+	return builder.String()
 }
 
 func passwordDigest(password string) (string, string, error) {

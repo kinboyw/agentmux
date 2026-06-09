@@ -61,6 +61,7 @@ func (s *sqliteAuthStore) migrate() error {
 			hash TEXT PRIMARY KEY,
 			id TEXT NOT NULL,
 			tenant_id TEXT NOT NULL,
+			user_email TEXT NOT NULL DEFAULT '',
 			role TEXT NOT NULL,
 			device_id TEXT NOT NULL,
 			name TEXT NOT NULL,
@@ -78,6 +79,20 @@ func (s *sqliteAuthStore) migrate() error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_credentials_tenant ON credentials(tenant_id)`,
+		`CREATE TABLE IF NOT EXISTS refresh_tokens (
+			hash TEXT PRIMARY KEY,
+			id TEXT NOT NULL,
+			user_email TEXT NOT NULL,
+			tenant_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			device_id TEXT NOT NULL,
+			device_name TEXT NOT NULL,
+			status TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_used_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_device ON refresh_tokens(user_email, device_id)`,
 		`CREATE TABLE IF NOT EXISTS device_auth_sessions (
 			device_code_hash TEXT PRIMARY KEY,
 			user_code_hash TEXT NOT NULL,
@@ -87,14 +102,29 @@ func (s *sqliteAuthStore) migrate() error {
 			status TEXT NOT NULL,
 			user_email TEXT NOT NULL,
 			credential TEXT NOT NULL,
+			refresh_token TEXT NOT NULL DEFAULT '',
+			attempt_count INTEGER NOT NULL DEFAULT 0,
 			expires_at TEXT NOT NULL,
 			created_at TEXT NOT NULL,
-			approved_at TEXT NOT NULL
+			approved_at TEXT NOT NULL,
+			last_attempt_at TEXT NOT NULL DEFAULT '',
+			last_poll_at TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_auth_user_code ON device_auth_sessions(user_code_hash)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
+			return err
+		}
+	}
+	for _, statement := range []string{
+		`ALTER TABLE credentials ADD COLUMN user_email TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE device_auth_sessions ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE device_auth_sessions ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE device_auth_sessions ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE device_auth_sessions ADD COLUMN last_poll_at TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return err
 		}
 	}
@@ -252,7 +282,7 @@ func (s *sqliteAuthStore) Register(req registerRequest) (authCredentialResponse,
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
-	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
+	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
 }
 
 func (s *sqliteAuthStore) Login(req loginRequest) (authCredentialResponse, error) {
@@ -273,7 +303,37 @@ func (s *sqliteAuthStore) Login(req loginRequest) (authCredentialResponse, error
 	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
 		return authCredentialResponse{}, fmt.Errorf("invalid email or password")
 	}
-	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
+	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
+}
+
+func (s *sqliteAuthStore) Refresh(req refreshRequest) (authCredentialResponse, error) {
+	if req.RefreshToken == "" {
+		return authCredentialResponse{}, fmt.Errorf("refresh token is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(now); err != nil {
+		return authCredentialResponse{}, err
+	}
+	refresh, ok, err := s.refreshByHash(tokenHash(req.RefreshToken))
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	if !ok || now.After(refresh.ExpiresAt) || refresh.Status != "active" {
+		return authCredentialResponse{}, fmt.Errorf("invalid or expired refresh token")
+	}
+	user, ok, err := s.userByEmail(refresh.UserEmail)
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	if !ok {
+		return authCredentialResponse{}, fmt.Errorf("refresh user is missing")
+	}
+	if _, err := s.db.Exec(`DELETE FROM refresh_tokens WHERE hash = ?`, refresh.Hash); err != nil {
+		return authCredentialResponse{}, err
+	}
+	return s.issueControlCredentialLocked(user, refresh.DeviceID, refresh.DeviceName, now)
 }
 
 func (s *sqliteAuthStore) StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error) {
@@ -306,14 +366,15 @@ func (s *sqliteAuthStore) StartDeviceAuth(req deviceStartRequest) (deviceStartRe
 		return deviceStartResponse{}, err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO device_auth_sessions(device_code_hash, user_code_hash, user_code, device_id, device_name, status, user_email, credential, expires_at, created_at, approved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO device_auth_sessions(device_code_hash, user_code_hash, user_code, device_id, device_name, status, user_email, credential, refresh_token, attempt_count, expires_at, created_at, approved_at, last_attempt_at, last_poll_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		entry.DeviceCodeHash, entry.UserCodeHash, entry.UserCode, entry.DeviceID, entry.DeviceName, entry.Status,
-		entry.UserEmail, entry.Credential, formatTime(entry.ExpiresAt), formatTime(entry.CreatedAt), formatTime(entry.ApprovedAt),
+		entry.UserEmail, entry.Credential, entry.RefreshToken, entry.AttemptCount, formatTime(entry.ExpiresAt), formatTime(entry.CreatedAt),
+		formatTime(entry.ApprovedAt), formatTime(entry.LastAttemptAt), formatTime(entry.LastPollAt),
 	)
 	if err != nil {
 		return deviceStartResponse{}, err
 	}
-	return deviceStartResponse{DeviceCode: deviceCode, UserCode: userCode, ExpiresAt: entry.ExpiresAt, Interval: 2}, nil
+	return deviceStartResponse{DeviceCode: deviceCode, UserCode: userCode, ExpiresAt: entry.ExpiresAt, Interval: devicePollIntervalSeconds}, nil
 }
 
 func (s *sqliteAuthStore) ApproveDeviceAuth(req deviceApproveRequest) (authCredentialResponse, error) {
@@ -331,30 +392,42 @@ func (s *sqliteAuthStore) ApproveDeviceAuth(req deviceApproveRequest) (authCrede
 	if err := s.cleanupLocked(now); err != nil {
 		return authCredentialResponse{}, err
 	}
-	user, ok, err := s.userByEmail(email)
-	if err != nil {
-		return authCredentialResponse{}, err
-	}
-	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
-		return authCredentialResponse{}, fmt.Errorf("invalid email or password")
-	}
 	device, ok, err := s.deviceByUserCodeHash(tokenHash(code))
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
 	if !ok || now.After(device.ExpiresAt) {
-		return authCredentialResponse{}, fmt.Errorf("invalid or expired device code")
+		return authCredentialResponse{}, fmt.Errorf("authorization failed")
 	}
 	if device.Status != "pending" {
 		return authCredentialResponse{}, fmt.Errorf("device authorization is %s", device.Status)
 	}
-	credential, err := s.issueCredentialLocked(user, "control", device.DeviceID, device.DeviceName, now)
+	if device.AttemptCount >= maxDeviceApproveFailures {
+		_, _ = s.db.Exec(`UPDATE device_auth_sessions SET status = ? WHERE device_code_hash = ?`, "blocked", device.DeviceCodeHash)
+		return authCredentialResponse{}, fmt.Errorf("device authorization is blocked")
+	}
+	user, ok, err := s.userByEmail(email)
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
+		status := "pending"
+		if device.AttemptCount+1 >= maxDeviceApproveFailures {
+			status = "blocked"
+		}
+		_, _ = s.db.Exec(
+			`UPDATE device_auth_sessions SET attempt_count = attempt_count + 1, status = ?, last_attempt_at = ? WHERE device_code_hash = ?`,
+			status, formatTime(now), device.DeviceCodeHash,
+		)
+		return authCredentialResponse{}, fmt.Errorf("authorization failed")
+	}
+	credential, err := s.issueControlCredentialLocked(user, device.DeviceID, device.DeviceName, now)
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
 	_, err = s.db.Exec(
-		`UPDATE device_auth_sessions SET status = ?, user_email = ?, credential = ?, approved_at = ? WHERE device_code_hash = ?`,
-		"approved", user.Email, credential.Credential, formatTime(now), device.DeviceCodeHash,
+		`UPDATE device_auth_sessions SET status = ?, user_email = ?, credential = ?, refresh_token = ?, approved_at = ? WHERE device_code_hash = ?`,
+		"approved", user.Email, credential.Credential, credential.RefreshToken, formatTime(now), device.DeviceCodeHash,
 	)
 	if err != nil {
 		return authCredentialResponse{}, err
@@ -380,7 +453,11 @@ func (s *sqliteAuthStore) PollDeviceAuth(req devicePollRequest) (devicePollRespo
 		return devicePollResponse{Status: "expired"}, nil
 	}
 	if device.Status != "approved" {
-		return devicePollResponse{Status: device.Status, Interval: 2, ExpiresAt: device.ExpiresAt}, nil
+		if device.Status == "pending" && !device.LastPollAt.IsZero() && now.Sub(device.LastPollAt) < minDevicePollInterval {
+			return devicePollResponse{Status: "slow_down", Interval: deviceSlowDownSeconds, ExpiresAt: device.ExpiresAt}, nil
+		}
+		_, _ = s.db.Exec(`UPDATE device_auth_sessions SET last_poll_at = ? WHERE device_code_hash = ?`, formatTime(now), device.DeviceCodeHash)
+		return devicePollResponse{Status: device.Status, Interval: devicePollIntervalSeconds, ExpiresAt: device.ExpiresAt}, nil
 	}
 	credential, ok, err := s.credentialByHash(tokenHash(device.Credential))
 	if err != nil {
@@ -396,14 +473,40 @@ func (s *sqliteAuthStore) PollDeviceAuth(req devicePollRequest) (devicePollRespo
 	if !ok {
 		return devicePollResponse{}, fmt.Errorf("approved user is missing")
 	}
+	refresh, ok, err := s.refreshByHash(tokenHash(device.RefreshToken))
+	if err != nil {
+		return devicePollResponse{}, err
+	}
+	if !ok {
+		return devicePollResponse{}, fmt.Errorf("approved refresh token is missing")
+	}
 	response := authCredentialResponse{
 		Credential: device.Credential, CredentialID: credential.ID, TenantID: credential.TenantID,
 		Role: credential.Role, DeviceID: credential.DeviceID, ExpiresAt: credential.ExpiresAt,
-		Scopes: append([]string(nil), credential.Scopes...),
-		User:   authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		Scopes: append([]string(nil), credential.Scopes...), RefreshToken: device.RefreshToken,
+		RefreshExpiresAt: refresh.ExpiresAt,
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
 	}
 	_, _ = s.db.Exec(`DELETE FROM device_auth_sessions WHERE device_code_hash = ?`, device.DeviceCodeHash)
 	return devicePollResponse{Status: "approved", Credential: &response}, nil
+}
+
+func (s *sqliteAuthStore) DeviceAuthInfo(userCode string) (deviceAuthInfo, bool) {
+	code := normalizeUserCode(userCode)
+	if code == "" {
+		return deviceAuthInfo{}, false
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(now); err != nil {
+		return deviceAuthInfo{}, false
+	}
+	device, ok, err := s.deviceByUserCodeHash(tokenHash(code))
+	if err != nil || !ok || now.After(device.ExpiresAt) {
+		return deviceAuthInfo{}, false
+	}
+	return deviceInfoFromEntry(device), true
 }
 
 func (s *sqliteAuthStore) Credential(token string) (credentialEntry, bool) {
@@ -423,8 +526,12 @@ func (s *sqliteAuthStore) Credential(token string) (credentialEntry, bool) {
 	return entry, true
 }
 
-func (s *sqliteAuthStore) issueCredentialLocked(user userEntry, role, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
+func (s *sqliteAuthStore) issueControlCredentialLocked(user userEntry, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
 	credential, err := randomToken("amx_cred_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	refreshToken, err := randomToken("amx_ref_")
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
@@ -432,19 +539,29 @@ func (s *sqliteAuthStore) issueCredentialLocked(user userEntry, role, deviceID, 
 	if deviceID == "" {
 		deviceID = "dev_" + randomID()
 	}
+	deviceName = strings.TrimSpace(deviceName)
 	entry := credentialEntry{
 		Hash: tokenHash(credential), ID: "cred_" + randomID(), TenantID: user.TenantID,
-		Role: role, DeviceID: deviceID, Name: strings.TrimSpace(deviceName),
-		Scopes: credentialScopes(role), ExpiresAt: now.Add(defaultCredentialTTL), CreatedAt: now,
+		UserEmail: user.Email, Role: "control", DeviceID: deviceID, Name: deviceName,
+		Scopes: credentialScopes("control"), ExpiresAt: now.Add(defaultControlAccessTTL), CreatedAt: now,
 	}
 	if err := s.insertCredential(entry); err != nil {
+		return authCredentialResponse{}, err
+	}
+	refresh := refreshTokenEntry{
+		Hash: tokenHash(refreshToken), ID: "ref_" + randomID(), UserEmail: user.Email,
+		TenantID: user.TenantID, Role: "control", DeviceID: deviceID, DeviceName: deviceName,
+		Status: "active", ExpiresAt: now.Add(defaultRefreshTokenTTL), CreatedAt: now,
+	}
+	if err := s.insertRefresh(refresh); err != nil {
 		return authCredentialResponse{}, err
 	}
 	return authCredentialResponse{
 		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
 		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
-		Scopes: append([]string(nil), entry.Scopes...),
-		User:   authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
+		RefreshExpiresAt: refresh.ExpiresAt,
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
 	}, nil
 }
 
@@ -454,8 +571,17 @@ func (s *sqliteAuthStore) insertCredential(entry credentialEntry) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO credentials(hash, id, tenant_id, role, device_id, name, scopes_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		entry.Hash, entry.ID, entry.TenantID, entry.Role, entry.DeviceID, entry.Name, scopesJSON, formatTime(entry.ExpiresAt), formatTime(entry.CreatedAt),
+		`INSERT INTO credentials(hash, id, tenant_id, user_email, role, device_id, name, scopes_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		entry.Hash, entry.ID, entry.TenantID, entry.UserEmail, entry.Role, entry.DeviceID, entry.Name, scopesJSON, formatTime(entry.ExpiresAt), formatTime(entry.CreatedAt),
+	)
+	return err
+}
+
+func (s *sqliteAuthStore) insertRefresh(entry refreshTokenEntry) error {
+	_, err := s.db.Exec(
+		`INSERT INTO refresh_tokens(hash, id, user_email, tenant_id, role, device_id, device_name, status, expires_at, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		entry.Hash, entry.ID, entry.UserEmail, entry.TenantID, entry.Role, entry.DeviceID, entry.DeviceName, entry.Status,
+		formatTime(entry.ExpiresAt), formatTime(entry.CreatedAt), formatTime(entry.LastUsedAt),
 	)
 	return err
 }
@@ -466,6 +592,10 @@ func (s *sqliteAuthStore) cleanupLocked(now time.Time) error {
 		return err
 	}
 	_, err = s.db.Exec(`DELETE FROM credentials WHERE expires_at < ?`, formatTime(now))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`DELETE FROM refresh_tokens WHERE expires_at < ? OR status != ?`, formatTime(now), "active")
 	if err != nil {
 		return err
 	}
@@ -495,8 +625,8 @@ func (s *sqliteAuthStore) credentialByHash(hash string) (credentialEntry, bool, 
 	var entry credentialEntry
 	var expiresAt, createdAt, scopesJSON string
 	err := s.db.QueryRow(
-		`SELECT hash, id, tenant_id, role, device_id, name, scopes_json, expires_at, created_at FROM credentials WHERE hash = ?`, hash,
-	).Scan(&entry.Hash, &entry.ID, &entry.TenantID, &entry.Role, &entry.DeviceID, &entry.Name, &scopesJSON, &expiresAt, &createdAt)
+		`SELECT hash, id, tenant_id, user_email, role, device_id, name, scopes_json, expires_at, created_at FROM credentials WHERE hash = ?`, hash,
+	).Scan(&entry.Hash, &entry.ID, &entry.TenantID, &entry.UserEmail, &entry.Role, &entry.DeviceID, &entry.Name, &scopesJSON, &expiresAt, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return credentialEntry{}, false, nil
 	}
@@ -506,6 +636,27 @@ func (s *sqliteAuthStore) credentialByHash(hash string) (credentialEntry, bool, 
 	entry.ExpiresAt = parseStoredTime(expiresAt)
 	entry.CreatedAt = parseStoredTime(createdAt)
 	entry.Scopes = unmarshalScopes(scopesJSON)
+	return entry, true, nil
+}
+
+func (s *sqliteAuthStore) refreshByHash(hash string) (refreshTokenEntry, bool, error) {
+	var entry refreshTokenEntry
+	var expiresAt, createdAt, lastUsedAt string
+	err := s.db.QueryRow(
+		`SELECT hash, id, user_email, tenant_id, role, device_id, device_name, status, expires_at, created_at, last_used_at FROM refresh_tokens WHERE hash = ?`, hash,
+	).Scan(
+		&entry.Hash, &entry.ID, &entry.UserEmail, &entry.TenantID, &entry.Role, &entry.DeviceID,
+		&entry.DeviceName, &entry.Status, &expiresAt, &createdAt, &lastUsedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return refreshTokenEntry{}, false, nil
+	}
+	if err != nil {
+		return refreshTokenEntry{}, false, err
+	}
+	entry.ExpiresAt = parseStoredTime(expiresAt)
+	entry.CreatedAt = parseStoredTime(createdAt)
+	entry.LastUsedAt = parseStoredTime(lastUsedAt)
 	return entry, true, nil
 }
 
@@ -535,13 +686,14 @@ func (s *sqliteAuthStore) deviceByDeviceCodeHash(hash string) (deviceAuthEntry, 
 
 func (s *sqliteAuthStore) deviceByColumn(column string, value string) (deviceAuthEntry, bool, error) {
 	var entry deviceAuthEntry
-	var expiresAt, createdAt, approvedAt string
+	var expiresAt, createdAt, approvedAt, lastAttemptAt, lastPollAt string
 	err := s.db.QueryRow(
-		`SELECT device_code_hash, user_code_hash, user_code, device_id, device_name, status, user_email, credential, expires_at, created_at, approved_at FROM device_auth_sessions WHERE `+column+` = ?`,
+		`SELECT device_code_hash, user_code_hash, user_code, device_id, device_name, status, user_email, credential, refresh_token, attempt_count, expires_at, created_at, approved_at, last_attempt_at, last_poll_at FROM device_auth_sessions WHERE `+column+` = ?`,
 		value,
 	).Scan(
 		&entry.DeviceCodeHash, &entry.UserCodeHash, &entry.UserCode, &entry.DeviceID, &entry.DeviceName,
-		&entry.Status, &entry.UserEmail, &entry.Credential, &expiresAt, &createdAt, &approvedAt,
+		&entry.Status, &entry.UserEmail, &entry.Credential, &entry.RefreshToken, &entry.AttemptCount,
+		&expiresAt, &createdAt, &approvedAt, &lastAttemptAt, &lastPollAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return deviceAuthEntry{}, false, nil
@@ -552,6 +704,8 @@ func (s *sqliteAuthStore) deviceByColumn(column string, value string) (deviceAut
 	entry.ExpiresAt = parseStoredTime(expiresAt)
 	entry.CreatedAt = parseStoredTime(createdAt)
 	entry.ApprovedAt = parseStoredTime(approvedAt)
+	entry.LastAttemptAt = parseStoredTime(lastAttemptAt)
+	entry.LastPollAt = parseStoredTime(lastPollAt)
 	return entry, true, nil
 }
 

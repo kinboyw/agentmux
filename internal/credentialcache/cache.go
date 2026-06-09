@@ -15,15 +15,17 @@ type Cache struct {
 }
 
 type Entry struct {
-	HubURL       string    `json:"hub_url"`
-	Credential   string    `json:"credential"`
-	CredentialID string    `json:"credential_id"`
-	TenantID     string    `json:"tenant_id"`
-	Role         string    `json:"role"`
-	DeviceID     string    `json:"device_id"`
-	DeviceName   string    `json:"device_name"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	HubURL           string    `json:"hub_url"`
+	Credential       string    `json:"credential"`
+	CredentialID     string    `json:"credential_id"`
+	TenantID         string    `json:"tenant_id"`
+	Role             string    `json:"role"`
+	DeviceID         string    `json:"device_id"`
+	DeviceName       string    `json:"device_name"`
+	ExpiresAt        time.Time `json:"expires_at"`
+	RefreshToken     string    `json:"refresh_token,omitempty"`
+	RefreshExpiresAt time.Time `json:"refresh_expires_at,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 func Path() (string, error) {
@@ -85,20 +87,22 @@ func load(hubURL, role, deviceID string, matchHub bool) (Entry, bool) {
 		if role != "" && entry.Role != role {
 			continue
 		}
-		if entry.Credential == "" {
+		if entry.Credential == "" && entry.RefreshToken == "" {
 			continue
 		}
 		if deviceID != "" && entry.DeviceID != deviceID {
 			continue
 		}
-		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+		accessExpired := entry.Credential == "" || (!entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt))
+		refreshExpired := entry.RefreshToken == "" || (!entry.RefreshExpiresAt.IsZero() && now.After(entry.RefreshExpiresAt))
+		if accessExpired && refreshExpired {
 			continue
 		}
 		if newest.Credential == "" || entry.UpdatedAt.After(newest.UpdatedAt) {
 			newest = entry
 		}
 	}
-	return newest, newest.Credential != ""
+	return newest, newest.Credential != "" || newest.RefreshToken != ""
 }
 
 func Save(entry Entry) error {

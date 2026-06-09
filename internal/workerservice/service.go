@@ -54,6 +54,53 @@ func Start(ctx context.Context, binary string) (Result, error) {
 	return result, nil
 }
 
+func Restart(ctx context.Context, binary string) (Result, error) {
+	binary, err := normalizeBinary(binary)
+	if err != nil {
+		return Result{}, err
+	}
+	var skipped []string
+	if runtime.GOOS == "linux" {
+		if systemdServiceExists() {
+			if out, err := run(ctx, "systemctl", "--user", "restart", ServiceName+".service"); err == nil {
+				return Result{Backend: "systemd", Detail: strings.TrimSpace(out)}, nil
+			} else {
+				skipped = append(skipped, "systemd --user restart unavailable: "+err.Error())
+			}
+		} else {
+			result, err := startSystemd(ctx, binary)
+			if err == nil {
+				return result, nil
+			}
+			skipped = append(skipped, "systemd --user unavailable: "+err.Error())
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if launchdServiceExists() {
+			_, _ = run(ctx, "launchctl", "unload", "-w", launchdPlistPath())
+			if result, err := startLaunchd(ctx, binary); err == nil {
+				return result, nil
+			} else {
+				skipped = append(skipped, "launchd restart unavailable: "+err.Error())
+			}
+		} else {
+			result, err := startLaunchd(ctx, binary)
+			if err == nil {
+				return result, nil
+			}
+			skipped = append(skipped, "launchd unavailable: "+err.Error())
+		}
+	}
+	result, err := restartFallback(binary)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(skipped) > 0 {
+		result.Detail += "\n" + strings.Join(skipped, "\n")
+	}
+	return result, nil
+}
+
 func Stop(ctx context.Context) (Result, error) {
 	if runtime.GOOS == "linux" && systemdServiceExists() {
 		if out, err := run(ctx, "systemctl", "--user", "stop", ServiceName+".service"); err == nil {
@@ -69,35 +116,51 @@ func Stop(ctx context.Context) (Result, error) {
 }
 
 func Status(ctx context.Context) (string, error) {
+	var skipped []string
 	if runtime.GOOS == "linux" && systemdServiceExists() {
 		out, err := run(ctx, "systemctl", "--user", "status", ServiceName+".service", "--no-pager", "-l")
-		if out != "" {
+		if err == nil && out != "" {
 			return out, nil
 		}
-		return "", err
+		if err != nil {
+			skipped = append(skipped, "systemd --user unavailable: "+err.Error())
+		}
 	}
 	if runtime.GOOS == "darwin" && launchdServiceExists() {
 		out, err := run(ctx, "launchctl", "list", launchdLabel)
-		if out != "" {
+		if err == nil && out != "" {
 			return out, nil
 		}
-		return "", err
+		if err != nil {
+			skipped = append(skipped, "launchd unavailable: "+err.Error())
+		}
 	}
-	return fallbackStatus()
+	out, err := fallbackStatus()
+	if len(skipped) > 0 {
+		out += strings.Join(skipped, "\n") + "\n"
+	}
+	return out, err
 }
 
 func Logs(ctx context.Context, lines int) (string, error) {
 	if lines <= 0 {
 		lines = 80
 	}
+	var skipped []string
 	if runtime.GOOS == "linux" && systemdServiceExists() {
 		out, err := run(ctx, "journalctl", "--user", "-u", ServiceName+".service", "-n", strconv.Itoa(lines), "--no-pager")
-		if out != "" {
+		if err == nil && out != "" {
 			return out, nil
 		}
-		return "", err
+		if err != nil {
+			skipped = append(skipped, "systemd --user logs unavailable: "+err.Error())
+		}
 	}
-	return fallbackLogs(lines)
+	out, err := fallbackLogs(lines)
+	if len(skipped) > 0 {
+		out += strings.Join(skipped, "\n") + "\n"
+	}
+	return out, err
 }
 
 func StateDir() (string, error) {
@@ -291,6 +354,37 @@ func startFallback(binary string) (Result, error) {
 	return Result{Backend: "process", Detail: fmt.Sprintf("pid=%d log=%s", cmd.Process.Pid, logPath)}, nil
 }
 
+func restartFallback(binary string) (Result, error) {
+	pidPath, err := PIDPath()
+	if err != nil {
+		return Result{}, err
+	}
+	var stopped string
+	if pid, ok := readPID(pidPath); ok {
+		if processRunning(pid) {
+			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+				return Result{}, err
+			}
+			if waitForExit(pid, 2*time.Second) {
+				stopped = fmt.Sprintf("stopped pid=%d", pid)
+			} else {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+				_ = waitForExit(pid, time.Second)
+				stopped = fmt.Sprintf("killed pid=%d", pid)
+			}
+		}
+		_ = os.Remove(pidPath)
+	}
+	result, err := startFallback(binary)
+	if err != nil {
+		return Result{}, err
+	}
+	if stopped != "" {
+		result.Detail = stopped + "\n" + result.Detail
+	}
+	return result, nil
+}
+
 func stopFallback() (Result, error) {
 	pidPath, err := PIDPath()
 	if err != nil {
@@ -400,4 +494,15 @@ func readPID(path string) (int, bool) {
 func processRunning(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+func waitForExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processRunning(pid) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return !processRunning(pid)
 }

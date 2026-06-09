@@ -16,8 +16,7 @@ import (
 
 	"private/agentmux/internal/credentialcache"
 	"private/agentmux/internal/protocol"
-	"private/agentmux/internal/pty"
-	"private/agentmux/internal/tmux"
+	"private/agentmux/internal/sessionbackend"
 	"private/agentmux/internal/ws"
 )
 
@@ -57,16 +56,16 @@ type Worker struct {
 	ID       string
 	Name     string
 	Version  string
-	Adapter  tmux.Adapter
+	Backend  sessionbackend.Backend
 	Logger   *slog.Logger
 	Interval time.Duration
 
 	mu      sync.Mutex
 	streams map[string]context.CancelFunc
-	terms   map[string]*pty.Terminal
+	terms   map[string]sessionbackend.Stream
 }
 
-func New(hubURL, token, id, name string, adapter tmux.Adapter, logger *slog.Logger) *Worker {
+func New(hubURL, token, id, name string, backend sessionbackend.Backend, logger *slog.Logger) *Worker {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -78,9 +77,9 @@ func New(hubURL, token, id, name string, adapter tmux.Adapter, logger *slog.Logg
 	}
 	return &Worker{
 		HubURL: hubURL, Token: token, ID: id, Name: name, Version: "dev",
-		Adapter: adapter, Logger: logger, Interval: time.Second,
+		Backend: backend, Logger: logger, Interval: time.Second,
 		streams: map[string]context.CancelFunc{},
-		terms:   map[string]*pty.Terminal{},
+		terms:   map[string]sessionbackend.Stream{},
 	}
 }
 
@@ -132,6 +131,7 @@ func ResolveAuth(ctx context.Context, opts AuthOptions) (AuthResult, error) {
 }
 
 func (w *Worker) Run(ctx context.Context) error {
+	defer w.closeBackend()
 	target, err := workerURL(w.HubURL, w.Token)
 	if err != nil {
 		return err
@@ -159,7 +159,7 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 	if err := writeEnvelope(conn, hello); err != nil {
 		return err
 	}
-	w.Logger.Info("worker connected", "hub", target, "id", w.ID, "name", w.Name)
+	w.Logger.Info("worker connected", "hub", target, "id", w.ID, "name", w.Name, "session_backend", w.Backend.Name())
 	if err := w.sendSnapshot(ctx, conn); err != nil {
 		w.Logger.Error("snapshot failed", "error", err)
 	}
@@ -193,13 +193,15 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			return err
 		}
 		switch env.Type {
+		case protocol.TypeSessionSync:
+			_ = w.sendSnapshot(ctx, conn)
 		case protocol.TypeSessionCreate:
 			var session protocol.Session
 			if err := env.DecodePayload(&session); err != nil {
 				w.sendError(conn, env.SessionID, err.Error())
 				continue
 			}
-			if err := w.Adapter.Create(ctx, session.Name, session.CWD, session.Command); err != nil {
+			if err := w.Backend.Create(ctx, session.Name, session.CWD, session.Command); err != nil {
 				w.sendError(conn, protocol.SessionID(w.ID, session.Name), err.Error())
 				continue
 			}
@@ -209,7 +211,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			if name == "" {
 				_, name, _ = protocol.SplitSessionID(env.SessionID)
 			}
-			if err := w.Adapter.Kill(ctx, name); err != nil {
+			if err := w.Backend.Kill(ctx, name); err != nil {
 				w.sendError(conn, env.SessionID, err.Error())
 				continue
 			}
@@ -222,7 +224,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			}
 			var req protocol.SessionPreviewRequest
 			_ = env.DecodePayload(&req)
-			data, err := w.Adapter.Capture(ctx, name, req.Lines)
+			data, err := w.Backend.Capture(ctx, name, req.Lines)
 			if err != nil {
 				w.sendRequestError(conn, env.ID, env.SessionID, err.Error())
 				continue
@@ -242,7 +244,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			if w.writeTerminal(env.StreamID, input.Data) {
 				continue
 			}
-			if err := w.Adapter.SendTerminalInput(ctx, name, input.Data); err != nil {
+			if err := w.Backend.SendTerminalInput(ctx, name, input.Data); err != nil {
 				w.sendError(conn, env.SessionID, err.Error())
 			}
 		case protocol.TypeTerminalOpen:
@@ -269,7 +271,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 }
 
 func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
-	sessions, err := w.Adapter.List(ctx)
+	sessions, err := w.Backend.List(ctx)
 	if err != nil {
 		return err
 	}
@@ -292,7 +294,7 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
-	terminal, err := pty.StartTmuxAttach(ctx, name, size.Cols, size.Rows)
+	terminal, err := w.Backend.Open(ctx, name, size.Cols, size.Rows)
 	if err != nil {
 		w.sendStreamError(conn, streamID, sessionID, err.Error())
 		cancel()
@@ -386,13 +388,20 @@ func (w *Worker) stopAllStreams() {
 	streams := w.streams
 	w.streams = map[string]context.CancelFunc{}
 	terms := w.terms
-	w.terms = map[string]*pty.Terminal{}
+	w.terms = map[string]sessionbackend.Stream{}
 	w.mu.Unlock()
 	for _, cancel := range streams {
 		cancel()
 	}
 	for _, terminal := range terms {
 		_ = terminal.Close()
+	}
+}
+
+func (w *Worker) closeBackend() {
+	closer, ok := w.Backend.(interface{ Close() error })
+	if ok {
+		_ = closer.Close()
 	}
 }
 

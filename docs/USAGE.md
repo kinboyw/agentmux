@@ -9,10 +9,10 @@ tmux sessions from the browser.
 AgentMux has three roles in one binary:
 
 - `hub`: the HTTPS/WSS entrypoint, API server, Web Control host, and session router.
-- `worker`: an outbound connector that manages local tmux sessions on a machine where agents run.
+- `worker`: an outbound connector that manages local sessions on a machine where agents run.
 - `control`: CLI commands for listing, creating, and attaching to sessions. The browser control surface is served by Hub at `/control`.
 
-The agent itself remains unaware. Codex, Claude, Gemini, OpenCode, or a shell runs inside tmux; Worker attaches below it at the terminal layer.
+The agent itself remains unaware. Codex, Claude, Gemini, OpenCode, or a shell runs inside a local terminal backend; Worker attaches below it at the terminal layer.
 
 ## Quick Start
 
@@ -154,13 +154,36 @@ Open the landing page:
 https://hub.example.com/
 ```
 
-Click `Generate join signal`, then run the generated Worker command on the machine that owns the tmux sessions:
+Click `Generate join signal`, then run the generated Worker command on the machine that owns the local sessions:
 
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_...' --name "$(hostname)"
 ```
 
 The script uses an existing `agentmux` in `PATH`, builds from source when run inside a checkout, or downloads the matching GitHub release archive.
+
+### Worker session backend
+
+Worker defaults to `auto` backend selection:
+
+- `tmux` is used when available.
+- If tmux is not available, Worker falls back to the built-in PTY backend and prints a warning.
+
+Built-in PTY sessions can be detached and re-attached from Control while the
+Worker process is alive, but they are not durable across Worker process stops or
+restarts. Install tmux when you want local sessions to survive Worker restarts.
+
+Configure the default backend:
+
+```bash
+agentmux worker config --backend auto
+agentmux worker config --backend tmux
+agentmux worker config --backend pty
+```
+
+You can also pass `--backend auto|tmux|pty` to `agentmux worker run`,
+`agentmux worker join`, or `agentmux worker start`. Explicit `tmux` fails fast
+when tmux is missing; `auto` falls back to built-in PTY.
 
 ## Open Web Control
 
@@ -202,6 +225,6 @@ Runtime state is rebuilt as workers reconnect:
 
 - online workers
 - active WebSocket streams
-- live tmux session snapshots
+- live session snapshots
 
 Back up the configured `agentmux.db` file for Hub identity state.

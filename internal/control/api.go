@@ -13,7 +13,7 @@ import (
 	"private/agentmux/internal/protocol"
 )
 
-func (c Client) ListWorkers(ctx context.Context, out io.Writer) error {
+func (c *Client) ListWorkers(ctx context.Context, out io.Writer) error {
 	workers, err := c.Workers(ctx)
 	if err != nil {
 		return err
@@ -24,7 +24,7 @@ func (c Client) ListWorkers(ctx context.Context, out io.Writer) error {
 	return nil
 }
 
-func (c Client) ListSessions(ctx context.Context, out io.Writer) error {
+func (c *Client) ListSessions(ctx context.Context, out io.Writer) error {
 	sessions, err := c.Sessions(ctx)
 	if err != nil {
 		return err
@@ -35,7 +35,7 @@ func (c Client) ListSessions(ctx context.Context, out io.Writer) error {
 	return nil
 }
 
-func (c Client) Workers(ctx context.Context) ([]protocol.WorkerView, error) {
+func (c *Client) Workers(ctx context.Context) ([]protocol.WorkerView, error) {
 	var payload struct {
 		Workers []protocol.WorkerView `json:"workers"`
 	}
@@ -45,7 +45,7 @@ func (c Client) Workers(ctx context.Context) ([]protocol.WorkerView, error) {
 	return payload.Workers, nil
 }
 
-func (c Client) Sessions(ctx context.Context) ([]protocol.SessionView, error) {
+func (c *Client) Sessions(ctx context.Context) ([]protocol.SessionView, error) {
 	var payload struct {
 		Sessions []protocol.SessionView `json:"sessions"`
 	}
@@ -55,12 +55,12 @@ func (c Client) Sessions(ctx context.Context) ([]protocol.SessionView, error) {
 	return payload.Sessions, nil
 }
 
-func (c Client) CreateSession(ctx context.Context, req protocol.CreateSession) error {
+func (c *Client) CreateSession(ctx context.Context, req protocol.CreateSession) error {
 	var payload map[string]string
 	return c.doJSON(ctx, http.MethodPost, "/api/sessions", req, &payload)
 }
 
-func (c Client) SendInput(ctx context.Context, sessionID, data string) error {
+func (c *Client) SendInput(ctx context.Context, sessionID, data string) error {
 	workerID, name, ok := protocol.SplitSessionID(sessionID)
 	if !ok {
 		return fmt.Errorf("invalid session id %q; expected worker/name", sessionID)
@@ -70,7 +70,7 @@ func (c Client) SendInput(ctx context.Context, sessionID, data string) error {
 	return c.doJSON(ctx, http.MethodPost, path, protocol.TerminalInput{Data: data}, &payload)
 }
 
-func (c Client) StopSession(ctx context.Context, sessionID string) error {
+func (c *Client) StopSession(ctx context.Context, sessionID string) error {
 	workerID, name, ok := protocol.SplitSessionID(sessionID)
 	if !ok {
 		return fmt.Errorf("invalid session id %q; expected worker/name", sessionID)
@@ -80,7 +80,7 @@ func (c Client) StopSession(ctx context.Context, sessionID string) error {
 	return c.doJSON(ctx, http.MethodDelete, path, nil, &payload)
 }
 
-func (c Client) SessionPreview(ctx context.Context, sessionID string, lines int) (string, error) {
+func (c *Client) SessionPreview(ctx context.Context, sessionID string, lines int) (string, error) {
 	workerID, name, ok := protocol.SplitSessionID(sessionID)
 	if !ok {
 		return "", fmt.Errorf("invalid session id %q; expected worker/name", sessionID)
@@ -96,7 +96,7 @@ func (c Client) SessionPreview(ctx context.Context, sessionID string, lines int)
 	return payload.Data, nil
 }
 
-func (c Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, deviceName string) (string, error) {
+func (c *Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, deviceName string) (string, error) {
 	var payload struct {
 		Credential string `json:"credential"`
 		DeviceID   string `json:"device_id"`
@@ -107,7 +107,7 @@ func (c Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, devi
 		"device_id":   deviceID,
 		"device_name": deviceName,
 	}
-	client := c
+	client := *c
 	client.Token = ""
 	if err := client.doJSON(ctx, http.MethodPost, "/api/exchange", req, &payload); err != nil {
 		return "", err
@@ -115,7 +115,15 @@ func (c Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, devi
 	return payload.Credential, nil
 }
 
-func (c Client) doJSON(ctx context.Context, method, path string, body any, target any) error {
+func (c *Client) doJSON(ctx context.Context, method, path string, body any, target any) error {
+	if c == nil {
+		return fmt.Errorf("control client is nil")
+	}
+	if !skipAutoRefresh(path) {
+		if err := c.EnsureFresh(ctx); err != nil {
+			return err
+		}
+	}
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -147,4 +155,10 @@ func (c Client) doJSON(ctx context.Context, method, path string, body any, targe
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(target)
+}
+
+func skipAutoRefresh(path string) bool {
+	return path == "/api/exchange" ||
+		path == "/api/auth/refresh" ||
+		strings.HasPrefix(path, "/api/auth/device/")
 }

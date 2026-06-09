@@ -34,6 +34,8 @@ type WorkerView = {
   name: string;
   addr: string;
   last_seen: string;
+  status?: string;
+  online?: boolean;
 };
 
 type SessionView = {
@@ -77,6 +79,10 @@ type AuthCredentialPayload = {
   credential_id: string;
   tenant_id: string;
   device_id: string;
+  role?: string;
+  expires_at?: string;
+  refresh_token?: string;
+  refresh_expires_at?: string;
   user?: {
     email: string;
     name: string;
@@ -122,12 +128,19 @@ type DropTarget = {
 const dragMime = "application/x-agentmux-drag";
 const query = new URLSearchParams(window.location.search);
 const initialSignal = query.get("signal") || "";
-const initialToken = query.get("token") || localStorage.getItem("agentmux.token") || "";
+const queryToken = query.get("token") || "";
+const initialToken = queryToken || localStorage.getItem("agentmux.token") || "";
+const initialTokenExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.token_expires_at") || "";
+const initialRefreshToken = queryToken ? "" : localStorage.getItem("agentmux.refresh_token") || "";
+const initialRefreshExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.refresh_expires_at") || "";
 const initialPaneId = crypto.randomUUID();
 const initialUser = readStoredUser();
 
 function App() {
   const [token, setToken] = React.useState(initialToken);
+  const [tokenExpiresAt, setTokenExpiresAt] = React.useState(initialTokenExpiresAt);
+  const [refreshToken, setRefreshToken] = React.useState(initialRefreshToken);
+  const [refreshExpiresAt, setRefreshExpiresAt] = React.useState(initialRefreshExpiresAt);
   const [workers, setWorkers] = React.useState<WorkerView[]>([]);
   const [sessions, setSessions] = React.useState<SessionView[]>([]);
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
@@ -147,6 +160,14 @@ function App() {
   const [activePane, setActivePane] = React.useState<string>(initialPaneId);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
   const sessionButtonRefs = React.useRef<Record<string, HTMLButtonElement | null>>({});
+  const authRef = React.useRef({
+    token: initialToken,
+    tokenExpiresAt: initialTokenExpiresAt,
+    refreshToken: initialRefreshToken,
+    refreshExpiresAt: initialRefreshExpiresAt,
+  });
+  const refreshInFlight = React.useRef<Promise<string> | null>(null);
+  const lastActivityAt = React.useRef(Date.now());
   const [status, setStatus] = React.useState<Status>({
     tone: "idle",
     title: "No session attached",
@@ -175,6 +196,27 @@ function App() {
   );
 
   React.useEffect(() => {
+    authRef.current = { token, tokenExpiresAt, refreshToken, refreshExpiresAt };
+  }, [token, tokenExpiresAt, refreshToken, refreshExpiresAt]);
+
+  React.useEffect(() => {
+    const markActivity = () => {
+      lastActivityAt.current = Date.now();
+    };
+    window.addEventListener("keydown", markActivity, true);
+    window.addEventListener("pointerdown", markActivity, true);
+    const timer = window.setInterval(() => {
+      if (Date.now() - lastActivityAt.current > 10 * 60 * 1000) return;
+      void ensureFreshAccessToken();
+    }, 60_000);
+    return () => {
+      window.removeEventListener("keydown", markActivity, true);
+      window.removeEventListener("pointerdown", markActivity, true);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  React.useEffect(() => {
     if (initialSignal) {
       void exchangeSignal(initialSignal);
     } else if (initialToken) {
@@ -184,7 +226,8 @@ function App() {
 
   React.useEffect(() => {
     if (!createForm.worker_id && workers[0]) {
-      setCreateForm((form) => ({ ...form, worker_id: workers[0].id }));
+      const preferred = workers.find(workerIsOnline) || workers[0];
+      setCreateForm((form) => ({ ...form, worker_id: preferred.id }));
     }
   }, [workers, createForm.worker_id]);
 
@@ -217,16 +260,18 @@ function App() {
     await acceptCredential(data, "Signal credential ready");
   }
 
-  async function apiFetch(path: string, init: RequestInit = {}, authToken = token) {
+  async function apiFetch(path: string, init: RequestInit = {}, authToken = authRef.current.token) {
+    const nextToken = path === "/api/auth/refresh" ? authToken : await ensureFreshAccessToken(authToken);
     const headers = new Headers(init.headers);
-    if (authToken) headers.set("Authorization", `Bearer ${authToken}`);
+    if (nextToken) headers.set("Authorization", `Bearer ${nextToken}`);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     return fetch(path, { ...init, headers });
   }
 
-  async function refreshAll(authToken = token) {
-    localStorage.setItem("agentmux.token", authToken);
-    const [workersRes, sessionsRes] = await Promise.all([apiFetch("/api/workers", {}, authToken), apiFetch("/api/sessions", {}, authToken)]);
+  async function refreshAll(authToken = authRef.current.token) {
+    const nextToken = await ensureFreshAccessToken(authToken);
+    if (nextToken) localStorage.setItem("agentmux.token", nextToken);
+    const [workersRes, sessionsRes] = await Promise.all([apiFetch("/api/workers", {}, nextToken), apiFetch("/api/sessions", {}, nextToken)]);
     if (!workersRes.ok || !sessionsRes.ok) {
       setStatus({ tone: "err", title: "Unauthorized or hub unavailable", detail: `${workersRes.status} ${sessionsRes.status}` });
       return;
@@ -287,14 +332,8 @@ function App() {
   }
 
   async function acceptCredential(data: AuthCredentialPayload, title: string) {
-    setToken(data.credential);
-    setTokenDraft(data.credential);
-    localStorage.setItem("agentmux.token", data.credential);
+    storeCredential(data);
     localStorage.setItem("agentmux.control_device_id", data.device_id);
-    if (data.user) {
-      setCurrentUser(data.user);
-      localStorage.setItem("agentmux.user", JSON.stringify(data.user));
-    }
     setStatus({
       tone: "ok",
       title,
@@ -311,11 +350,89 @@ function App() {
       return;
     }
     setToken(nextToken);
+    setTokenExpiresAt("");
+    setRefreshToken("");
+    setRefreshExpiresAt("");
     setCurrentUser(null);
     setJoinSignal(null);
+    localStorage.setItem("agentmux.token", nextToken);
+    localStorage.removeItem("agentmux.token_expires_at");
+    localStorage.removeItem("agentmux.refresh_token");
+    localStorage.removeItem("agentmux.refresh_expires_at");
     localStorage.removeItem("agentmux.user");
     setAuthOpen(false);
     await refreshAll(nextToken);
+  }
+
+  function storeCredential(data: AuthCredentialPayload) {
+    setToken(data.credential);
+    setTokenDraft(data.credential);
+    setTokenExpiresAt(data.expires_at || "");
+    setRefreshToken(data.refresh_token || "");
+    setRefreshExpiresAt(data.refresh_expires_at || "");
+    authRef.current = {
+      token: data.credential,
+      tokenExpiresAt: data.expires_at || "",
+      refreshToken: data.refresh_token || "",
+      refreshExpiresAt: data.refresh_expires_at || "",
+    };
+    localStorage.setItem("agentmux.token", data.credential);
+    setOptionalStorage("agentmux.token_expires_at", data.expires_at);
+    setOptionalStorage("agentmux.refresh_token", data.refresh_token);
+    setOptionalStorage("agentmux.refresh_expires_at", data.refresh_expires_at);
+    if (data.user) {
+      setCurrentUser(data.user);
+      localStorage.setItem("agentmux.user", JSON.stringify(data.user));
+    } else {
+      setCurrentUser(null);
+      localStorage.removeItem("agentmux.user");
+    }
+  }
+
+  async function ensureFreshAccessToken(authToken = authRef.current.token) {
+    const state = authRef.current;
+    if (!authToken) return "";
+    if (authToken !== state.token) return state.token || authToken;
+    if (!state.refreshToken) return authToken;
+    if (!shouldRefreshBrowserToken(state.tokenExpiresAt)) return authToken;
+    if (isPast(state.refreshExpiresAt)) {
+      clearStoredRefresh();
+      return authToken;
+    }
+    if (!refreshInFlight.current) {
+      refreshInFlight.current = refreshBrowserCredential(state.refreshToken).finally(() => {
+        refreshInFlight.current = null;
+      });
+    }
+    try {
+      return await refreshInFlight.current;
+    } catch {
+      return authToken;
+    }
+  }
+
+  async function refreshBrowserCredential(currentRefreshToken: string) {
+    const res = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: currentRefreshToken }),
+    });
+    if (!res.ok) {
+      clearStoredRefresh();
+      setStatus({ tone: "warn", title: "Session refresh failed", detail: errorDetail(await res.text()) });
+      throw new Error("session refresh failed");
+    }
+    const data = (await res.json()) as AuthCredentialPayload;
+    storeCredential(data);
+    return data.credential;
+  }
+
+  function clearStoredRefresh() {
+    setRefreshToken("");
+    setRefreshExpiresAt("");
+    authRef.current = { ...authRef.current, refreshToken: "", refreshExpiresAt: "" };
+    localStorage.removeItem("agentmux.refresh_token");
+    localStorage.removeItem("agentmux.refresh_expires_at");
   }
 
   async function generateJoinSignal() {
@@ -348,7 +465,7 @@ function App() {
         setSessions(nextSessions);
         const found = nextSessions.find((session: SessionView) => session.id === sessionID);
         if (found) {
-          attach(found.id);
+          await attach(found.id);
           setWorkerFilter(workerID);
           setPendingFocusSessionId(found.id);
           setStatus({ tone: "ok", title: "Session ready", detail: found.id });
@@ -371,7 +488,8 @@ function App() {
     if (data.url) window.location.href = data.url;
   }
 
-  function attach(sessionId: string) {
+  async function attach(sessionId: string) {
+    await ensureFreshAccessToken();
     setLayout((node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
   }
 
@@ -443,7 +561,7 @@ function App() {
             <Select value={workerFilter} onChange={(event) => setWorkerFilter(event.target.value)} className="h-8 text-xs">
               <option value="all">All workers</option>
               {workerOptions.map((worker) => (
-                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)}</option>
+                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)} · {workerStatusLabel(worker)}</option>
               ))}
             </Select>
           </div>
@@ -453,9 +571,12 @@ function App() {
             {groupedSessions.map((group) => (
               <div key={group.workerId} className="space-y-1 pb-2">
                 <div className="px-2 pb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-                  <div className="truncate">{group.worker ? workerDisplayLabel(group.worker) : group.workerId}</div>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", !group.worker || workerIsOnline(group.worker) ? "bg-emerald-500" : "bg-amber-500")} />
+                    <div className="truncate">{group.worker ? workerDisplayLabel(group.worker) : group.workerId}</div>
+                  </div>
                   <div className="truncate text-[10px] normal-case tracking-normal text-muted-foreground/80">
-                    {group.worker?.addr || group.workerId} · {group.sessions.length} session{group.sessions.length === 1 ? "" : "s"}
+                    {group.worker ? workerStatusLabel(group.worker) : "unknown"} · {group.worker?.addr || group.workerId} · {group.sessions.length} session{group.sessions.length === 1 ? "" : "s"}
                   </div>
                 </div>
                 {group.sessions.map((session) => (
@@ -474,7 +595,7 @@ function App() {
                         type="button"
                         draggable
                         className="min-w-0 flex-1 px-2 py-1.5 text-left"
-                        onClick={() => attach(session.id)}
+                        onClick={() => void attach(session.id)}
                         onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
                         onDragEnd={() => setDropTarget(null)}
                       >
@@ -800,7 +921,7 @@ function CreateSessionModal({
             <Select value={createForm.worker_id} onChange={(event) => onFormChange((form) => ({ ...form, worker_id: event.target.value }))}>
               <option value="">Select worker</option>
               {workers.map((worker) => (
-                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)}</option>
+                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)} · {workerStatusLabel(worker)}</option>
               ))}
             </Select>
             {workers.length === 0 ? <div className="text-xs text-muted-foreground">No workers matched the current filter.</div> : null}
@@ -1465,6 +1586,25 @@ function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function setOptionalStorage(key: string, value?: string) {
+  if (value) localStorage.setItem(key, value);
+  else localStorage.removeItem(key);
+}
+
+function shouldRefreshBrowserToken(expiresAt?: string) {
+  if (!expiresAt) return true;
+  const deadline = Date.parse(expiresAt);
+  if (!Number.isFinite(deadline)) return true;
+  return deadline - Date.now() <= 2 * 60 * 1000;
+}
+
+function isPast(expiresAt?: string) {
+  if (!expiresAt) return false;
+  const deadline = Date.parse(expiresAt);
+  if (!Number.isFinite(deadline)) return false;
+  return Date.now() > deadline;
+}
+
 function readStoredUser(): AuthUser | null {
   const value = localStorage.getItem("agentmux.user");
   if (!value) return null;
@@ -1479,6 +1619,14 @@ function readStoredUser(): AuthUser | null {
 
 function workerDisplayLabel(worker: WorkerView) {
   return worker.name && worker.name !== worker.id ? `${worker.name} (${worker.id})` : worker.id;
+}
+
+function workerIsOnline(worker: WorkerView) {
+  return worker.online === true || !worker.status || worker.status === "online";
+}
+
+function workerStatusLabel(worker: WorkerView) {
+  return workerIsOnline(worker) ? "online" : "offline";
 }
 
 function filterWorkers(workers: WorkerView[], query: string) {

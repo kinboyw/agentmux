@@ -33,10 +33,12 @@ type Server struct {
 
 	mu          sync.RWMutex
 	workers     map[string]*workerConn
+	workerViews map[string]workerRecord
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
 	previews    map[string]chan protocol.Envelope
 	auth        AuthStore
+	rateLimiter *rateLimiter
 }
 
 type workerConn struct {
@@ -47,6 +49,15 @@ type workerConn struct {
 	lastSeen time.Time
 	conn     *ws.Conn
 	send     chan protocol.Envelope
+}
+
+type workerRecord struct {
+	id        string
+	tenantID  string
+	name      string
+	addr      string
+	lastSeen  time.Time
+	connected bool
 }
 
 type controlConn struct {
@@ -62,6 +73,45 @@ type authContext struct {
 }
 
 type authContextKey struct{}
+
+type rateLimitBucket struct {
+	Count     int
+	ResetAt   time.Time
+	UpdatedAt time.Time
+}
+
+type rateLimiter struct {
+	mu     sync.Mutex
+	limit  int
+	window time.Duration
+	items  map[string]rateLimitBucket
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{limit: limit, window: window, items: map[string]rateLimitBucket{}}
+}
+
+func (l *rateLimiter) Allow(key string) bool {
+	if l == nil || l.limit <= 0 || l.window <= 0 {
+		return true
+	}
+	now := time.Now().UTC()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for existingKey, bucket := range l.items {
+		if now.After(bucket.ResetAt) {
+			delete(l.items, existingKey)
+		}
+	}
+	bucket := l.items[key]
+	if bucket.ResetAt.IsZero() || now.After(bucket.ResetAt) {
+		bucket = rateLimitBucket{ResetAt: now.Add(l.window)}
+	}
+	bucket.Count++
+	bucket.UpdatedAt = now
+	l.items[key] = bucket
+	return bucket.Count <= l.limit
+}
 
 func New(addr, token string, logger *slog.Logger) *Server {
 	server, err := NewWithOptions(ServerOptions{Addr: addr, Token: token, Logger: logger})
@@ -92,10 +142,12 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		releaseRepo: defaultReleaseRepo(options.ReleaseRepo),
 		logger:      logger,
 		workers:     map[string]*workerConn{},
+		workerViews: map[string]workerRecord{},
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
 		previews:    map[string]chan protocol.Envelope{},
 		auth:        defaultAuthStore(options.AuthStore),
+		rateLimiter: newRateLimiter(10, time.Minute),
 	}, nil
 }
 
@@ -129,6 +181,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/exchange", s.handleExchange)
 	mux.HandleFunc("/api/auth/register", s.handleAuthRegister)
 	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("/api/auth/device/start", s.handleDeviceStart)
 	mux.HandleFunc("/api/auth/device/poll", s.handleDevicePoll)
 	mux.HandleFunc("/api/auth/device/approve", s.handleDeviceApprove)
@@ -332,6 +385,24 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, credential)
 }
 
+func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	credential, err := s.auth.Refresh(req)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
 func (s *Server) handleDeviceStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -381,6 +452,11 @@ func (s *Server) handleDeviceApprove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	limitKey := remoteHost(r.RemoteAddr) + "|" + normalizeUserCode(req.UserCode)
+	if !s.rateLimiter.Allow(limitKey) {
+		writeError(w, http.StatusTooManyRequests, "too many authorization attempts")
+		return
+	}
 	credential, err := s.auth.ApproveDeviceAuth(req)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
@@ -396,7 +472,17 @@ func (s *Server) handleDevicePage(w http.ResponseWriter, r *http.Request) {
 	}
 	data := struct {
 		UserCode string
-	}{UserCode: r.URL.Query().Get("user_code")}
+		Info     deviceAuthInfo
+		HasInfo  bool
+	}{
+		UserCode: normalizeUserCode(r.URL.Query().Get("user_code")),
+	}
+	if data.UserCode != "" {
+		data.Info, data.HasInfo = s.auth.DeviceAuthInfo(data.UserCode)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = deviceTemplate.Execute(w, data)
 }
@@ -416,10 +502,14 @@ func (s *Server) handleAuthOAuth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	auth := requestAuth(r)
 	s.mu.RLock()
-	workers := make([]protocol.WorkerView, 0, len(s.workers))
-	for _, worker := range s.workers {
+	workers := make([]protocol.WorkerView, 0, len(s.workerViews))
+	for _, worker := range s.workerViews {
 		if !auth.Admin && worker.tenantID != auth.Credential.TenantID {
 			continue
+		}
+		status := "offline"
+		if worker.connected {
+			status = "online"
 		}
 		workers = append(workers, protocol.WorkerView{
 			ID:       worker.id,
@@ -427,6 +517,8 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 			Name:     worker.name,
 			Addr:     worker.addr,
 			LastSeen: worker.lastSeen,
+			Status:   status,
+			Online:   worker.connected,
 		})
 	}
 	s.mu.RUnlock()
@@ -468,6 +560,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		go s.requestSessionSync(req.WorkerID)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -492,6 +585,7 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		go s.requestSessionSync(workerID)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
 		return
 	}
@@ -550,7 +644,7 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		send:     make(chan protocol.Envelope, 64),
 	}
 	s.registerWorker(worker)
-	defer s.unregisterWorker(worker.id)
+	defer s.unregisterWorker(worker)
 
 	go writeLoop(conn, worker.send)
 	for {
@@ -592,25 +686,50 @@ func (s *Server) registerWorker(worker *workerConn) {
 		_ = old.conn.Close()
 	}
 	s.workers[worker.id] = worker
+	s.workerViews[worker.id] = workerRecord{
+		id: worker.id, tenantID: worker.tenantID, name: worker.name, addr: worker.addr,
+		lastSeen: worker.lastSeen, connected: true,
+	}
 	s.mu.Unlock()
 	s.logger.Info("worker connected", "worker", worker.id)
 }
 
-func (s *Server) unregisterWorker(workerID string) {
-	s.mu.Lock()
-	delete(s.workers, workerID)
-	for id := range s.sessions {
-		if strings.HasPrefix(id, workerID+"/") {
-			delete(s.sessions, id)
-		}
+func (s *Server) unregisterWorker(worker *workerConn) {
+	if worker == nil {
+		return
 	}
+	s.mu.Lock()
+	current := s.workers[worker.id]
+	if current != worker {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.workers, worker.id)
+	record := s.workerViews[worker.id]
+	if record.id == "" {
+		record = workerRecord{id: worker.id, tenantID: worker.tenantID, name: worker.name, addr: worker.addr}
+	}
+	record.connected = false
+	record.lastSeen = time.Now().UTC()
+	if worker.name != "" {
+		record.name = worker.name
+	}
+	if worker.addr != "" {
+		record.addr = worker.addr
+	}
+	s.workerViews[worker.id] = record
 	s.mu.Unlock()
-	s.logger.Info("worker disconnected", "worker", workerID)
+	s.logger.Info("worker disconnected", "worker", worker.id)
 }
 
 func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) {
 	s.mu.Lock()
 	worker.lastSeen = time.Now().UTC()
+	if record := s.workerViews[worker.id]; record.id != "" {
+		record.lastSeen = worker.lastSeen
+		record.connected = true
+		s.workerViews[worker.id] = record
+	}
 	s.mu.Unlock()
 	switch env.Type {
 	case protocol.TypeWorkerHeartbeat:
@@ -794,6 +913,11 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 	}
 }
 
+func (s *Server) requestSessionSync(workerID string) {
+	time.Sleep(150 * time.Millisecond)
+	_ = s.sendToWorker(workerID, protocol.TypeSessionSync, nil, "", "")
+}
+
 func (s *Server) completePreview(env protocol.Envelope) bool {
 	if env.ID == "" {
 		return false
@@ -844,14 +968,17 @@ func (s *Server) sendToWorkerWithID(workerID, messageType string, payload any, n
 func (s *Server) workerInTenant(workerID, tenantID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	worker := s.workers[workerID]
-	return worker != nil && worker.tenantID == tenantID
+	if worker := s.workers[workerID]; worker != nil {
+		return worker.tenantID == tenantID
+	}
+	record := s.workerViews[workerID]
+	return record.id != "" && record.tenantID == tenantID
 }
 
 func (s *Server) workerTenantIDLocked(workerID string) string {
 	worker := s.workers[workerID]
 	if worker == nil {
-		return ""
+		return s.workerViews[workerID].tenantID
 	}
 	return worker.tenantID
 }
@@ -1117,6 +1244,15 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
     input { height: 38px; border-radius: 6px; border: 1px solid rgba(255,255,255,.14); background: #07090a; color: #eef2f3; padding: 0 11px; font-size: 14px; outline: none; }
     input:focus { border-color: #35c98f; box-shadow: 0 0 0 2px rgba(53,201,143,.2); }
     button { height: 38px; border: 1px solid #35c98f; border-radius: 6px; background: #35c98f; color: #02110b; font-weight: 650; cursor: pointer; }
+    .danger { border-color: rgba(255,94,94,.35); background: transparent; color: #ffb4b4; }
+    .oauth-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .oauth { border-color: rgba(255,255,255,.14); background: #0b0e10; color: #eef2f3; font-weight: 600; }
+    .divider { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; color: #6f7a80; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .divider::before, .divider::after { content: ""; height: 1px; background: rgba(255,255,255,.1); }
+    .device-card { display: grid; gap: 8px; margin: 16px 22px 0; padding: 12px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; background: rgba(255,255,255,.035); }
+    .row { display: flex; justify-content: space-between; gap: 14px; font-size: 12px; color: #9aa4aa; }
+    .row strong { color: #eef2f3; font-weight: 650; text-align: right; overflow-wrap: anywhere; }
+    .warning { margin: 0 22px; color: #d7b46a; font-size: 12px; line-height: 1.45; }
     #status { min-height: 18px; font-size: 12px; color: #9aa4aa; }
   </style>
 </head>
@@ -1126,15 +1262,46 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
       <h1>AgentMux device login</h1>
       <p>Confirm the code shown in your terminal, then sign in to authorize this Control device.</p>
     </header>
+    {{if .HasInfo}}
+    <section class="device-card">
+      <div class="row"><span>Device</span><strong>{{.Info.DeviceName}}</strong></div>
+      <div class="row"><span>Device ID</span><strong>{{.Info.DeviceID}}</strong></div>
+      <div class="row"><span>Status</span><strong>{{.Info.Status}}</strong></div>
+      <div class="row"><span>Expires</span><strong>{{.Info.ExpiresAt.Format "2006-01-02 15:04:05 UTC"}}</strong></div>
+    </section>
+    {{else}}
+    <p class="warning">Only approve this request if you just ran <strong>agentmux control login</strong> in your own terminal.</p>
+    {{end}}
     <form id="form">
       <label>Code<input id="user_code" name="user_code" autocomplete="one-time-code" value="{{.UserCode}}" required></label>
+      <div class="oauth-grid">
+        <button class="oauth" type="button" data-provider="github">Continue with GitHub</button>
+        <button class="oauth" type="button" data-provider="google">Continue with Google</button>
+      </div>
+      <div class="divider">or</div>
       <label>Email<input id="email" name="email" type="email" autocomplete="email" required></label>
       <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
       <button type="submit">Authorize Control</button>
+      <button class="danger" id="deny" type="button">Deny request</button>
       <div id="status"></div>
     </form>
   </main>
   <script>
+    if (window.location.search) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    document.querySelectorAll('[data-provider]').forEach(button => {
+      button.addEventListener('click', () => {
+        const status = document.getElementById('status');
+        const provider = button.getAttribute('data-provider');
+        status.textContent = provider + ' OAuth is reserved for the next auth milestone.';
+      });
+    });
+    document.getElementById('deny').addEventListener('click', () => {
+      const status = document.getElementById('status');
+      document.getElementById('user_code').value = '';
+      status.textContent = 'Request denied locally. The terminal login will expire automatically.';
+    });
     document.getElementById('form').addEventListener('submit', async event => {
       event.preventDefault();
       const status = document.getElementById('status');

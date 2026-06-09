@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-)
 
-var sessionNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,80}$`)
+	"private/agentmux/internal/pty"
+	"private/agentmux/internal/sessionbackend"
+)
 
 type Runner interface {
 	Run(ctx context.Context, name string, args ...string) (string, error)
@@ -32,19 +32,12 @@ type Adapter struct {
 func CheckAvailable() error {
 	path, err := exec.LookPath("tmux")
 	if err != nil {
-		return fmt.Errorf("tmux is required for agentmux worker but was not found in PATH\n\nInstall tmux and retry:\n  Debian/Ubuntu: sudo apt install tmux\n  Fedora:        sudo dnf install tmux\n  Arch:          sudo pacman -S tmux\n  macOS:         brew install tmux\n\nAgentMux worker currently uses tmux as the local session backend so sessions can survive control disconnects")
+		return fmt.Errorf("tmux was not found in PATH\n\nInstall tmux for durable local sessions:\n  Debian/Ubuntu: sudo apt install tmux\n  Fedora:        sudo dnf install tmux\n  Arch:          sudo pacman -S tmux\n  macOS:         brew install tmux\n\nAgentMux can fall back to the built-in PTY backend, but built-in PTY sessions are lost when the worker process stops")
 	}
 	if path == "" {
-		return fmt.Errorf("tmux is required for agentmux worker but was not found in PATH")
+		return fmt.Errorf("tmux was not found in PATH")
 	}
 	return nil
-}
-
-type Session struct {
-	Name    string
-	CWD     string
-	Command string
-	Status  string
 }
 
 func New(runner Runner) Adapter {
@@ -54,7 +47,11 @@ func New(runner Runner) Adapter {
 	return Adapter{Runner: runner}
 }
 
-func (a Adapter) List(ctx context.Context) ([]Session, error) {
+func (a Adapter) Name() string {
+	return "tmux"
+}
+
+func (a Adapter) List(ctx context.Context) ([]sessionbackend.Session, error) {
 	output, err := a.Runner.Run(ctx, "tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_current_path}\t#{pane_current_command}\t#{session_attached}")
 	if err != nil {
 		// tmux returns non-zero when no server exists. Treat that as empty.
@@ -63,7 +60,7 @@ func (a Adapter) List(ctx context.Context) ([]Session, error) {
 		}
 		return nil, fmt.Errorf("tmux list-panes: %w: %s", err, strings.TrimSpace(output))
 	}
-	seen := map[string]Session{}
+	seen := map[string]sessionbackend.Session{}
 	for _, line := range strings.Split(output, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -80,13 +77,13 @@ func (a Adapter) List(ctx context.Context) ([]Session, error) {
 		if safeInt(parts[3]) > 0 {
 			status = "attached"
 		}
-		seen[name] = Session{Name: name, CWD: parts[1], Command: parts[2], Status: status}
+		seen[name] = sessionbackend.Session{Name: name, CWD: parts[1], Command: parts[2], Status: status}
 	}
-	sessions := make([]Session, 0, len(seen))
+	sessions := make([]sessionbackend.Session, 0, len(seen))
 	for _, session := range seen {
 		sessions = append(sessions, session)
 	}
-	slices.SortFunc(sessions, func(a, b Session) int {
+	slices.SortFunc(sessions, func(a, b sessionbackend.Session) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 	return sessions, nil
@@ -95,8 +92,8 @@ func (a Adapter) List(ctx context.Context) ([]Session, error) {
 func (a Adapter) Create(ctx context.Context, name, cwd, command string) error {
 	name = strings.TrimSpace(name)
 	command = strings.TrimSpace(command)
-	if !sessionNamePattern.MatchString(name) {
-		return fmt.Errorf("invalid session name %q", name)
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return err
 	}
 	if command == "" {
 		return fmt.Errorf("command is required")
@@ -112,8 +109,8 @@ func (a Adapter) Create(ctx context.Context, name, cwd, command string) error {
 }
 
 func (a Adapter) Kill(ctx context.Context, name string) error {
-	if !sessionNamePattern.MatchString(name) {
-		return fmt.Errorf("invalid session name %q", name)
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return err
 	}
 	if _, err := a.Runner.Run(ctx, "tmux", "kill-session", "-t", name); err != nil {
 		return fmt.Errorf("tmux kill-session: %w", err)
@@ -122,8 +119,8 @@ func (a Adapter) Kill(ctx context.Context, name string) error {
 }
 
 func (a Adapter) SendInput(ctx context.Context, name, data string) error {
-	if !sessionNamePattern.MatchString(name) {
-		return fmt.Errorf("invalid session name %q", name)
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return err
 	}
 	if data == "" {
 		return nil
@@ -149,8 +146,8 @@ func (a Adapter) SendInput(ctx context.Context, name, data string) error {
 }
 
 func (a Adapter) SendTerminalInput(ctx context.Context, name, data string) error {
-	if !sessionNamePattern.MatchString(name) {
-		return fmt.Errorf("invalid session name %q", name)
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return err
 	}
 	if data == "" {
 		return nil
@@ -243,8 +240,8 @@ func controlKeyToken(value byte) string {
 }
 
 func (a Adapter) Capture(ctx context.Context, name string, lines int) (string, error) {
-	if !sessionNamePattern.MatchString(name) {
-		return "", fmt.Errorf("invalid session name %q", name)
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return "", err
 	}
 	if lines <= 0 {
 		lines = 200
@@ -254,6 +251,13 @@ func (a Adapter) Capture(ctx context.Context, name string, lines int) (string, e
 		return "", fmt.Errorf("tmux capture-pane: %w", err)
 	}
 	return output, nil
+}
+
+func (a Adapter) Open(ctx context.Context, name string, cols int, rows int) (sessionbackend.Stream, error) {
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return nil, err
+	}
+	return pty.StartTmuxAttach(ctx, name, cols, rows)
 }
 
 func safeInt(value string) int {

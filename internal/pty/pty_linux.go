@@ -3,8 +3,10 @@ package pty
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 )
@@ -21,11 +23,24 @@ type Terminal struct {
 }
 
 func StartTmuxAttach(ctx context.Context, session string, cols int, rows int) (*Terminal, error) {
+	return StartCommand(ctx, "tmux", []string{"attach-session", "-t", session}, "", cols, rows)
+}
+
+func StartCommand(ctx context.Context, name string, args []string, cwd string, cols int, rows int) (*Terminal, error) {
 	master, slave, err := openPTY(cols, rows)
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "tmux", "attach-session", "-t", session)
+	cmd := exec.CommandContext(ctx, name, args...)
+	if cwd != "" {
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			_ = master.Close()
+			_ = slave.Close()
+			return nil, err
+		}
+		cmd.Dir = abs
+	}
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	cmd.Stderr = slave
@@ -44,6 +59,17 @@ func StartTmuxAttach(ctx context.Context, session string, cols int, rows int) (*
 	return &Terminal{master: master, cmd: cmd}, nil
 }
 
+func (t *Terminal) Wait() error {
+	if t.cmd == nil {
+		return nil
+	}
+	return t.cmd.Wait()
+}
+
+func (t *Terminal) Master() *os.File {
+	return t.master
+}
+
 func (t *Terminal) Read(p []byte) (int, error) {
 	return t.master.Read(p)
 }
@@ -59,6 +85,33 @@ func (t *Terminal) Resize(cols int, rows int) error {
 func (t *Terminal) Close() error {
 	_ = t.master.Close()
 	return nil
+}
+
+func (t *Terminal) Kill() error {
+	if t.cmd == nil || t.cmd.Process == nil {
+		return nil
+	}
+	if err := t.cmd.Process.Kill(); err != nil && err != os.ErrProcessDone {
+		return err
+	}
+	return nil
+}
+
+func (t *Terminal) CopyOutput(ctx context.Context, writers func([]byte)) error {
+	buffer := make([]byte, 8192)
+	for {
+		n, err := t.Read(buffer)
+		if n > 0 {
+			chunk := append([]byte(nil), buffer[:n]...)
+			writers(chunk)
+		}
+		if err != nil {
+			if err != io.EOF && ctx.Err() == nil {
+				return err
+			}
+			return nil
+		}
+	}
 }
 
 func openPTY(cols int, rows int) (*os.File, *os.File, error) {

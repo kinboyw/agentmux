@@ -20,13 +20,15 @@ type AppAuthOptions struct {
 }
 
 type AppAuthResult struct {
-	Client       Client
-	CredentialID string
-	TenantID     string
-	DeviceID     string
-	Role         string
-	ExpiresAt    time.Time
-	Source       string
+	Client           Client
+	CredentialID     string
+	TenantID         string
+	DeviceID         string
+	Role             string
+	ExpiresAt        time.Time
+	RefreshToken     string
+	RefreshExpiresAt time.Time
+	Source           string
 }
 
 type exchangedCredentialPayload struct {
@@ -56,14 +58,16 @@ type DevicePollResponse struct {
 }
 
 type authCredentialResponsePayload struct {
-	Credential   string       `json:"credential"`
-	CredentialID string       `json:"credential_id"`
-	TenantID     string       `json:"tenant_id"`
-	Role         string       `json:"role"`
-	DeviceID     string       `json:"device_id"`
-	ExpiresAt    time.Time    `json:"expires_at"`
-	Scopes       []string     `json:"scopes"`
-	User         authUserView `json:"user"`
+	Credential       string       `json:"credential"`
+	CredentialID     string       `json:"credential_id"`
+	TenantID         string       `json:"tenant_id"`
+	Role             string       `json:"role"`
+	DeviceID         string       `json:"device_id"`
+	ExpiresAt        time.Time    `json:"expires_at"`
+	Scopes           []string     `json:"scopes"`
+	RefreshToken     string       `json:"refresh_token"`
+	RefreshExpiresAt time.Time    `json:"refresh_expires_at"`
+	User             authUserView `json:"user"`
 }
 
 type authUserView struct {
@@ -90,9 +94,12 @@ func ResolveAppAuth(ctx context.Context, opts AppAuthOptions) (AppAuthResult, er
 			TenantID: credential.TenantID, Role: credential.Role, DeviceID: credential.DeviceID,
 			DeviceName: deviceName, ExpiresAt: credential.ExpiresAt, UpdatedAt: time.Now().UTC(),
 		}
-		_ = credentialcache.Save(entry)
+		if err := credentialcache.Save(entry); err != nil {
+			return AppAuthResult{}, err
+		}
+		client = New(hubURL, credential.Credential).WithCacheEntry(entry)
 		return AppAuthResult{
-			Client: New(hubURL, credential.Credential), CredentialID: credential.CredentialID,
+			Client: client, CredentialID: credential.CredentialID,
 			TenantID: credential.TenantID, DeviceID: credential.DeviceID, Role: credential.Role,
 			ExpiresAt: credential.ExpiresAt, Source: "join",
 		}, nil
@@ -107,16 +114,26 @@ func ResolveAppAuth(ctx context.Context, opts AppAuthOptions) (AppAuthResult, er
 	} else {
 		entry, ok = credentialcache.Load(hubURL, "control", opts.DeviceID)
 	}
-	if !ok && opts.Login {
+	if ok && shouldRefresh(entry) {
+		refreshed, err := RefreshCachedCredential(ctx, entry)
+		if err == nil {
+			entry = refreshed
+		} else if entry.Credential == "" || time.Now().UTC().After(entry.ExpiresAt) {
+			return AppAuthResult{}, err
+		}
+	}
+	if !ok && opts.Login && hubURL != "" {
 		return DeviceLogin(ctx, hubURL, opts.DeviceID, deviceName, nil)
 	}
 	if !ok {
-		return AppAuthResult{}, errors.New("no credential available; pass --join or --token")
+		return AppAuthResult{}, errors.New("no cached control credential; run agentmux control login --hub <url> or pass --hub")
 	}
+	client := New(entry.HubURL, entry.Credential).WithCacheEntry(entry)
 	return AppAuthResult{
-		Client: New(entry.HubURL, entry.Credential), CredentialID: entry.CredentialID,
+		Client: client, CredentialID: entry.CredentialID,
 		TenantID: entry.TenantID, DeviceID: entry.DeviceID, Role: entry.Role,
-		ExpiresAt: entry.ExpiresAt, Source: "cache",
+		ExpiresAt: entry.ExpiresAt, RefreshToken: entry.RefreshToken, RefreshExpiresAt: entry.RefreshExpiresAt,
+		Source: "cache",
 	}, nil
 }
 
@@ -137,19 +154,22 @@ func DeviceLogin(ctx context.Context, hubURL, deviceID, deviceName string, promp
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return AppAuthResult{}, ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 			poll, err := client.PollDeviceAuth(ctx, start.DeviceCode)
 			if err != nil {
 				return AppAuthResult{}, err
 			}
+			interval = pollInterval(poll.Interval, interval)
 			switch poll.Status {
 			case "pending":
+				continue
+			case "slow_down":
 				continue
 			case "expired":
 				return AppAuthResult{}, errors.New("device login expired")
@@ -161,13 +181,18 @@ func DeviceLogin(ctx context.Context, hubURL, deviceID, deviceName string, promp
 				entry := credentialcache.Entry{
 					HubURL: hubURL, Credential: credential.Credential, CredentialID: credential.CredentialID,
 					TenantID: credential.TenantID, Role: credential.Role, DeviceID: credential.DeviceID,
-					DeviceName: deviceName, ExpiresAt: credential.ExpiresAt, UpdatedAt: time.Now().UTC(),
+					DeviceName: deviceName, ExpiresAt: credential.ExpiresAt, RefreshToken: credential.RefreshToken,
+					RefreshExpiresAt: credential.RefreshExpiresAt, UpdatedAt: time.Now().UTC(),
 				}
-				_ = credentialcache.Save(entry)
+				if err := credentialcache.Save(entry); err != nil {
+					return AppAuthResult{}, err
+				}
+				client := New(hubURL, credential.Credential).WithCacheEntry(entry)
 				return AppAuthResult{
-					Client: New(hubURL, credential.Credential), CredentialID: credential.CredentialID,
+					Client: client, CredentialID: credential.CredentialID,
 					TenantID: credential.TenantID, DeviceID: credential.DeviceID, Role: credential.Role,
-					ExpiresAt: credential.ExpiresAt, Source: "login",
+					ExpiresAt: credential.ExpiresAt, RefreshToken: credential.RefreshToken,
+					RefreshExpiresAt: credential.RefreshExpiresAt, Source: "login",
 				}, nil
 			default:
 				return AppAuthResult{}, errors.New("device login status: " + poll.Status)
@@ -176,7 +201,55 @@ func DeviceLogin(ctx context.Context, hubURL, deviceID, deviceName string, promp
 	}
 }
 
-func (c Client) StartDeviceAuth(ctx context.Context, deviceID, deviceName string) (DeviceStartResponse, error) {
+func pollInterval(seconds int, fallback time.Duration) time.Duration {
+	if seconds <= 0 {
+		return fallback
+	}
+	next := time.Duration(seconds) * time.Second
+	if next <= 0 {
+		return fallback
+	}
+	return next
+}
+
+func RefreshCachedCredential(ctx context.Context, entry credentialcache.Entry) (credentialcache.Entry, error) {
+	if entry.RefreshToken == "" {
+		return entry, errors.New("no refresh token available")
+	}
+	if !entry.RefreshExpiresAt.IsZero() && time.Now().UTC().After(entry.RefreshExpiresAt) {
+		return entry, errors.New("refresh token expired")
+	}
+	client := New(entry.HubURL, "")
+	credential, err := client.RefreshCredential(ctx, entry.RefreshToken)
+	if err != nil {
+		return entry, err
+	}
+	next := credentialcache.Entry{
+		HubURL: entry.HubURL, Credential: credential.Credential, CredentialID: credential.CredentialID,
+		TenantID: credential.TenantID, Role: credential.Role, DeviceID: credential.DeviceID,
+		DeviceName: entry.DeviceName, ExpiresAt: credential.ExpiresAt, RefreshToken: credential.RefreshToken,
+		RefreshExpiresAt: credential.RefreshExpiresAt, UpdatedAt: time.Now().UTC(),
+	}
+	if next.DeviceName == "" {
+		next.DeviceName = credential.User.Name
+	}
+	if err := credentialcache.Save(next); err != nil {
+		return entry, err
+	}
+	return next, nil
+}
+
+func shouldRefresh(entry credentialcache.Entry) bool {
+	if entry.RefreshToken == "" {
+		return false
+	}
+	if entry.Credential == "" || entry.ExpiresAt.IsZero() {
+		return true
+	}
+	return time.Until(entry.ExpiresAt) <= 2*time.Minute
+}
+
+func (c *Client) StartDeviceAuth(ctx context.Context, deviceID, deviceName string) (DeviceStartResponse, error) {
 	req := map[string]string{"device_id": deviceID, "device_name": deviceName}
 	var payload DeviceStartResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/api/auth/device/start", req, &payload); err != nil {
@@ -185,7 +258,7 @@ func (c Client) StartDeviceAuth(ctx context.Context, deviceID, deviceName string
 	return payload, nil
 }
 
-func (c Client) PollDeviceAuth(ctx context.Context, deviceCode string) (DevicePollResponse, error) {
+func (c *Client) PollDeviceAuth(ctx context.Context, deviceCode string) (DevicePollResponse, error) {
 	req := map[string]string{"device_code": deviceCode}
 	var payload DevicePollResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/api/auth/device/poll", req, &payload); err != nil {
@@ -194,14 +267,23 @@ func (c Client) PollDeviceAuth(ctx context.Context, deviceCode string) (DevicePo
 	return payload, nil
 }
 
-func (c Client) ExchangeSignalDetail(ctx context.Context, signal, role, deviceID, deviceName string) (exchangedCredentialPayload, error) {
+func (c *Client) RefreshCredential(ctx context.Context, refreshToken string) (authCredentialResponsePayload, error) {
+	req := map[string]string{"refresh_token": refreshToken}
+	var payload authCredentialResponsePayload
+	if err := c.doJSON(ctx, http.MethodPost, "/api/auth/refresh", req, &payload); err != nil {
+		return authCredentialResponsePayload{}, err
+	}
+	return payload, nil
+}
+
+func (c *Client) ExchangeSignalDetail(ctx context.Context, signal, role, deviceID, deviceName string) (exchangedCredentialPayload, error) {
 	req := map[string]string{
 		"signal":      signal,
 		"role":        role,
 		"device_id":   deviceID,
 		"device_name": deviceName,
 	}
-	client := c
+	client := *c
 	client.Token = ""
 	var payload exchangedCredentialPayload
 	if err := client.doJSON(ctx, http.MethodPost, "/api/exchange", req, &payload); err != nil {

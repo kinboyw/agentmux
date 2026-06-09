@@ -11,7 +11,7 @@ import (
 	"private/agentmux/internal/term"
 )
 
-func (c Client) Attach(ctx context.Context, sessionID string, in io.Reader, out io.Writer) error {
+func (c *Client) Attach(ctx context.Context, sessionID string, in io.Reader, out io.Writer) error {
 	cols, rows := terminalSize(in)
 	stream, err := c.OpenStream(ctx, sessionID, protocol.TerminalSize{Cols: cols, Rows: rows})
 	if err != nil {

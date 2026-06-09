@@ -42,6 +42,16 @@ func TestDedupeWorkersKeepsNewestLastSeen(t *testing.T) {
 	}
 }
 
+func TestDefaultWorkerIDPrefersOnlineWorker(t *testing.T) {
+	workers := []protocol.WorkerView{
+		{ID: "offline", Status: "offline", Online: false},
+		{ID: "online", Status: "online", Online: true},
+	}
+	if got := defaultWorkerID(workers); got != "online" {
+		t.Fatalf("expected online worker, got %q", got)
+	}
+}
+
 func TestReadAppKeyEscDoesNotQuit(t *testing.T) {
 	key, err := readAppKey(strings.NewReader("\x1b"))
 	if err != nil {
@@ -73,6 +83,16 @@ func TestReadAppKeyArrows(t *testing.T) {
 	}
 	if key != "down" {
 		t.Fatalf("expected application cursor down, got %q", key)
+	}
+}
+
+func TestReadAppKeyDetach(t *testing.T) {
+	key, err := readAppKey(strings.NewReader("\x1d"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "detach" {
+		t.Fatalf("expected detach, got %q", key)
 	}
 }
 
@@ -167,7 +187,7 @@ func TestCompactSessionLineFitsNarrowList(t *testing.T) {
 		Status:  "active",
 		Command: "very-long-command",
 	})
-	if visibleLen(line) > 42 {
+	if visibleLen(line) > 34 {
 		t.Fatalf("compact line too wide: %d %q", visibleLen(line), line)
 	}
 	if !strings.Contains(stripControl(line), "worker/") {
@@ -178,6 +198,19 @@ func TestCompactSessionLineFitsNarrowList(t *testing.T) {
 	}
 	if !strings.Contains(line, "~") {
 		t.Fatalf("expected ellipsis marker: %q", line)
+	}
+}
+
+func TestAppLayoutUsesNarrowSessionList(t *testing.T) {
+	listWidth, previewWidth, limit := appLayout(120, 24)
+	if listWidth > 34 {
+		t.Fatalf("left list too wide: %d", listWidth)
+	}
+	if previewWidth <= listWidth {
+		t.Fatalf("expected wider preview/session pane: list=%d preview=%d", listWidth, previewWidth)
+	}
+	if limit != 17 {
+		t.Fatalf("unexpected body limit: %d", limit)
 	}
 }
 
@@ -205,6 +238,106 @@ func TestRenderIncludesSessionListWhenPreviewExists(t *testing.T) {
 	}
 	if !strings.Contains(output, "colored error") {
 		t.Fatalf("preview missing from render:\n%s", output)
+	}
+}
+
+func TestRenderUnauthenticatedApp(t *testing.T) {
+	app := NewUnauthApp(nil, &bytes.Buffer{}, nil)
+	app.status = "not logged in; type /login"
+	app.renderWithSize(120, 24)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "auth=none") || !strings.Contains(output, "/login") {
+		t.Fatalf("unauthenticated render missing login prompt:\n%s", output)
+	}
+}
+
+func TestLoadSelectedPreviewUsesCache(t *testing.T) {
+	app := &App{
+		sessions: []protocol.SessionView{
+			{ID: "local/a"},
+			{ID: "local/b"},
+		},
+		selected: 1,
+		previews: map[string]string{"local/b": "cached preview"},
+	}
+	app.loadSelectedPreview()
+	if app.preview != "cached preview" {
+		t.Fatalf("expected cached preview, got %q", app.preview)
+	}
+}
+
+func TestLoadSelectedPreviewPrefersStreamBuffer(t *testing.T) {
+	app := &App{
+		sessions: []protocol.SessionView{{ID: "local/a"}},
+		previews: map[string]string{"local/a": "capture"},
+		buffers:  map[string]string{"local/a": "live"},
+	}
+	app.loadSelectedPreview()
+	if app.preview != "live" {
+		t.Fatalf("expected live buffer, got %q", app.preview)
+	}
+}
+
+func TestLoadSelectedPreviewKeepsCaptureDuringWarmup(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	app.previews["local/a"] = "capture"
+	app.buffers["local/a"] = "partial history"
+	app.streams["local/a"] = &appSessionStream{
+		sessionID:  "local/a",
+		warming:    true,
+		warmUntil:  time.Now().Add(time.Second),
+		quietUntil: time.Now().Add(time.Second),
+		maxWarm:    time.Now().Add(time.Second),
+	}
+	app.loadSelectedPreview()
+	if app.preview != "capture" {
+		t.Fatalf("expected capture during warmup, got %q", app.preview)
+	}
+	if !app.finishWarmStreams(time.Now().Add(2 * time.Second)) {
+		t.Fatalf("expected warmup completion to change render state")
+	}
+	if app.preview != "partial history" {
+		t.Fatalf("expected live buffer after warmup, got %q", app.preview)
+	}
+}
+
+func TestRenderDoesNotClearWholeScreenEachFrame(t *testing.T) {
+	app := &App{
+		Out: &bytes.Buffer{},
+		sessions: []protocol.SessionView{{
+			ID: "local/demo", WorkerID: "local", Name: "demo", Status: "active", Command: "bash",
+		}},
+		preview: "ready",
+		status:  "ready",
+	}
+	app.renderWithSize(120, 24)
+	output := app.Out.(*bytes.Buffer).String()
+	if strings.Contains(output, "\x1b[2J") {
+		t.Fatalf("render should not clear whole screen every frame")
+	}
+	if !strings.Contains(output, "\x1b[2K") {
+		t.Fatalf("render should clear individual lines")
+	}
+}
+
+func TestDetachMarksStreamForTTL(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.streams["local/a"] = &appSessionStream{sessionID: "local/a"}
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	app.active = "local/a"
+	app.detachActive()
+	if app.active != "" {
+		t.Fatalf("expected active session to clear")
+	}
+	if app.streams["local/a"].keepUntil.IsZero() {
+		t.Fatalf("expected detach TTL")
+	}
+	if app.cleanupStreams(time.Now().Add(appStreamDetachTTL+time.Second)) != true {
+		t.Fatalf("expected expired stream cleanup")
+	}
+	if _, ok := app.streams["local/a"]; ok {
+		t.Fatalf("expected stream to close after TTL")
 	}
 }
 

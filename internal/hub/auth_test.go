@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,6 +42,9 @@ func TestAuthStoreRegisterLogin(t *testing.T) {
 	if registered.Credential == "" || registered.User.Email != "user@example.com" || registered.TenantID == "" {
 		t.Fatalf("unexpected registration response: %+v", registered)
 	}
+	if registered.RefreshToken == "" || registered.RefreshExpiresAt.IsZero() {
+		t.Fatalf("expected refresh token on registration: %+v", registered)
+	}
 	if _, ok := store.Credential(registered.Credential); !ok {
 		t.Fatal("expected registered credential to authorize")
 	}
@@ -56,6 +60,64 @@ func TestAuthStoreRegisterLogin(t *testing.T) {
 	}
 	if loggedIn.Credential == "" || loggedIn.Credential == registered.Credential || loggedIn.TenantID != registered.TenantID {
 		t.Fatalf("unexpected login response: %+v", loggedIn)
+	}
+	if loggedIn.RefreshToken == "" || loggedIn.RefreshToken == registered.RefreshToken {
+		t.Fatalf("expected rotated login refresh token: %+v", loggedIn)
+	}
+}
+
+func TestAuthStoreRefreshRotatesToken(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		testAuthStoreRefreshRotatesToken(t, newAuthStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		store, err := OpenSQLiteAuthStore(t.TempDir() + "/agentmux.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		testAuthStoreRefreshRotatesToken(t, store)
+	})
+}
+
+func testAuthStoreRefreshRotatesToken(t *testing.T, store AuthStore) {
+	t.Helper()
+	registered, err := store.Register(registerRequest{
+		Email: "refresh@example.com", Password: "password123", Name: "Refresh",
+		DeviceID: "browser", DeviceName: "Browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.RefreshToken == "" {
+		t.Fatal("expected refresh token")
+	}
+	if time.Until(registered.ExpiresAt) > defaultControlAccessTTL+time.Minute {
+		t.Fatalf("access token ttl is too long: %s", time.Until(registered.ExpiresAt))
+	}
+	refreshTTL := time.Until(registered.RefreshExpiresAt)
+	if refreshTTL < 6*24*time.Hour || refreshTTL > defaultRefreshTokenTTL+time.Minute {
+		t.Fatalf("unexpected refresh ttl: %s", refreshTTL)
+	}
+	refreshed, err := store.Refresh(refreshRequest{RefreshToken: registered.RefreshToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Credential == "" || refreshed.Credential == registered.Credential {
+		t.Fatalf("expected new access token: %+v", refreshed)
+	}
+	if refreshed.RefreshToken == "" || refreshed.RefreshToken == registered.RefreshToken {
+		t.Fatalf("expected rotated refresh token: %+v", refreshed)
+	}
+	if _, ok := store.Credential(refreshed.Credential); !ok {
+		t.Fatal("expected refreshed credential to authorize")
+	}
+	if _, err := store.Refresh(refreshRequest{RefreshToken: registered.RefreshToken}); err == nil {
+		t.Fatal("old refresh token should be single-use")
 	}
 }
 
@@ -141,6 +203,20 @@ func testAuthStoreDeviceLogin(t *testing.T, store AuthStore) {
 	if pending.Status != "pending" {
 		t.Fatalf("expected pending, got %+v", pending)
 	}
+	slowDown, err := store.PollDeviceAuth(devicePollRequest{DeviceCode: start.DeviceCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slowDown.Status != "slow_down" || slowDown.Interval != deviceSlowDownSeconds {
+		t.Fatalf("expected slow_down, got %+v", slowDown)
+	}
+	info, ok := store.DeviceAuthInfo(start.UserCode)
+	if !ok {
+		t.Fatal("expected device auth info")
+	}
+	if info.DeviceID != "cli" || info.DeviceName != "CLI" || info.Status != "pending" {
+		t.Fatalf("unexpected device info: %+v", info)
+	}
 	approved, err := store.ApproveDeviceAuth(deviceApproveRequest{
 		UserCode: start.UserCode, Email: "device@example.com", Password: "password123",
 	})
@@ -150,12 +226,84 @@ func testAuthStoreDeviceLogin(t *testing.T, store AuthStore) {
 	if approved.TenantID != registered.TenantID || approved.Role != "control" {
 		t.Fatalf("unexpected approved credential: %+v", approved)
 	}
+	if approved.RefreshToken == "" || approved.RefreshExpiresAt.IsZero() {
+		t.Fatalf("expected approved refresh token: %+v", approved)
+	}
 	polled, err := store.PollDeviceAuth(devicePollRequest{DeviceCode: start.DeviceCode})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if polled.Status != "approved" || polled.Credential == nil || polled.Credential.Credential != approved.Credential {
 		t.Fatalf("unexpected poll response: %+v", polled)
+	}
+	if polled.Credential.RefreshToken != approved.RefreshToken {
+		t.Fatalf("expected poll to include refresh token: %+v", polled.Credential)
+	}
+	if _, ok := store.DeviceAuthInfo(start.UserCode); ok {
+		t.Fatal("device auth info should be consumed after successful poll")
+	}
+}
+
+func TestAuthStoreDeviceLoginBlocksRepeatedFailures(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		testAuthStoreDeviceLoginBlocksRepeatedFailures(t, newAuthStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		store, err := OpenSQLiteAuthStore(t.TempDir() + "/agentmux.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		testAuthStoreDeviceLoginBlocksRepeatedFailures(t, store)
+	})
+}
+
+func testAuthStoreDeviceLoginBlocksRepeatedFailures(t *testing.T, store AuthStore) {
+	t.Helper()
+	if _, err := store.Register(registerRequest{
+		Email: "blocked@example.com", Password: "password123", Name: "Blocked",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	start, err := store.StartDeviceAuth(deviceStartRequest{DeviceID: "cli", DeviceName: "CLI"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxDeviceApproveFailures; i++ {
+		if _, err := store.ApproveDeviceAuth(deviceApproveRequest{
+			UserCode: start.UserCode, Email: "blocked@example.com", Password: "wrong-password",
+		}); err == nil {
+			t.Fatal("expected failed approval")
+		}
+	}
+	poll, err := store.PollDeviceAuth(devicePollRequest{DeviceCode: start.DeviceCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poll.Status != "blocked" {
+		t.Fatalf("expected blocked status, got %+v", poll)
+	}
+	if _, err := store.ApproveDeviceAuth(deviceApproveRequest{
+		UserCode: start.UserCode, Email: "blocked@example.com", Password: "password123",
+	}); err == nil {
+		t.Fatal("blocked device should not approve later")
+	}
+}
+
+func TestRandomUserCodeUsesLongGroupedSecret(t *testing.T) {
+	code, err := randomUserCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(code) != len("AAAA-AAAA-AAAA-AAAA") {
+		t.Fatalf("unexpected code length: %q", code)
+	}
+	if normalizeUserCode(strings.ReplaceAll(code, "-", "")) != code {
+		t.Fatalf("normalization should restore grouping: %q", code)
 	}
 }
 
