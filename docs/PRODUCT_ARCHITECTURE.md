@@ -45,6 +45,9 @@ agentmux hub --addr 127.0.0.1:8080 --data ./agentmux.db --public-url https://hub
 - `--data` enables SQLite persistence for identity bootstrap state.
 - `--public-url` makes generated commands stable behind Cloudflare Tunnel,
   Cloudflare Proxy, Caddy, Nginx, or another TLS terminator.
+- With `cloudflared tunnel --url`, the public `trycloudflare.com` URL is known
+  only after `cloudflared` starts. Hub should be restarted with that URL before
+  generating Worker and Control commands.
 - Without `--data`, Hub keeps the development in-memory auth store.
 
 ### Worker

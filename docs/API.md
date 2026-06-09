@@ -92,7 +92,9 @@ Response:
 
 If the Hub is started with `--public-url https://hub.example.com`, generated
 commands and `control_url` use that URL instead of request-local host headers.
-This is the recommended mode behind Cloudflare Tunnel or another reverse proxy.
+Use a stable hostname for production. With `cloudflared tunnel --url`, copy the
+printed `https://*.trycloudflare.com` URL and restart Hub with that value before
+generating join commands.
 
 ### `POST /api/exchange`
 

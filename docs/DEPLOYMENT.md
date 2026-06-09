@@ -20,7 +20,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now agentmux
 ```
 
-Edit `/etc/agentmux/agentmux.env`:
+For a named Cloudflare Tunnel or another reverse proxy with your own hostname,
+edit `/etc/agentmux/agentmux.env`:
 
 ```text
 AGENTMUX_TOKEN=change-me-long-random-admin-token
@@ -28,13 +29,7 @@ AGENTMUX_PUBLIC_URL=https://hub.example.com
 AGENTMUX_DATA=/var/lib/agentmux/agentmux.db
 ```
 
-Cloudflare quick tunnel:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8080
-```
-
-Named tunnel:
+Named tunnel setup:
 
 ```bash
 cloudflared tunnel create agentmux
@@ -43,7 +38,7 @@ sudo install -m 0644 deploy/cloudflare/config.yml.example /etc/cloudflared/confi
 cloudflared tunnel run agentmux
 ```
 
-The Hub must be started with:
+The Hub must be started with the same public hostname:
 
 ```bash
 agentmux hub \
@@ -54,6 +49,18 @@ agentmux hub \
 
 `--public-url` is what makes generated worker commands use
 `wss://hub.example.com`.
+
+For a temporary quick tunnel, the public URL is not known until `cloudflared`
+prints it:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8080
+```
+
+Copy the printed `https://*.trycloudflare.com` URL and restart Hub with that
+value as `AGENTMUX_PUBLIC_URL` or `--public-url`. If Hub keeps a local
+`--public-url`, generated Worker and Control commands will point at
+`127.0.0.1` and will not work from other machines.
 
 ## Docker Compose
 
@@ -92,8 +99,10 @@ Run:
 docker compose up -d --build
 ```
 
-The compose file binds Hub to `127.0.0.1:8080` by default, so it is ready for
-Cloudflare Tunnel:
+The compose file binds Hub to `127.0.0.1:8080` by default. For a named tunnel,
+set `AGENTMUX_PUBLIC_URL=https://hub.example.com` in `.env` before starting the
+service. For a quick tunnel, start once, run `cloudflared`, copy the generated
+URL, update `.env`, and restart the Hub container.
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8080

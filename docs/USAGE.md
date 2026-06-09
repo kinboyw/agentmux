@@ -1,6 +1,8 @@
 # AgentMux Usage Guide
 
-This guide covers the practical ways to run AgentMux after a release is built.
+This guide covers the normal operating path for AgentMux: run Hub with a stable
+public URL, join Workers with a short-lived signal, and control long-running
+tmux sessions from the browser.
 
 ## Concepts
 
@@ -11,6 +13,26 @@ AgentMux has three roles in one binary:
 - `control`: CLI commands for listing, creating, and attaching to sessions. The browser control surface is served by Hub at `/control`.
 
 The agent itself remains unaware. Codex, Claude, Gemini, OpenCode, or a shell runs inside tmux; Worker attaches below it at the terminal layer.
+
+## Quick Start With Docker
+
+Run Hub with the published image:
+
+```bash
+docker run -d \
+  --name agentmux \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v agentmux-data:/var/lib/agentmux \
+  ghcr.io/kinboyw/agentmux:latest \
+  hub \
+  --addr 0.0.0.0:8080 \
+  --data /var/lib/agentmux/agentmux.db \
+  --public-url https://hub.example.com
+```
+
+Open the public URL, generate a signal, run the Worker command on a machine with
+tmux, and then open Web Control.
 
 ## Local Smoke Test
 
@@ -46,7 +68,7 @@ Important flags:
 - `--public-url`: external HTTPS URL used to generate worker/control commands.
 - `--release-repo`: GitHub `owner/repo` for `/install.sh` downloads. Defaults to `kinboyw/agentmux`.
 
-## Run Hub From Docker
+## Run Hub From Docker Image
 
 Release tags publish a multi-arch image to GitHub Container Registry:
 
@@ -78,6 +100,14 @@ docker compose up -d --build
 
 ## Put Hub Behind Cloudflare Tunnel
 
+There are two different Cloudflare Tunnel modes. The `--public-url` value must
+match the URL that users, Workers, and Controls will actually use.
+
+### Named tunnel with your own domain
+
+Use this when you already know the public hostname, for example
+`https://hub.example.com`. This is the production path.
+
 Start Hub locally:
 
 ```bash
@@ -87,13 +117,47 @@ agentmux hub \
   --public-url https://hub.example.com
 ```
 
-Start a quick tunnel:
+Start the named tunnel:
+
+```bash
+cloudflared tunnel run agentmux
+```
+
+Cloudflare terminates HTTPS and forwards WebSocket upgrades to Hub. Workers
+still connect outbound-only over `wss://...`.
+
+### Quick tunnel with a generated trycloudflare.com URL
+
+For a temporary tunnel, you do not know `--public-url` until `cloudflared`
+prints it.
+
+First start Hub with a local URL:
+
+```bash
+agentmux hub \
+  --addr 127.0.0.1:8080 \
+  --data /var/lib/agentmux/agentmux.db \
+  --public-url http://127.0.0.1:8080
+```
+
+Then run:
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8080
 ```
 
-Cloudflare terminates HTTPS and forwards WebSocket upgrades to Hub. Workers still connect outbound-only over `wss://...`.
+Copy the printed `https://*.trycloudflare.com` URL, stop Hub, and restart Hub
+with that value:
+
+```bash
+agentmux hub \
+  --addr 127.0.0.1:8080 \
+  --data /var/lib/agentmux/agentmux.db \
+  --public-url https://example.trycloudflare.com
+```
+
+Then open that public URL and generate Worker/Control commands. Without this
+restart, Hub will generate local-only commands.
 
 ## Join A Worker
 

@@ -1279,7 +1279,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div>
           <div class="command">
             <div class="command-title"><span data-i18n="dockerImage">Docker image</span></div>
-            <pre id="docker-command">docker run --rm -p 8080:8080 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}</pre>
+            <pre id="docker-command">docker run -d --name agentmux --restart unless-stopped -p 127.0.0.1:8080:8080 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}</pre>
           </div>
           <div id="release-note" class="release-note" data-i18n="releaseLoading">Loading latest release note from GitHub...</div>
           <div id="release-assets" class="asset-list"></div>
@@ -1319,18 +1319,19 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="panel-head">
           <div>
             <h2 data-i18n="quickTitle">Quick Start</h2>
-            <p data-i18n="quickLead">Install the release binary through the generated script, then connect before the signal expires.</p>
+            <p data-i18n="quickLead">Run Hub, expose it with a stable public URL, then generate a join signal for Worker and Control.</p>
           </div>
           <button id="mint2" data-i18n="generate">Generate</button>
         </div>
         <div id="result" class="grid">
           <div class="command">
-            <div class="command-title"><span data-i18n="installBinary">Install binary</span></div>
-            <pre>curl -fsSL {{.BaseURL}}/install.sh | sh -s -- control --join amx_sig_...</pre>
+            <div class="command-title"><span data-i18n="runHubDocker">Run Hub with Docker</span></div>
+            <pre>docker run -d --name agentmux --restart unless-stopped -p 127.0.0.1:8080:8080 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url https://hub.example.com</pre>
           </div>
           <div class="command">
-            <div class="command-title"><span data-i18n="cloudflareTunnel">Cloudflare tunnel</span></div>
-            <pre>cloudflared tunnel --url http://127.0.0.1:8080</pre>
+            <div class="command-title"><span data-i18n="quickTunnel">Quick tunnel discovery</span></div>
+            <pre>cloudflared tunnel --url http://127.0.0.1:8080
+# copy the printed https://*.trycloudflare.com URL into --public-url, then restart Hub</pre>
           </div>
         </div>
       </section>
@@ -1391,10 +1392,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: 'Multi-pane Web Control',
         workspaceBody: 'Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.',
         quickTitle: 'Quick Start',
-        quickLead: 'Install the release binary through the generated script, then connect before the signal expires.',
+        quickLead: 'Run Hub, expose it with a stable public URL, then generate a join signal for Worker and Control.',
         generate: 'Generate',
-        installBinary: 'Install binary',
-        cloudflareTunnel: 'Cloudflare tunnel',
+        runHubDocker: 'Run Hub with Docker',
+        quickTunnel: 'Quick tunnel discovery',
         footerSecurity: 'Default admin token stays local. Signals exchange into scoped credentials.',
         footerDocs: 'Docs',
         generating: 'Generating signal...',
@@ -1442,10 +1443,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: '多窗格网页控制台',
         workspaceBody: '在紧凑的浏览器工作区里操作多个长期运行的 tmux agent 会话。',
         quickTitle: '快速开始',
-        quickLead: '通过生成的脚本安装 release 二进制，然后在信令过期前完成接入。',
+        quickLead: '先运行 Hub，用稳定公网 URL 暴露服务，然后生成信令接入 Worker 和 Control。',
         generate: '生成',
-        installBinary: '安装二进制',
-        cloudflareTunnel: 'Cloudflare Tunnel',
+        runHubDocker: '用 Docker 运行 Hub',
+        quickTunnel: '临时隧道地址发现',
         footerSecurity: '默认管理员 token 保持本地使用。信令会交换为受限凭证。',
         footerDocs: '文档',
         generating: '正在生成信令...',
@@ -1555,7 +1556,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       version.textContent = tag + (latestRelease.published_at ? ' · ' + t('releasePublished') + new Date(latestRelease.published_at).toLocaleDateString() : '');
       link.href = latestRelease.html_url || fallbackReleaseURL;
       note.textContent = trimReleaseNote(latestRelease.body || latestRelease.name || t('releaseUnavailable'));
-      dockerCommand.textContent = 'docker run --rm -p 8080:8080 -v agentmux-data:/var/lib/agentmux ' + containerImage + ':' + tag.replace(/^v/, '') + ' hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}';
+      dockerCommand.textContent = 'docker run -d --name agentmux --restart unless-stopped -p 127.0.0.1:8080:8080 -v agentmux-data:/var/lib/agentmux ' + containerImage + ':' + tag.replace(/^v/, '') + ' hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}';
       assets.innerHTML = '';
       for (const asset of latestRelease.assets || []) {
         const href = asset.browser_download_url || asset.url;

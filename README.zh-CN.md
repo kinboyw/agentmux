@@ -21,25 +21,32 @@ AgentMux 的核心设计是让 agent 无感。Codex、Claude、Gemini、OpenCode
 
 ## 快速开始
 
-本地一键验证：
+使用发布的容器镜像运行 Hub：
+
+```bash
+docker run -d \
+  --name agentmux \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v agentmux-data:/var/lib/agentmux \
+  ghcr.io/kinboyw/agentmux:latest \
+  hub \
+  --addr 0.0.0.0:8080 \
+  --data /var/lib/agentmux/agentmux.db \
+  --public-url https://hub.example.com
+```
+
+打开 Hub 落地页，生成 join signal，然后在拥有 tmux 会话的机器上运行页面生成的
+Worker 命令。浏览器侧直接打开页面生成的 Web Control URL。
+
+本地源码验证：
 
 ```bash
 ./scripts/dev-tmux.sh
 ```
 
-这会创建一个名为 `agentmux-dev` 的 tmux session，并在同一个窗口中分出三个 pane：
-
-- `hub`
-- `worker`
-- `control`
-
-默认端口是 `8081`，默认 token 是 `dev-token`。
-
-浏览器控制台：
-
-```text
-http://127.0.0.1:8081/control?token=dev-token
-```
+这会在一个 tmux session 中启动 Hub、Worker、Control 三个 pane。默认端口是 `8081`，
+默认 token 是 `dev-token`。
 
 项目 Go 版本由 mise 管理：
 
@@ -64,19 +71,22 @@ agentmux hub \
   --public-url https://hub.example.com
 ```
 
-`--data` 会持久化信令、凭证和注册用户。在线 Worker、实时 WebSocket 流和会话快照仍然属于运行态，
-会在 Worker 重连后重建。`--public-url` 用于在 Hub 位于 Cloudflare Tunnel、Nginx、Caddy
-或其他反向代理之后时生成正确的 worker/control/落地页命令。
+`--data` 会持久化信令、凭证和注册用户。在线 Worker、实时 WebSocket 流和会话快照属于运行态，
+会在 Worker 重连后重建。`--public-url` 是 Hub 对外可访问的 URL，用于生成 Worker、Control
+和落地页命令。
 
-Cloudflare Tunnel 示例：
+Cloudflare named tunnel 示例：
 
 ```bash
 agentmux hub --addr 127.0.0.1:8080 --data ./agentmux.db --public-url https://hub.example.com
-cloudflared tunnel --url http://127.0.0.1:8080
+cloudflared tunnel run agentmux
 ```
 
 Cloudflare 负责 HTTPS 终止并把 WebSocket upgrade 转发给 Go Hub。当 public URL 是 HTTPS 时，
 Hub 会自动生成 `wss://...` 的 Worker 接入地址。
+
+如果使用临时 `trycloudflare.com` 隧道，需要先运行 `cloudflared tunnel --url ...`，
+复制命令输出的公网 URL，再用这个 URL 作为 `--public-url` 重启 Hub。
 
 ![AgentMux Cloudflare 部署](docs/assets/visuals/agentmux-3-cloudflare-deployment-v1.png)
 
@@ -98,6 +108,9 @@ Signal 形如 `amx_sig_...`，正常 API 或 WebSocket 访问前会交换成受�
 ![AgentMux 信令接入](docs/assets/visuals/agentmux-2-zero-tier-style-onboarding-v1.png)
 
 ## 手动三终端验证
+
+下面的 `go run` 命令只用于源码开发阶段的手动验证。正式使用优先选择 release 二进制、
+Docker 镜像或 Hub 落地页生成的安装命令。
 
 Terminal 1：
 
