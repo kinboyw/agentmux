@@ -956,6 +956,7 @@ HUB_HTTP="%s"
 HUB_WS="%s"
 BIN_DIR="${AGENTMUX_BIN_DIR:-$HOME/.local/bin}"
 BIN="$BIN_DIR/agentmux"
+TUI_BIN="$BIN_DIR/agentmux-tui"
 
 mkdir -p "$BIN_DIR"
 
@@ -993,12 +994,16 @@ else
   exit 1
 fi
 
+if [ "$BIN" != "$TUI_BIN" ]; then
+  ln -sf "$BIN" "$TUI_BIN" 2>/dev/null || true
+fi
+
 case "$ROLE" in
   worker)
-    exec "$BIN" worker --hub "$HUB_WS" "$@"
+    exec "$BIN" worker join --hub "$HUB_WS" "$@"
     ;;
   control)
-    exec "$BIN" control app --hub "$HUB_HTTP" "$@"
+    exec "$TUI_BIN" join --hub "$HUB_HTTP" "$@"
     ;;
   *)
     echo "usage: install.sh worker|control [agentmux flags]" >&2

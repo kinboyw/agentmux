@@ -7,24 +7,31 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"private/agentmux/internal/control"
+	"private/agentmux/internal/credentialcache"
 	"private/agentmux/internal/hub"
 	"private/agentmux/internal/protocol"
 	"private/agentmux/internal/term"
 	"private/agentmux/internal/tmux"
 	"private/agentmux/internal/worker"
+	"private/agentmux/internal/workerservice"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if isTUIInvocation() {
+		runTUI(ctx, os.Args[1:])
+		return
+	}
+	if len(os.Args) < 2 {
+		runDefault(ctx)
+		return
+	}
 
 	switch os.Args[1] {
 	case "hub":
@@ -36,6 +43,69 @@ func main() {
 	default:
 		usage()
 		os.Exit(2)
+	}
+}
+
+func isTUIInvocation() bool {
+	return filepathBase(os.Args[0]) == "agentmux-tui"
+}
+
+func runDefault(ctx context.Context) {
+	entry, ok := credentialcache.LoadLatest("", "")
+	if !ok {
+		usage()
+		os.Exit(2)
+	}
+	switch entry.Role {
+	case "worker":
+		runWorkerWithAuth(ctx, entry.HubURL, entry.Credential, entry.DeviceID, entry.DeviceName, time.Second, "cache")
+	case "control":
+		defer term.ResetModes(os.Stdout)
+		auth := control.AppAuthResult{
+			Client: control.New(entry.HubURL, entry.Credential), CredentialID: entry.CredentialID,
+			TenantID: entry.TenantID, DeviceID: entry.DeviceID, Role: entry.Role,
+			ExpiresAt: entry.ExpiresAt, Source: "cache",
+		}
+		app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
+		if err := app.Run(ctx); err != nil && err != context.Canceled {
+			fatal(err)
+		}
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+func runTUI(ctx context.Context, args []string) {
+	defer term.ResetModes(os.Stdout)
+	if len(args) > 0 && args[0] == "join" {
+		fs := flag.NewFlagSet("join", flag.ExitOnError)
+		common := addControlCommon(fs)
+		deviceID := fs.String("device-id", "", "stable control device id")
+		deviceName := fs.String("device-name", hostname(), "control device display name")
+		_ = fs.Parse(args[1:])
+		if common.hub == "" {
+			common.hub = "http://127.0.0.1:8080"
+		}
+		if common.join == "" {
+			fatal(fmt.Errorf("--join is required"))
+		}
+		if _, err := control.ResolveAppAuth(ctx, control.AppAuthOptions{
+			HubURL: common.hub, Token: common.token, Join: common.join,
+			DeviceID: *deviceID, DeviceName: *deviceName,
+		}); err != nil {
+			fatal(err)
+		}
+		fmt.Fprintln(os.Stderr, "control credential saved")
+		return
+	}
+	auth, err := resolveControlAppAuth(ctx, args)
+	if err != nil {
+		fatal(err)
+	}
+	app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
+	if err := app.Run(ctx); err != nil && err != context.Canceled {
+		fatal(err)
 	}
 }
 
@@ -71,32 +141,172 @@ func runHub(ctx context.Context, args []string) {
 }
 
 func runWorker(ctx context.Context, args []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "join":
+			runWorkerJoin(ctx, args[1:])
+			return
+		case "run":
+			runWorkerForeground(ctx, args[1:])
+			return
+		case "start":
+			runWorkerStart(ctx)
+			return
+		case "stop":
+			runWorkerStop(ctx)
+			return
+		case "status":
+			runWorkerStatus(ctx)
+			return
+		case "logs":
+			runWorkerLogs(ctx, args[1:])
+			return
+		default:
+			workerUsage()
+			os.Exit(2)
+		}
+	}
+	if hasJoinArg(args) {
+		runWorkerJoin(ctx, args)
+		return
+	}
+	runWorkerForeground(ctx, args)
+}
+
+func runWorkerForeground(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
-	hubURL := fs.String("hub", "ws://127.0.0.1:8080", "hub URL")
+	hubURL := fs.String("hub", "", "hub URL")
 	token := fs.String("token", os.Getenv("AGENTMUX_TOKEN"), "shared auth token")
 	join := fs.String("join", "", "short-lived signal token")
 	id := fs.String("id", "", "stable worker id")
 	name := fs.String("name", hostname(), "worker display name")
 	interval := fs.Duration("interval", time.Second, "terminal capture interval")
 	_ = fs.Parse(args)
+	if *hubURL == "" && (*token != "" || *join != "") {
+		*hubURL = "ws://127.0.0.1:8080"
+	}
+	workerID := *id
+	if workerID == "" && (*token != "" || *join != "") {
+		workerID = *name
+	}
+	auth, err := worker.ResolveAuth(ctx, worker.AuthOptions{
+		HubURL: *hubURL, Token: *token, Join: *join,
+		DeviceID: workerID, DeviceName: *name,
+	})
+	if err != nil {
+		fatal(err)
+	}
+	runWorkerWithAuth(ctx, auth.HubURL, auth.Token, workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name), *interval, auth.Source)
+}
+
+func runWorkerJoin(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	hubURL := fs.String("hub", "", "hub URL")
+	join := fs.String("join", "", "short-lived signal token")
+	id := fs.String("id", "", "stable worker id")
+	name := fs.String("name", hostname(), "worker display name")
+	start := fs.Bool("start", true, "start background worker service after saving credential")
+	_ = fs.Parse(args)
+	if *hubURL == "" {
+		*hubURL = "ws://127.0.0.1:8080"
+	}
+	if *join == "" {
+		fatal(fmt.Errorf("--join is required"))
+	}
 	workerID := *id
 	if workerID == "" {
 		workerID = *name
 	}
-	if *join != "" {
-		credential, deviceID, err := worker.ExchangeSignal(ctx, *hubURL, *join, workerID, *name)
-		if err != nil {
-			fatal(err)
-		}
-		*token = credential
-		workerID = deviceID
-		slog.Default().Info("worker signal exchanged", "device_id", deviceID)
+	auth, err := worker.ResolveAuth(ctx, worker.AuthOptions{
+		HubURL: *hubURL, Join: *join, DeviceID: workerID, DeviceName: *name,
+	})
+	if err != nil {
+		fatal(err)
 	}
-	w := worker.New(*hubURL, *token, workerID, *name, tmux.New(nil), slog.Default())
-	w.Interval = *interval
+	slog.Default().Info("worker signal exchanged", "device_id", auth.DeviceID)
+	if !*start {
+		return
+	}
+	if err := tmux.CheckAvailable(); err != nil {
+		fatal(err)
+	}
+	result, err := workerservice.Start(ctx, executablePath())
+	if err != nil {
+		fatal(err)
+	}
+	slog.Default().Info("worker service started", "backend", result.Backend, "detail", result.Detail)
+}
+
+func runWorkerStart(ctx context.Context) {
+	if err := tmux.CheckAvailable(); err != nil {
+		fatal(err)
+	}
+	if _, ok := credentialcache.LoadLatest("worker", ""); !ok {
+		fatal(fmt.Errorf("no worker credential available; run agentmux worker join first"))
+	}
+	result, err := workerservice.Start(ctx, executablePath())
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "worker service started (%s)\n%s\n", result.Backend, result.Detail)
+}
+
+func runWorkerStop(ctx context.Context) {
+	result, err := workerservice.Stop(ctx)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "worker service stopped (%s)\n%s\n", result.Backend, result.Detail)
+}
+
+func runWorkerStatus(ctx context.Context) {
+	out, err := workerservice.Status(ctx)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprint(os.Stdout, out)
+}
+
+func runWorkerLogs(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	lines := fs.Int("n", 80, "number of log lines")
+	_ = fs.Parse(args)
+	out, err := workerservice.Logs(ctx, *lines)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprint(os.Stdout, out)
+}
+
+func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string, interval time.Duration, source string) {
+	if err := tmux.CheckAvailable(); err != nil {
+		fatal(err)
+	}
+	switch source {
+	case "join":
+		slog.Default().Info("worker signal exchanged", "device_id", workerID)
+	case "cache":
+		slog.Default().Info("worker credential loaded", "device_id", workerID)
+	}
+	w := worker.New(hubURL, token, workerID, name, tmux.New(nil), slog.Default())
+	w.Interval = interval
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
 	}
+}
+
+func workerIDFromAuth(auth worker.AuthResult, fallback string) string {
+	if auth.DeviceID != "" {
+		return auth.DeviceID
+	}
+	return fallback
+}
+
+func workerNameFromAuth(auth worker.AuthResult, fallback string) string {
+	if auth.DeviceName != "" {
+		return auth.DeviceName
+	}
+	return fallback
 }
 
 func runControl(ctx context.Context, args []string) {
@@ -107,15 +317,7 @@ func runControl(ctx context.Context, args []string) {
 	}
 	switch args[0] {
 	case "app":
-		fs := flag.NewFlagSet("app", flag.ExitOnError)
-		common := addControlCommon(fs)
-		deviceID := fs.String("device-id", "", "stable control device id")
-		deviceName := fs.String("device-name", hostname(), "control device display name")
-		_ = fs.Parse(args[1:])
-		auth, err := control.ResolveAppAuth(ctx, control.AppAuthOptions{
-			HubURL: common.hub, Token: common.token, Join: common.join,
-			DeviceID: *deviceID, DeviceName: *deviceName,
-		})
+		auth, err := resolveControlAppAuth(ctx, args[1:])
 		if err != nil {
 			fatal(err)
 		}
@@ -182,6 +384,21 @@ func runControl(ctx context.Context, args []string) {
 	}
 }
 
+func resolveControlAppAuth(ctx context.Context, args []string) (control.AppAuthResult, error) {
+	fs := flag.NewFlagSet("app", flag.ExitOnError)
+	common := addControlCommon(fs)
+	deviceID := fs.String("device-id", "", "stable control device id")
+	deviceName := fs.String("device-name", hostname(), "control device display name")
+	_ = fs.Parse(args)
+	if common.hub == "" && (common.token != "" || common.join != "") {
+		common.hub = "http://127.0.0.1:8080"
+	}
+	return control.ResolveAppAuth(ctx, control.AppAuthOptions{
+		HubURL: common.hub, Token: common.token, Join: common.join,
+		DeviceID: *deviceID, DeviceName: *deviceName,
+	})
+}
+
 type commonControlFlags struct {
 	hub   string
 	token string
@@ -197,22 +414,24 @@ func controlFlags(name string, args []string) commonControlFlags {
 
 func addControlCommon(fs *flag.FlagSet) *commonControlFlags {
 	common := &commonControlFlags{}
-	fs.StringVar(&common.hub, "hub", "http://127.0.0.1:8080", "hub URL")
+	fs.StringVar(&common.hub, "hub", "", "hub URL")
 	fs.StringVar(&common.token, "token", os.Getenv("AGENTMUX_TOKEN"), "shared auth token")
 	fs.StringVar(&common.join, "join", "", "short-lived signal token")
 	return common
 }
 
 func newControlClient(ctx context.Context, flags commonControlFlags) control.Client {
-	if flags.join == "" {
-		return control.New(flags.hub, flags.token)
+	if flags.hub == "" && (flags.token != "" || flags.join != "") {
+		flags.hub = "http://127.0.0.1:8080"
 	}
-	client := control.New(flags.hub, "")
-	credential, err := client.ExchangeSignal(ctx, flags.join, "control", "", hostname())
+	auth, err := control.ResolveAppAuth(ctx, control.AppAuthOptions{
+		HubURL: flags.hub, Token: flags.token, Join: flags.join,
+		DeviceName: hostname(),
+	})
 	if err != nil {
 		fatal(err)
 	}
-	return control.New(flags.hub, credential)
+	return auth.Client
 }
 
 func hostname() string {
@@ -231,12 +450,43 @@ func getenv(key, fallback string) string {
 	return value
 }
 
+func hasJoinArg(args []string) bool {
+	for _, arg := range args {
+		if arg == "--join" || strings.HasPrefix(arg, "--join=") {
+			return true
+		}
+	}
+	return false
+}
+
+func executablePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return os.Args[0]
+	}
+	return exe
+}
+
+func filepathBase(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' || path[i] == '\\' {
+			return path[i+1:]
+		}
+	}
+	return path
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: agentmux <hub|worker|control> [options]")
+	fmt.Fprintln(os.Stderr, "       agentmux-tui [join|options]")
 }
 
 func controlUsage() {
 	fmt.Fprintln(os.Stderr, "usage: agentmux control <app|workers|list|create|send|stop|attach> [options]")
+}
+
+func workerUsage() {
+	fmt.Fprintln(os.Stderr, "usage: agentmux worker <join|run|start|stop|status|logs> [options]")
 }
 
 func fatal(err error) {

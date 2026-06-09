@@ -29,6 +29,17 @@ type Adapter struct {
 	Runner Runner
 }
 
+func CheckAvailable() error {
+	path, err := exec.LookPath("tmux")
+	if err != nil {
+		return fmt.Errorf("tmux is required for agentmux worker but was not found in PATH\n\nInstall tmux and retry:\n  Debian/Ubuntu: sudo apt install tmux\n  Fedora:        sudo dnf install tmux\n  Arch:          sudo pacman -S tmux\n  macOS:         brew install tmux\n\nAgentMux worker currently uses tmux as the local session backend so sessions can survive control disconnects")
+	}
+	if path == "" {
+		return fmt.Errorf("tmux is required for agentmux worker but was not found in PATH")
+	}
+	return nil
+}
+
 type Session struct {
 	Name    string
 	CWD     string

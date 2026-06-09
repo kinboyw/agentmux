@@ -14,11 +14,42 @@ import (
 	"sync"
 	"time"
 
+	"private/agentmux/internal/credentialcache"
 	"private/agentmux/internal/protocol"
 	"private/agentmux/internal/pty"
 	"private/agentmux/internal/tmux"
 	"private/agentmux/internal/ws"
 )
+
+type AuthOptions struct {
+	HubURL     string
+	Token      string
+	Join       string
+	DeviceID   string
+	DeviceName string
+}
+
+type AuthResult struct {
+	HubURL       string
+	Token        string
+	CredentialID string
+	TenantID     string
+	DeviceID     string
+	DeviceName   string
+	Role         string
+	ExpiresAt    time.Time
+	Source       string
+}
+
+type ExchangedCredential struct {
+	Credential   string    `json:"credential"`
+	CredentialID string    `json:"credential_id"`
+	TenantID     string    `json:"tenant_id"`
+	Role         string    `json:"role"`
+	DeviceID     string    `json:"device_id"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	Scopes       []string  `json:"scopes"`
+}
 
 type Worker struct {
 	HubURL   string
@@ -51,6 +82,53 @@ func New(hubURL, token, id, name string, adapter tmux.Adapter, logger *slog.Logg
 		streams: map[string]context.CancelFunc{},
 		terms:   map[string]*pty.Terminal{},
 	}
+}
+
+func ResolveAuth(ctx context.Context, opts AuthOptions) (AuthResult, error) {
+	hubURL := credentialcache.NormalizeHubURL(opts.HubURL)
+	deviceID := strings.TrimSpace(opts.DeviceID)
+	deviceName := strings.TrimSpace(opts.DeviceName)
+	if deviceName == "" {
+		deviceName = "worker"
+	}
+	if deviceID == "" && (opts.Join != "" || opts.Token != "") {
+		deviceID = deviceName
+	}
+	if opts.Join != "" {
+		credential, err := ExchangeSignalDetail(ctx, hubURL, opts.Join, deviceID, deviceName)
+		if err != nil {
+			return AuthResult{}, err
+		}
+		entry := credentialcache.Entry{
+			HubURL: hubURL, Credential: credential.Credential, CredentialID: credential.CredentialID,
+			TenantID: credential.TenantID, Role: credential.Role, DeviceID: credential.DeviceID,
+			DeviceName: deviceName, ExpiresAt: credential.ExpiresAt, UpdatedAt: time.Now().UTC(),
+		}
+		_ = credentialcache.Save(entry)
+		return AuthResult{
+			HubURL: hubURL, Token: credential.Credential, CredentialID: credential.CredentialID,
+			TenantID: credential.TenantID, DeviceID: credential.DeviceID, DeviceName: deviceName,
+			Role: credential.Role, ExpiresAt: credential.ExpiresAt, Source: "join",
+		}, nil
+	}
+	if opts.Token != "" {
+		return AuthResult{HubURL: hubURL, Token: opts.Token, DeviceID: deviceID, DeviceName: deviceName, Source: "token"}, nil
+	}
+	var entry credentialcache.Entry
+	var ok bool
+	if hubURL == "" {
+		entry, ok = credentialcache.LoadLatest("worker", deviceID)
+	} else {
+		entry, ok = credentialcache.Load(hubURL, "worker", deviceID)
+	}
+	if !ok {
+		return AuthResult{}, fmt.Errorf("no credential available; pass --join or --token")
+	}
+	return AuthResult{
+		HubURL: entry.HubURL, Token: entry.Credential, CredentialID: entry.CredentialID,
+		TenantID: entry.TenantID, DeviceID: entry.DeviceID, DeviceName: entry.DeviceName,
+		Role: entry.Role, ExpiresAt: entry.ExpiresAt, Source: "cache",
+	}, nil
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -342,9 +420,17 @@ func (w *Worker) sendStreamError(conn *ws.Conn, streamID, sessionID, message str
 }
 
 func ExchangeSignal(ctx context.Context, hubURL, signal, deviceID, deviceName string) (string, string, error) {
-	base, err := httpBaseURL(hubURL)
+	payload, err := ExchangeSignalDetail(ctx, hubURL, signal, deviceID, deviceName)
 	if err != nil {
 		return "", "", err
+	}
+	return payload.Credential, payload.DeviceID, nil
+}
+
+func ExchangeSignalDetail(ctx context.Context, hubURL, signal, deviceID, deviceName string) (ExchangedCredential, error) {
+	base, err := httpBaseURL(hubURL)
+	if err != nil {
+		return ExchangedCredential{}, err
 	}
 	req := map[string]string{
 		"signal":      signal,
@@ -354,30 +440,27 @@ func ExchangeSignal(ctx context.Context, hubURL, signal, deviceID, deviceName st
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
-		return "", "", err
+		return ExchangedCredential{}, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/exchange", bytes.NewReader(raw))
 	if err != nil {
-		return "", "", err
+		return ExchangedCredential{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return "", "", err
+		return ExchangedCredential{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", "", fmt.Errorf("POST /api/exchange failed: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return ExchangedCredential{}, fmt.Errorf("POST /api/exchange failed: %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
-	var payload struct {
-		Credential string `json:"credential"`
-		DeviceID   string `json:"device_id"`
-	}
+	var payload ExchangedCredential
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", "", err
+		return ExchangedCredential{}, err
 	}
-	return payload.Credential, payload.DeviceID, nil
+	return payload, nil
 }
 
 func workerURL(hubURL, token string) (string, error) {
