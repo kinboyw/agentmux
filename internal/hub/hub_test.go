@@ -93,6 +93,10 @@ func TestLandingPageIncludesOpenSourceIdentityAndBilingualVisuals(t *testing.T) 
 	body := rec.Body.String()
 	for _, want := range []string{
 		"https://github.com/kinboyw/agentmux",
+		"latestReleaseAPI",
+		"ghcr.io/kinboyw/agentmux",
+		`class="github-icon"`,
+		`id="release-note"`,
 		`data-lang="zh"`,
 		`data-full="/docassets/system-architecture.png"`,
 		`id="lightbox"`,

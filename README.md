@@ -92,6 +92,12 @@ HTTPS.
 See [Deployment](docs/DEPLOYMENT.md) for Docker Compose, systemd, Cloudflare
 Tunnel, and release install script details.
 
+Docker images are published to GitHub Container Registry on release tags:
+
+```bash
+docker pull ghcr.io/kinboyw/agentmux:latest
+```
+
 Signal-based onboarding:
 
 1. Open `http://127.0.0.1:8081/`.
@@ -149,6 +155,7 @@ mise exec -- go build -o dist/agentmux ./cmd/agentmux
 ## Documents
 
 - [Design](docs/DESIGN.md)
+- [Usage](docs/USAGE.md)
 - [Product Architecture](docs/PRODUCT_ARCHITECTURE.md)
 - [API](docs/API.md)
 - [Deployment](docs/DEPLOYMENT.md)

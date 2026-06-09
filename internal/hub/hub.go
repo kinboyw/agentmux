@@ -161,8 +161,13 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := s.requestBaseURL(r)
 	data := landingData{
-		BaseURL: baseURL,
-		WSURL:   websocketBase(baseURL),
+		BaseURL:          baseURL,
+		WSURL:            websocketBase(baseURL),
+		ReleaseRepo:      s.releaseRepo,
+		GitHubURL:        "https://github.com/" + s.releaseRepo,
+		ReleasesURL:      "https://github.com/" + s.releaseRepo + "/releases",
+		LatestReleaseAPI: "https://api.github.com/repos/" + s.releaseRepo + "/releases/latest",
+		ContainerImage:   "ghcr.io/" + strings.ToLower(s.releaseRepo),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = landingTemplate.Execute(w, data)
@@ -901,8 +906,13 @@ func remoteHost(addr string) string {
 }
 
 type landingData struct {
-	BaseURL string
-	WSURL   string
+	BaseURL          string
+	WSURL            string
+	ReleaseRepo      string
+	GitHubURL        string
+	ReleasesURL      string
+	LatestReleaseAPI string
+	ContainerImage   string
 }
 
 type controlPageData struct {
@@ -1092,7 +1102,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     button.primary, .button.primary { background: linear-gradient(135deg, var(--accent), #8df3c5); border-color: transparent; color: #06130e; font-weight: 760; }
     .shell { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; }
     .nav {
-      height: 60px;
+      height: 66px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -1104,10 +1114,12 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       top: 0;
       z-index: 20;
     }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 780; letter-spacing: 0; }
-    .mark { width: 30px; height: 30px; border-radius: 8px; box-shadow: 0 0 24px rgba(54, 214, 147, .3); }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 780; letter-spacing: 0; }
+    .mark { width: 38px; height: 38px; border-radius: 10px; box-shadow: 0 0 28px rgba(54, 214, 147, .34); }
     .navlinks { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 14px; }
     .navlinks a { text-decoration: none; }
+    .github-icon { width: 16px; height: 16px; flex: 0 0 auto; }
+    .github-link, .with-icon { display: inline-flex; align-items: center; gap: 7px; }
     .lang { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 3px; background: rgba(7, 10, 10, .72); }
     .lang button { min-height: 26px; border: 0; border-radius: 999px; padding: 0 9px; color: var(--muted); background: transparent; font-size: 12px; }
     .lang button.active { background: rgba(54, 214, 147, .18); color: var(--text); }
@@ -1157,6 +1169,13 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .visual p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
     .visual .hint { margin-top: 14px; color: #cce7dc; font-size: 12px; }
     .panel { padding: 18px; margin-bottom: 52px; }
+    .release-panel { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 18px; align-items: stretch; margin-bottom: 56px; }
+    .release-meta { display: grid; align-content: start; gap: 12px; }
+    .release-version { width: fit-content; border: 1px solid rgba(54, 214, 147, .38); border-radius: 999px; padding: 7px 11px; color: #d7f8ea; background: rgba(54, 214, 147, .12); font-size: 13px; font-weight: 680; }
+    .release-note { min-height: 150px; max-height: 270px; overflow: auto; white-space: pre-wrap; color: #c7d8d2; line-height: 1.55; font-size: 13px; border: 1px solid var(--line); border-radius: 7px; background: rgba(3, 5, 5, .72); padding: 12px; }
+    .release-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .asset-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+    .asset-list a { border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; color: var(--muted); text-decoration: none; font-size: 12px; background: rgba(10, 14, 14, .72); }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
     .command { border: 1px solid var(--line); border-radius: 7px; background: rgba(3, 5, 5, .82); overflow: hidden; }
@@ -1180,7 +1199,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       .nav { padding: 0 18px; }
       .navlinks a.hide-small { display: none; }
       main { width: min(100% - 28px, 760px); }
-      .hero, .grid, .cards, .visual, .visual:nth-child(even) { grid-template-columns: 1fr; }
+      .hero, .grid, .cards, .release-panel, .visual, .visual:nth-child(even) { grid-template-columns: 1fr; }
       .hero { padding-top: 36px; }
       .hero-visual { transform: none; }
       .visual-copy, .visual:nth-child(even) .visual-copy { order: 0; border-left: 0; border-right: 0; border-top: 1px solid var(--line); }
@@ -1204,7 +1223,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <a href="/control" data-i18n="navControl">Web Control</a>
         <a class="hide-small" href="/install.sh">install.sh</a>
         <a class="hide-small" href="#quickstart" data-i18n="navQuick">Quick Start</a>
-        <a class="github-link" href="https://github.com/kinboyw/agentmux" rel="noreferrer" data-i18n="navGithub">GitHub</a>
+        <a class="github-link" href="{{.GitHubURL}}" rel="noreferrer">
+          <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>
+          <span data-i18n="navGithub">GitHub</span>
+        </a>
         <div class="lang" aria-label="Language">
           <button type="button" data-lang="en">EN</button>
           <button type="button" data-lang="zh">中</button>
@@ -1220,7 +1242,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
           <div class="actions">
             <button id="mint" class="primary" data-i18n="generateSignal">Generate join signal</button>
             <a class="button" href="/control" data-i18n="openControl">Open Web Control</a>
-            <a class="button" href="https://github.com/kinboyw/agentmux" rel="noreferrer" data-i18n="openGithub">Open-source on GitHub</a>
+            <a class="button with-icon" href="{{.GitHubURL}}" rel="noreferrer">
+              <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>
+              <span data-i18n="openGithub">Open-source on GitHub</span>
+            </a>
             <span id="status" class="status">Hub {{.BaseURL}} · Worker {{.WSURL}}</span>
           </div>
         </div>
@@ -1236,6 +1261,29 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="card"><h2 data-i18n="cardAgentTitle">Agent-unaware</h2><p data-i18n="cardAgentBody">No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.</p></div>
         <div class="card"><h2 data-i18n="cardCloudTitle">Cloudflare-ready</h2><p data-i18n="cardCloudBody">Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.</p></div>
         <div class="card"><h2 data-i18n="cardControlTitle">Multi-session control</h2><p data-i18n="cardControlBody">The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.</p></div>
+      </section>
+
+      <section id="release" class="panel release-panel" aria-label="AgentMux release information">
+        <div class="release-meta">
+          <div class="pill"><span class="dot"></span><span data-i18n="releaseEyebrow">GitHub release</span></div>
+          <h2 data-i18n="releaseTitle">Latest version</h2>
+          <p data-i18n="releaseLead">The landing page reads the latest GitHub release and shows the version, notes, binary assets, and container image.</p>
+          <div id="release-version" class="release-version">v0.0.1</div>
+          <div class="release-actions">
+            <a id="release-link" class="button with-icon" href="{{.ReleasesURL}}" rel="noreferrer">
+              <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>
+              <span data-i18n="releaseOpen">Open release</span>
+            </a>
+          </div>
+        </div>
+        <div>
+          <div class="command">
+            <div class="command-title"><span data-i18n="dockerImage">Docker image</span></div>
+            <pre id="docker-command">docker run --rm -p 8080:8080 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}</pre>
+          </div>
+          <div id="release-note" class="release-note" data-i18n="releaseLoading">Loading latest release note from GitHub...</div>
+          <div id="release-assets" class="asset-list"></div>
+        </div>
       </section>
 
       <section aria-label="AgentMux architecture visuals">
@@ -1289,7 +1337,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
 
       <footer class="footer">
         <span data-i18n="footerSecurity">Default admin token stays local. Signals exchange into scoped credentials.</span>
-        <span><span data-i18n="footerDocs">Docs</span>: README.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md · <a href="https://github.com/kinboyw/agentmux" rel="noreferrer">github.com/kinboyw/agentmux</a></span>
+        <span><span data-i18n="footerDocs">Docs</span>: README.md · docs/USAGE.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md · <a class="with-icon" href="{{.GitHubURL}}" rel="noreferrer"><svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>{{.ReleaseRepo}}</a></span>
       </footer>
     </main>
   </div>
@@ -1301,8 +1349,12 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
   </div>
   <script>
     const baseStatus = 'Hub {{.BaseURL}} · Worker {{.WSURL}}';
+    const latestReleaseAPI = '{{.LatestReleaseAPI}}';
+    const fallbackReleaseURL = '{{.ReleasesURL}}';
+    const containerImage = '{{.ContainerImage}}';
     const result = document.getElementById('result');
     const status = document.getElementById('status');
+    let latestRelease = null;
     const dictionaries = {
       en: {
         navControl: 'Web Control',
@@ -1322,6 +1374,14 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         cardCloudBody: 'Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.',
         cardControlTitle: 'Multi-session control',
         cardControlBody: 'The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.',
+        releaseEyebrow: 'GitHub release',
+        releaseTitle: 'Latest version',
+        releaseLead: 'The landing page reads the latest GitHub release and shows the version, notes, binary assets, and container image.',
+        releaseOpen: 'Open release',
+        releaseLoading: 'Loading latest release note from GitHub...',
+        releaseUnavailable: 'Release information is not available yet. Open GitHub Releases for published versions and assets.',
+        releasePublished: 'Published ',
+        dockerImage: 'Docker image',
         visualTitle: 'Architecture in practice',
         visualLead: 'Large technical diagrams are embedded directly into the Hub landing page and can be opened for detail review.',
         onboardingTitle: 'Signal onboarding',
@@ -1365,6 +1425,14 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         cardCloudBody: 'Hub 可以放在 Cloudflare Tunnel 或反向代理之后。HTTPS 自动对应 WSS，Worker 默认只需要出站连接。',
         cardControlTitle: '多会话控制',
         cardControlBody: 'Web Control 支持可调整窗格、拖拽布局、会话创建，以及浏览器侧凭证。',
+        releaseEyebrow: 'GitHub 版本发布',
+        releaseTitle: '最新版本',
+        releaseLead: '落地页会读取 GitHub 最新 release，并展示版本号、说明、二进制产物和容器镜像。',
+        releaseOpen: '打开版本页',
+        releaseLoading: '正在从 GitHub 加载最新 release note...',
+        releaseUnavailable: '暂时无法获取版本信息。可以打开 GitHub Releases 查看已发布版本和产物。',
+        releasePublished: '发布时间 ',
+        dockerImage: 'Docker 镜像',
         visualTitle: '架构如何落地',
         visualLead: '关键技术图示直接嵌入 Hub 落地页，点击即可放大查看细节。',
         onboardingTitle: '信令接入流程',
@@ -1409,6 +1477,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       if (event.key === 'Escape') closeLightbox();
     });
     setLanguage(currentLang);
+    loadRelease();
     async function mint() {
       status.textContent = t('generating');
       const res = await fetch('/api/signals', { method: 'POST' });
@@ -1437,6 +1506,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         button.classList.toggle('active', button.getAttribute('data-lang') === currentLang);
       });
       if (status.textContent === '' || status.textContent.startsWith('Hub ')) status.textContent = baseStatus;
+      renderRelease();
     }
     function t(key) {
       return dictionaries[currentLang][key] || dictionaries.en[key] || key;
@@ -1460,6 +1530,47 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     }
     function closeLightbox() {
       document.getElementById('lightbox').classList.remove('open');
+    }
+    async function loadRelease() {
+      const note = document.getElementById('release-note');
+      try {
+        const response = await fetch(latestReleaseAPI, { headers: { 'Accept': 'application/vnd.github+json' } });
+        if (!response.ok) throw new Error(String(response.status));
+        latestRelease = await response.json();
+        renderRelease();
+      } catch {
+        document.getElementById('release-version').textContent = 'GitHub Releases';
+        document.getElementById('release-link').href = fallbackReleaseURL;
+        note.textContent = t('releaseUnavailable');
+      }
+    }
+    function renderRelease() {
+      if (!latestRelease) return;
+      const tag = latestRelease.tag_name || latestRelease.name || 'latest';
+      const version = document.getElementById('release-version');
+      const link = document.getElementById('release-link');
+      const note = document.getElementById('release-note');
+      const assets = document.getElementById('release-assets');
+      const dockerCommand = document.getElementById('docker-command');
+      version.textContent = tag + (latestRelease.published_at ? ' · ' + t('releasePublished') + new Date(latestRelease.published_at).toLocaleDateString() : '');
+      link.href = latestRelease.html_url || fallbackReleaseURL;
+      note.textContent = trimReleaseNote(latestRelease.body || latestRelease.name || t('releaseUnavailable'));
+      dockerCommand.textContent = 'docker run --rm -p 8080:8080 -v agentmux-data:/var/lib/agentmux ' + containerImage + ':' + tag.replace(/^v/, '') + ' hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}';
+      assets.innerHTML = '';
+      for (const asset of latestRelease.assets || []) {
+        const href = asset.browser_download_url || asset.url;
+        if (!href || !asset.name) continue;
+        const item = document.createElement('a');
+        item.href = href;
+        item.rel = 'noreferrer';
+        item.textContent = asset.name;
+        assets.appendChild(item);
+      }
+    }
+    function trimReleaseNote(value) {
+      const text = String(value).trim();
+      if (text.length <= 900) return text;
+      return text.slice(0, 900).replace(/\s+\S*$/, '') + '...';
     }
     function shellQuote(value) {
       return "'" + String(value).replace(/'/g, "'\\''") + "'";

@@ -52,8 +52,9 @@ Control mode:
 curl -fsSL https://hub.example.com/install.sh | sh -s -- control --join 'amx_sig_...'
 ```
 
-Until release binaries are published, the script expects either `agentmux` to
-already be in `PATH` or to be run from a source checkout with Go available.
+The script uses an existing `agentmux` in `PATH`, builds from source when run
+inside a checkout, or downloads a matching Linux/macOS release archive from
+GitHub.
 
 ### `GET /health`
 

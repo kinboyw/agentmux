@@ -57,6 +57,29 @@ agentmux hub \
 
 ## Docker Compose
 
+Release tags publish a multi-arch Hub image to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/kinboyw/agentmux:latest
+```
+
+Run a released image directly:
+
+```bash
+docker run -d \
+  --name agentmux \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v agentmux-data:/var/lib/agentmux \
+  ghcr.io/kinboyw/agentmux:latest \
+  hub \
+  --addr 0.0.0.0:8080 \
+  --data /var/lib/agentmux/agentmux.db \
+  --public-url https://hub.example.com
+```
+
+Local compose remains source-build oriented:
+
 Create `.env` from the example:
 
 ```bash

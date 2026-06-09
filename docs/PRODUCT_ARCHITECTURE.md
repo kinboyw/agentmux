@@ -398,6 +398,7 @@ GitHub Actions now provide two tracks:
 
 - CI on pushes and pull requests: Go tests, Web Control build, binary build.
 - Release on `v*` tags: cross-compiled Linux and macOS tarballs. Windows assets are deferred until the terminal backend has a native ConPTY path.
+- Docker image publishing on `v*` tags: multi-arch Linux images are pushed to `ghcr.io/kinboyw/agentmux`.
 
 The release build rebuilds Web Control and embeds it into `internal/hub/webdist`
 before compiling the Go binary.

@@ -80,6 +80,12 @@ Hub 会自动生成 `wss://...` 的 Worker 接入地址。
 
 ![AgentMux Cloudflare 部署](docs/assets/visuals/agentmux-3-cloudflare-deployment-v1.png)
 
+Release tag 会发布 Docker 镜像到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/kinboyw/agentmux:latest
+```
+
 ## 信令接入
 
 1. 打开 `http://127.0.0.1:8081/`。
@@ -137,6 +143,7 @@ mise exec -- go build -o dist/agentmux ./cmd/agentmux
 ## 文档
 
 - [Design](docs/DESIGN.md)
+- [Usage](docs/USAGE.md)
 - [Product Architecture](docs/PRODUCT_ARCHITECTURE.md)
 - [API](docs/API.md)
 - [Deployment](docs/DEPLOYMENT.md)
