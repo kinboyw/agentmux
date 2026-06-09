@@ -58,23 +58,19 @@ without requiring agent-specific remote features.
 
 ## Quick Start Copy
 
-For the README and release pages, lead with the released Docker image:
+For README and landing-page copy, lead with an existing Hub:
 
-```bash
-docker run -d \
-  --name agentmux \
-  --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v agentmux-data:/var/lib/agentmux \
-  ghcr.io/kinboyw/agentmux:latest \
-  hub \
-  --addr 0.0.0.0:8080 \
-  --data /var/lib/agentmux/agentmux.db \
-  --public-url https://hub.example.com
+```text
+Open an AgentMux Hub landing page, generate a join signal, run the generated
+Worker command on the machine that owns your tmux sessions, then open Web
+Control from the browser.
 ```
 
-Then tell users to open the Hub landing page, generate a join signal, run the
-generated Worker command on the tmux host, and open Web Control.
+Keep Hub deployment as a self-hosting path, not the default user path:
+
+```bash
+docker run -d --name agentmux --restart unless-stopped -p 8081:8081 ghcr.io/kinboyw/agentmux:latest
+```
 
 Keep `go run` examples clearly labeled as source-development commands.
 
@@ -99,4 +95,4 @@ before generating Worker or Control commands.
 - Confirm release assets are uploaded for Linux and Darwin.
 - Confirm GHCR publishes `ghcr.io/kinboyw/agentmux:X.Y.Z` and `latest`.
 - Copy the release note from `docs/releases/vX.Y.Z.md`.
-- Verify the landing page latest-release panel links to the GitHub release.
+- Verify the landing page top-right version badge links to the GitHub release.

@@ -14,25 +14,17 @@ AgentMux has three roles in one binary:
 
 The agent itself remains unaware. Codex, Claude, Gemini, OpenCode, or a shell runs inside tmux; Worker attaches below it at the terminal layer.
 
-## Quick Start With Docker
+## Quick Start
 
-Run Hub with the published image:
+If you already have an AgentMux Hub URL, open that landing page and use the
+generated commands:
 
-```bash
-docker run -d \
-  --name agentmux \
-  --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v agentmux-data:/var/lib/agentmux \
-  ghcr.io/kinboyw/agentmux:latest \
-  hub \
-  --addr 0.0.0.0:8080 \
-  --data /var/lib/agentmux/agentmux.db \
-  --public-url https://hub.example.com
-```
+1. Click `Generate join signal`.
+2. Run the generated Worker command on the machine that owns your tmux sessions.
+3. Open the generated Web Control URL.
 
-Open the public URL, generate a signal, run the Worker command on a machine with
-tmux, and then open Web Control.
+That is the normal user path. Hub deployment is only needed when you want to run
+your own private Hub.
 
 ## Local Smoke Test
 
@@ -52,11 +44,11 @@ This path uses local source builds and is meant for development only.
 
 ## Run Hub From A Release Binary
 
-Install the binary from GitHub Releases, then start Hub:
+Install the binary from GitHub Releases, then start a self-hosted Hub:
 
 ```bash
 agentmux hub \
-  --addr 0.0.0.0:8080 \
+  --addr 0.0.0.0:8081 \
   --data ./agentmux.db \
   --public-url https://hub.example.com
 ```
@@ -76,20 +68,15 @@ Release tags publish a multi-arch image to GitHub Container Registry:
 docker pull ghcr.io/kinboyw/agentmux:latest
 ```
 
-Run Hub:
+Run a self-hosted Hub:
 
 ```bash
-docker run -d \
-  --name agentmux \
-  --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v agentmux-data:/var/lib/agentmux \
-  ghcr.io/kinboyw/agentmux:latest \
-  hub \
-  --addr 0.0.0.0:8080 \
-  --data /var/lib/agentmux/agentmux.db \
-  --public-url https://hub.example.com
+docker run -d --name agentmux --restart unless-stopped -p 8081:8081 ghcr.io/kinboyw/agentmux:latest
 ```
+
+The image defaults to `hub --addr 0.0.0.0:8081 --data /var/lib/agentmux/agentmux.db`.
+Use `-v agentmux-data:/var/lib/agentmux` when you want the embedded database to
+survive container replacement.
 
 For local compose-based development:
 

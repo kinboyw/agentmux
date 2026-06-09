@@ -21,24 +21,25 @@ or a shell simply run inside tmux. Worker observes and controls tmux.
 
 ## Quick Start
 
-Run Hub with the published container image:
+If you are already viewing an AgentMux Hub landing page, use that Hub directly:
+
+1. Click `Generate join signal`.
+2. Run the generated Worker command on the machine that owns your tmux sessions.
+3. Open the generated Web Control URL from your browser.
+
+To self-host a Hub, run the published container image:
 
 ```bash
-docker run -d \
-  --name agentmux \
-  --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v agentmux-data:/var/lib/agentmux \
-  ghcr.io/kinboyw/agentmux:latest \
-  hub \
-  --addr 0.0.0.0:8080 \
-  --data /var/lib/agentmux/agentmux.db \
-  --public-url https://hub.example.com
+docker run -d --name agentmux --restart unless-stopped -p 8081:8081 ghcr.io/kinboyw/agentmux:latest
 ```
 
-Open the Hub landing page, generate a join signal, then run the generated
-Worker command on the machine that owns your tmux sessions. Open the generated
-Web Control URL from any browser.
+The container stores Hub state under `/var/lib/agentmux` by default. Mount that
+directory only when you want to persist the embedded database outside the
+container.
+
+If the self-hosted Hub does not already have a public URL, put it behind
+Cloudflare Tunnel, ngrok, or another reverse proxy first, then open the public
+URL and generate Worker and Control commands from that page.
 
 For local source verification:
 

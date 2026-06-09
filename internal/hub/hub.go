@@ -1120,6 +1120,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .navlinks a { text-decoration: none; }
     .github-icon { width: 16px; height: 16px; flex: 0 0 auto; }
     .github-link, .with-icon { display: inline-flex; align-items: center; gap: 7px; }
+    .version-link { border: 1px solid rgba(54, 214, 147, .34); border-radius: 999px; padding: 6px 9px; color: #d7f8ea; background: rgba(54, 214, 147, .1); font-weight: 650; }
     .lang { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 3px; background: rgba(7, 10, 10, .72); }
     .lang button { min-height: 26px; border: 0; border-radius: 999px; padding: 0 9px; color: var(--muted); background: transparent; font-size: 12px; }
     .lang button.active { background: rgba(54, 214, 147, .18); color: var(--text); }
@@ -1169,11 +1170,6 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .visual p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
     .visual .hint { margin-top: 14px; color: #cce7dc; font-size: 12px; }
     .panel { padding: 18px; margin-bottom: 52px; }
-    .release-panel { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 18px; align-items: stretch; margin-bottom: 56px; }
-    .release-meta { display: grid; align-content: start; gap: 12px; }
-    .release-version { width: fit-content; border: 1px solid rgba(54, 214, 147, .38); border-radius: 999px; padding: 7px 11px; color: #d7f8ea; background: rgba(54, 214, 147, .12); font-size: 13px; font-weight: 680; }
-    .release-note { min-height: 150px; max-height: 270px; overflow: auto; white-space: pre-wrap; color: #c7d8d2; line-height: 1.55; font-size: 13px; border: 1px solid var(--line); border-radius: 7px; background: rgba(3, 5, 5, .72); padding: 12px; }
-    .release-actions { display: flex; flex-wrap: wrap; gap: 10px; }
     .asset-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
     .asset-list a { border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; color: var(--muted); text-decoration: none; font-size: 12px; background: rgba(10, 14, 14, .72); }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
@@ -1199,7 +1195,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       .nav { padding: 0 18px; }
       .navlinks a.hide-small { display: none; }
       main { width: min(100% - 28px, 760px); }
-      .hero, .grid, .cards, .release-panel, .visual, .visual:nth-child(even) { grid-template-columns: 1fr; }
+      .hero, .grid, .cards, .visual, .visual:nth-child(even) { grid-template-columns: 1fr; }
       .hero { padding-top: 36px; }
       .hero-visual { transform: none; }
       .visual-copy, .visual:nth-child(even) .visual-copy { order: 0; border-left: 0; border-right: 0; border-top: 1px solid var(--line); }
@@ -1208,7 +1204,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     }
     @media (max-width: 620px) {
       .navlinks { gap: 8px; }
-      .navlinks a:not(.github-link) { display: none; }
+      .navlinks a:not(.github-link):not(.version-link) { display: none; }
       h1 { font-size: 42px; }
       .lead { font-size: 16px; }
       .lightbox { padding: 10px; }
@@ -1223,6 +1219,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <a href="/control" data-i18n="navControl">Web Control</a>
         <a class="hide-small" href="/install.sh">install.sh</a>
         <a class="hide-small" href="#quickstart" data-i18n="navQuick">Quick Start</a>
+        <a id="version-link" class="version-link" href="{{.ReleasesURL}}" rel="noreferrer">latest</a>
         <a class="github-link" href="{{.GitHubURL}}" rel="noreferrer">
           <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>
           <span data-i18n="navGithub">GitHub</span>
@@ -1263,29 +1260,6 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="card"><h2 data-i18n="cardControlTitle">Multi-session control</h2><p data-i18n="cardControlBody">The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.</p></div>
       </section>
 
-      <section id="release" class="panel release-panel" aria-label="AgentMux release information">
-        <div class="release-meta">
-          <div class="pill"><span class="dot"></span><span data-i18n="releaseEyebrow">GitHub release</span></div>
-          <h2 data-i18n="releaseTitle">Latest version</h2>
-          <p data-i18n="releaseLead">The landing page reads the latest GitHub release and shows the version, notes, binary assets, and container image.</p>
-          <div id="release-version" class="release-version">v0.0.1</div>
-          <div class="release-actions">
-            <a id="release-link" class="button with-icon" href="{{.ReleasesURL}}" rel="noreferrer">
-              <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>
-              <span data-i18n="releaseOpen">Open release</span>
-            </a>
-          </div>
-        </div>
-        <div>
-          <div class="command">
-            <div class="command-title"><span data-i18n="dockerImage">Docker image</span></div>
-            <pre id="docker-command">docker run -d --name agentmux --restart unless-stopped -p 127.0.0.1:8080:8080 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}</pre>
-          </div>
-          <div id="release-note" class="release-note" data-i18n="releaseLoading">Loading latest release note from GitHub...</div>
-          <div id="release-assets" class="asset-list"></div>
-        </div>
-      </section>
-
       <section aria-label="AgentMux architecture visuals">
         <div class="section-head">
           <div>
@@ -1319,19 +1293,50 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="panel-head">
           <div>
             <h2 data-i18n="quickTitle">Quick Start</h2>
-            <p data-i18n="quickLead">Run Hub, expose it with a stable public URL, then generate a join signal for Worker and Control.</p>
+            <p data-i18n="quickLead">This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your tmux sessions, then open Web Control from this browser.</p>
           </div>
           <button id="mint2" data-i18n="generate">Generate</button>
         </div>
         <div id="result" class="grid">
           <div class="command">
-            <div class="command-title"><span data-i18n="runHubDocker">Run Hub with Docker</span></div>
-            <pre>docker run -d --name agentmux --restart unless-stopped -p 127.0.0.1:8080:8080 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url https://hub.example.com</pre>
+            <div class="command-title"><span data-i18n="currentHub">Current Hub</span></div>
+            <pre>{{.BaseURL}}</pre>
           </div>
           <div class="command">
-            <div class="command-title"><span data-i18n="quickTunnel">Quick tunnel discovery</span></div>
-            <pre>cloudflared tunnel --url http://127.0.0.1:8080
-# copy the printed https://*.trycloudflare.com URL into --public-url, then restart Hub</pre>
+            <div class="command-title"><span data-i18n="workerStep">Worker side</span></div>
+            <pre data-i18n="workerStepBody">Click Generate to create a short-lived command for the machine running tmux and agents.</pre>
+          </div>
+          <div class="command">
+            <div class="command-title"><span data-i18n="controlStep">Control side</span></div>
+            <pre data-i18n="controlStepBody">After the Worker is connected, open Web Control to preview sessions and create or attach tmux-backed agent workspaces.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 data-i18n="selfHostTitle">Self-host Hub</h2>
+            <p data-i18n="selfHostLead">Only use this when you want to run your own Hub. The Docker image already defaults to port 8081 and stores data under /var/lib/agentmux.</p>
+          </div>
+        </div>
+        <div class="grid">
+          <div class="command">
+            <div class="command-title"><span data-i18n="runHubDocker">Run Hub with Docker</span></div>
+            <pre>docker run -d --name agentmux --restart unless-stopped -p 8081:8081 {{.ContainerImage}}:latest</pre>
+          </div>
+          <div class="command">
+            <div class="command-title"><span data-i18n="runHubBinary">Run Hub with binary</span></div>
+            <pre>agentmux hub --addr 0.0.0.0:8081 --data ./agentmux.db</pre>
+          </div>
+          <div class="command">
+            <div class="command-title"><span data-i18n="runHubPersist">Optional Docker persistence</span></div>
+            <pre>docker run -d --name agentmux --restart unless-stopped -p 8081:8081 -v agentmux-data:/var/lib/agentmux {{.ContainerImage}}:latest</pre>
+          </div>
+          <div class="command">
+            <div class="command-title"><span data-i18n="quickTunnel">Optional tunnel when Hub has no public URL</span></div>
+            <pre>cloudflared tunnel --url http://127.0.0.1:8081
+# open the printed https://*.trycloudflare.com URL and generate commands there</pre>
           </div>
         </div>
       </section>
@@ -1352,7 +1357,6 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     const baseStatus = 'Hub {{.BaseURL}} · Worker {{.WSURL}}';
     const latestReleaseAPI = '{{.LatestReleaseAPI}}';
     const fallbackReleaseURL = '{{.ReleasesURL}}';
-    const containerImage = '{{.ContainerImage}}';
     const result = document.getElementById('result');
     const status = document.getElementById('status');
     let latestRelease = null;
@@ -1375,14 +1379,6 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         cardCloudBody: 'Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.',
         cardControlTitle: 'Multi-session control',
         cardControlBody: 'The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.',
-        releaseEyebrow: 'GitHub release',
-        releaseTitle: 'Latest version',
-        releaseLead: 'The landing page reads the latest GitHub release and shows the version, notes, binary assets, and container image.',
-        releaseOpen: 'Open release',
-        releaseLoading: 'Loading latest release note from GitHub...',
-        releaseUnavailable: 'Release information is not available yet. Open GitHub Releases for published versions and assets.',
-        releasePublished: 'Published ',
-        dockerImage: 'Docker image',
         visualTitle: 'Architecture in practice',
         visualLead: 'Large technical diagrams are embedded directly into the Hub landing page and can be opened for detail review.',
         onboardingTitle: 'Signal onboarding',
@@ -1392,10 +1388,19 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: 'Multi-pane Web Control',
         workspaceBody: 'Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.',
         quickTitle: 'Quick Start',
-        quickLead: 'Run Hub, expose it with a stable public URL, then generate a join signal for Worker and Control.',
+        quickLead: 'This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your tmux sessions, then open Web Control from this browser.',
         generate: 'Generate',
+        currentHub: 'Current Hub',
+        workerStep: 'Worker side',
+        workerStepBody: 'Click Generate to create a short-lived command for the machine running tmux and agents.',
+        controlStep: 'Control side',
+        controlStepBody: 'After the Worker is connected, open Web Control to preview sessions and create or attach tmux-backed agent workspaces.',
+        selfHostTitle: 'Self-host Hub',
+        selfHostLead: 'Only use this when you want to run your own Hub. The Docker image already defaults to port 8081 and stores data under /var/lib/agentmux.',
+        runHubBinary: 'Run Hub with binary',
         runHubDocker: 'Run Hub with Docker',
-        quickTunnel: 'Quick tunnel discovery',
+        runHubPersist: 'Optional Docker persistence',
+        quickTunnel: 'Optional tunnel when Hub has no public URL',
         footerSecurity: 'Default admin token stays local. Signals exchange into scoped credentials.',
         footerDocs: 'Docs',
         generating: 'Generating signal...',
@@ -1426,14 +1431,6 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         cardCloudBody: 'Hub 可以放在 Cloudflare Tunnel 或反向代理之后。HTTPS 自动对应 WSS，Worker 默认只需要出站连接。',
         cardControlTitle: '多会话控制',
         cardControlBody: 'Web Control 支持可调整窗格、拖拽布局、会话创建，以及浏览器侧凭证。',
-        releaseEyebrow: 'GitHub 版本发布',
-        releaseTitle: '最新版本',
-        releaseLead: '落地页会读取 GitHub 最新 release，并展示版本号、说明、二进制产物和容器镜像。',
-        releaseOpen: '打开版本页',
-        releaseLoading: '正在从 GitHub 加载最新 release note...',
-        releaseUnavailable: '暂时无法获取版本信息。可以打开 GitHub Releases 查看已发布版本和产物。',
-        releasePublished: '发布时间 ',
-        dockerImage: 'Docker 镜像',
         visualTitle: '架构如何落地',
         visualLead: '关键技术图示直接嵌入 Hub 落地页，点击即可放大查看细节。',
         onboardingTitle: '信令接入流程',
@@ -1443,10 +1440,19 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: '多窗格网页控制台',
         workspaceBody: '在紧凑的浏览器工作区里操作多个长期运行的 tmux agent 会话。',
         quickTitle: '快速开始',
-        quickLead: '先运行 Hub，用稳定公网 URL 暴露服务，然后生成信令接入 Worker 和 Control。',
+        quickLead: '当前 Hub 已经在运行。生成接入信令，在拥有 tmux 会话的机器上运行 Worker 命令，然后从当前浏览器打开 Web Control。',
         generate: '生成',
+        currentHub: '当前 Hub',
+        workerStep: 'Worker 侧',
+        workerStepBody: '点击生成，为运行 tmux 和 agent 的机器创建一条限时 Worker 接入命令。',
+        controlStep: 'Control 侧',
+        controlStepBody: 'Worker 接入后，打开 Web Control 预览会话，并创建或 attach tmux agent 工作区。',
+        selfHostTitle: '自托管 Hub',
+        selfHostLead: '只有当你想运行自己的 Hub 时才需要这里。Docker 镜像已默认使用 8081 端口，并把数据放在 /var/lib/agentmux。',
+        runHubBinary: '用二进制运行 Hub',
         runHubDocker: '用 Docker 运行 Hub',
-        quickTunnel: '临时隧道地址发现',
+        runHubPersist: '可选 Docker 持久化',
+        quickTunnel: 'Hub 无公网地址时可选穿透',
         footerSecurity: '默认管理员 token 保持本地使用。信令会交换为受限凭证。',
         footerDocs: '文档',
         generating: '正在生成信令...',
@@ -1478,7 +1484,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       if (event.key === 'Escape') closeLightbox();
     });
     setLanguage(currentLang);
-    loadRelease();
+    loadLatestVersion();
     async function mint() {
       status.textContent = t('generating');
       const res = await fetch('/api/signals', { method: 'POST' });
@@ -1507,7 +1513,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         button.classList.toggle('active', button.getAttribute('data-lang') === currentLang);
       });
       if (status.textContent === '' || status.textContent.startsWith('Hub ')) status.textContent = baseStatus;
-      renderRelease();
+      renderLatestVersion();
     }
     function t(key) {
       return dictionaries[currentLang][key] || dictionaries.en[key] || key;
@@ -1532,49 +1538,24 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     function closeLightbox() {
       document.getElementById('lightbox').classList.remove('open');
     }
-    async function loadRelease() {
-      const note = document.getElementById('release-note');
+    async function loadLatestVersion() {
       try {
         const response = await fetch(latestReleaseAPI, { headers: { 'Accept': 'application/vnd.github+json' } });
         if (!response.ok) throw new Error(String(response.status));
         latestRelease = await response.json();
-        renderRelease();
+        renderLatestVersion();
       } catch {
-        document.getElementById('release-version').textContent = 'GitHub Releases';
-        document.getElementById('release-link').href = fallbackReleaseURL;
-        note.textContent = t('releaseUnavailable');
+        const link = document.getElementById('version-link');
+        link.textContent = 'latest';
+        link.href = fallbackReleaseURL;
       }
     }
-    function renderRelease() {
+    function renderLatestVersion() {
       if (!latestRelease) return;
       const tag = latestRelease.tag_name || latestRelease.name || 'latest';
-      const version = document.getElementById('release-version');
-      const link = document.getElementById('release-link');
-      const note = document.getElementById('release-note');
-      const assets = document.getElementById('release-assets');
-      const dockerCommand = document.getElementById('docker-command');
-      version.textContent = tag + (latestRelease.published_at ? ' · ' + t('releasePublished') + new Date(latestRelease.published_at).toLocaleDateString() : '');
+      const link = document.getElementById('version-link');
+      link.textContent = tag;
       link.href = latestRelease.html_url || fallbackReleaseURL;
-      note.textContent = trimReleaseNote(latestRelease.body || latestRelease.name || t('releaseUnavailable'));
-      dockerCommand.textContent = 'docker run -d --name agentmux --restart unless-stopped -p 127.0.0.1:8080:8080 -v agentmux-data:/var/lib/agentmux ' + containerImage + ':' + tag.replace(/^v/, '') + ' hub --addr 0.0.0.0:8080 --data /var/lib/agentmux/agentmux.db --public-url {{.BaseURL}}';
-      assets.innerHTML = '';
-      for (const asset of latestRelease.assets || []) {
-        const href = asset.browser_download_url || asset.url;
-        if (!href || !asset.name) continue;
-        const item = document.createElement('a');
-        item.href = href;
-        item.rel = 'noreferrer';
-        item.textContent = asset.name;
-        assets.appendChild(item);
-      }
-    }
-    function trimReleaseNote(value) {
-      const text = String(value).trim();
-      if (text.length <= 900) return text;
-      return text.slice(0, 900).replace(/\s+\S*$/, '') + '...';
-    }
-    function shellQuote(value) {
-      return "'" + String(value).replace(/'/g, "'\\''") + "'";
     }
     function escapeHTML(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));

@@ -24,17 +24,18 @@ func OpenSQLiteAuthStore(path string) (*sqliteAuthStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("sqlite path is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("prepare sqlite directory %s: %w", dir, err)
 	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open sqlite database %s: %w", path, err)
 	}
 	store := &sqliteAuthStore{db: db}
 	if err := store.migrate(); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, fmt.Errorf("initialize sqlite database %s: %w", path, err)
 	}
 	return store, nil
 }

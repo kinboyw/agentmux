@@ -73,17 +73,20 @@ docker pull ghcr.io/kinboyw/agentmux:latest
 Run a released image directly:
 
 ```bash
-docker run -d \
-  --name agentmux \
-  --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v agentmux-data:/var/lib/agentmux \
-  ghcr.io/kinboyw/agentmux:latest \
-  hub \
-  --addr 0.0.0.0:8080 \
-  --data /var/lib/agentmux/agentmux.db \
-  --public-url https://hub.example.com
+docker run -d --name agentmux --restart unless-stopped -p 8081:8081 ghcr.io/kinboyw/agentmux:latest
 ```
+
+The image defaults to `hub --addr 0.0.0.0:8081 --data /var/lib/agentmux/agentmux.db`.
+Mount `/var/lib/agentmux` only when you want the embedded database to live
+outside the container:
+
+```bash
+docker run -d --name agentmux --restart unless-stopped -p 8081:8081 -v agentmux-data:/var/lib/agentmux ghcr.io/kinboyw/agentmux:latest
+```
+
+For advanced bind mounts, remember the published image runs as the distroless
+`nonroot` user (`65532:65532`), so the host directory must be writable by that
+UID/GID.
 
 Local compose remains source-build oriented:
 

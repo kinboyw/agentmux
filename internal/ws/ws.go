@@ -71,13 +71,10 @@ func Dial(ctx context.Context, rawURL string, token string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	host := parsed.Host
-	if !strings.Contains(host, ":") {
-		host += ":80"
-	}
 	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
 		return nil, fmt.Errorf("unsupported websocket scheme %q", parsed.Scheme)
 	}
+	host := dialHost(parsed)
 	dialer := net.Dialer{}
 	var conn net.Conn
 	conn, err = dialer.DialContext(ctx, "tcp", host)
@@ -129,6 +126,16 @@ func Dial(ctx context.Context, rawURL string, token string) (*Conn, error) {
 		return nil, fmt.Errorf("websocket upgrade failed: %s", resp.Status)
 	}
 	return &Conn{conn: conn, br: br, writeMask: true}, nil
+}
+
+func dialHost(parsed *url.URL) string {
+	if parsed.Port() != "" {
+		return parsed.Host
+	}
+	if parsed.Scheme == "wss" {
+		return net.JoinHostPort(parsed.Hostname(), "443")
+	}
+	return net.JoinHostPort(parsed.Hostname(), "80")
 }
 
 func (c *Conn) ReadText() (string, error) {

@@ -21,23 +21,23 @@ AgentMux 的核心设计是让 agent 无感。Codex、Claude、Gemini、OpenCode
 
 ## 快速开始
 
-使用发布的容器镜像运行 Hub：
+如果你已经打开了一个 AgentMux Hub 落地页，直接复用当前 Hub：
+
+1. 点击 `生成接入信令`。
+2. 在拥有 tmux 会话的机器上运行页面生成的 Worker 命令。
+3. 从浏览器打开页面生成的 Web Control URL。
+
+如果需要自托管 Hub，运行发布的容器镜像：
 
 ```bash
-docker run -d \
-  --name agentmux \
-  --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v agentmux-data:/var/lib/agentmux \
-  ghcr.io/kinboyw/agentmux:latest \
-  hub \
-  --addr 0.0.0.0:8080 \
-  --data /var/lib/agentmux/agentmux.db \
-  --public-url https://hub.example.com
+docker run -d --name agentmux --restart unless-stopped -p 8081:8081 ghcr.io/kinboyw/agentmux:latest
 ```
 
-打开 Hub 落地页，生成 join signal，然后在拥有 tmux 会话的机器上运行页面生成的
-Worker 命令。浏览器侧直接打开页面生成的 Web Control URL。
+容器默认把 Hub 状态放在内部 `/var/lib/agentmux` 目录。只有需要把数据库持久化到宿主机时，
+才需要按需挂载这个目录。
+
+如果自托管 Hub 本身没有公网访问地址，先通过 Cloudflare Tunnel、ngrok 或其他反向代理暴露服务，
+然后打开公网 URL，在页面上生成 Worker 和 Control 命令。
 
 本地源码验证：
 
