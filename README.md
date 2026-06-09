@@ -139,3 +139,4 @@ mise exec -- go build -o dist/agentmux ./cmd/agentmux
 - [API](docs/API.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Roadmap](docs/ROADMAP.md)
+- [Visual Prompt Library](docs/visual-prompts/README.md)
