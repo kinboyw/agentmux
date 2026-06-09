@@ -13,6 +13,7 @@ import {
   SplitSquareHorizontal,
   SplitSquareVertical,
   UserPlus,
+  UserRound,
   X,
 } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
@@ -80,6 +81,27 @@ type AuthCredentialPayload = {
   };
 };
 
+type AuthUser = {
+  email: string;
+  name: string;
+};
+
+type WorkerSessionGroup = {
+  worker: WorkerView | null;
+  workerId: string;
+  sessions: SessionView[];
+};
+
+type SignalPayload = {
+  signal: string;
+  signal_id: string;
+  tenant_id: string;
+  expires_at: string;
+  worker_command: string;
+  control_command: string;
+  control_url: string;
+};
+
 type DragPayload =
   | {
       kind: "session";
@@ -100,14 +122,20 @@ const query = new URLSearchParams(window.location.search);
 const initialSignal = query.get("signal") || "";
 const initialToken = query.get("token") || localStorage.getItem("agentmux.token") || "";
 const initialPaneId = crypto.randomUUID();
+const initialUser = readStoredUser();
 
 function App() {
   const [token, setToken] = React.useState(initialToken);
   const [workers, setWorkers] = React.useState<WorkerView[]>([]);
   const [sessions, setSessions] = React.useState<SessionView[]>([]);
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
+  const [authOpen, setAuthOpen] = React.useState(false);
   const [authMode, setAuthMode] = React.useState<AuthMode>("login");
   const [authForm, setAuthForm] = React.useState({ email: "", password: "", name: "" });
+  const [currentUser, setCurrentUser] = React.useState<AuthUser | null>(initialUser);
+  const [workerFilter, setWorkerFilter] = React.useState("all");
+  const [tokenDraft, setTokenDraft] = React.useState(initialToken);
+  const [joinSignal, setJoinSignal] = React.useState<SignalPayload | null>(null);
   const [layout, setLayout] = React.useState<LayoutNode>({ type: "pane", id: initialPaneId });
   const [activePane, setActivePane] = React.useState<string>(initialPaneId);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
@@ -122,6 +150,16 @@ function App() {
     cwd: ".",
     command: "bash",
   });
+
+  const workerOptions = React.useMemo(
+    () => workers.slice().sort((left, right) => workerDisplayLabel(left).localeCompare(workerDisplayLabel(right))),
+    [workers],
+  );
+
+  const groupedSessions = React.useMemo(
+    () => buildWorkerSessionGroups(workerOptions, sessions, workerFilter),
+    [workerOptions, sessions, workerFilter],
+  );
 
   React.useEffect(() => {
     if (initialSignal) {
@@ -212,14 +250,45 @@ function App() {
 
   async function acceptCredential(data: AuthCredentialPayload, title: string) {
     setToken(data.credential);
+    setTokenDraft(data.credential);
     localStorage.setItem("agentmux.token", data.credential);
     localStorage.setItem("agentmux.control_device_id", data.device_id);
+    if (data.user) {
+      setCurrentUser(data.user);
+      localStorage.setItem("agentmux.user", JSON.stringify(data.user));
+    }
     setStatus({
       tone: "ok",
       title,
       detail: `${data.user?.email || data.credential_id} · ${data.tenant_id}`,
     });
+    setAuthOpen(false);
     await refreshAll(data.credential);
+  }
+
+  async function applyDirectToken() {
+    const nextToken = tokenDraft.trim();
+    if (!nextToken) {
+      setStatus({ tone: "warn", title: "Missing token", detail: "Enter a control credential or dev token." });
+      return;
+    }
+    setToken(nextToken);
+    setCurrentUser(null);
+    setJoinSignal(null);
+    localStorage.removeItem("agentmux.user");
+    setAuthOpen(false);
+    await refreshAll(nextToken);
+  }
+
+  async function generateJoinSignal() {
+    const res = await apiFetch("/api/signals", { method: "POST" });
+    if (!res.ok) {
+      setStatus({ tone: "err", title: "Signal generation failed", detail: await res.text() });
+      return;
+    }
+    const data = (await res.json()) as SignalPayload;
+    setJoinSignal(data);
+    setStatus({ tone: "ok", title: "Join signal ready", detail: `${data.tenant_id} · expires ${new Date(data.expires_at).toLocaleString()}` });
   }
 
   async function startOAuth(provider: "github" | "google") {
@@ -294,79 +363,50 @@ function App() {
             <ChevronLeft className="h-4 w-4" />
           </Button>
         </div>
-        <div className="space-y-3 border-b border-border p-3">
-          <div className="grid grid-cols-2 rounded-md bg-secondary p-1">
-            <Button
-              variant={authMode === "login" ? "default" : "ghost"}
-              size="sm"
-              onClick={() => setAuthMode("login")}
-              type="button"
-            >
-              <LogIn className="h-4 w-4" />
-              Sign in
-            </Button>
-            <Button
-              variant={authMode === "register" ? "default" : "ghost"}
-              size="sm"
-              onClick={() => setAuthMode("register")}
-              type="button"
-            >
-              <UserPlus className="h-4 w-4" />
-              Register
-            </Button>
-          </div>
-          <form className="space-y-2" onSubmit={submitAuth}>
-            <Input type="email" value={authForm.email} onChange={(event) => setAuthForm({ ...authForm, email: event.target.value })} placeholder="email" autoComplete="email" />
-            {authMode === "register" ? (
-              <Input value={authForm.name} onChange={(event) => setAuthForm({ ...authForm, name: event.target.value })} placeholder="display name" autoComplete="name" />
-            ) : null}
-            <Input type="password" value={authForm.password} onChange={(event) => setAuthForm({ ...authForm, password: event.target.value })} placeholder="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} />
-            <Button variant="secondary" className="w-full" type="submit">
-              {authMode === "register" ? <UserPlus className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
-              {authMode === "register" ? "Create Account" : "Sign In"}
-            </Button>
-          </form>
-          <div className="grid grid-cols-2 gap-2">
-            <Button variant="ghost" size="sm" type="button" onClick={() => void startOAuth("github")}>
-              <Github className="h-4 w-4" />
-              GitHub
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              type="button"
-              onClick={() => void startOAuth("google")}
-            >
-              <Globe className="h-4 w-4" />
-              Google
-            </Button>
-          </div>
-          <Input value={token} onChange={(event) => setToken(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
-          <Button variant="secondary" className="w-full" onClick={() => void refreshAll()}>
-            <RefreshCw className="h-4 w-4" />
-            Refresh
-          </Button>
-        </div>
         <div className="min-h-0 flex-1 overflow-auto p-1.5">
-          <div className="mb-2 px-1 text-xs font-medium uppercase text-muted-foreground">Sessions</div>
+          <div className="mb-2 flex items-center gap-2 px-1">
+            <div className="flex-1 text-xs font-medium uppercase text-muted-foreground">Sessions</div>
+            <Button variant="ghost" size="icon-sm" onClick={() => void refreshAll()} title="Refresh workers and sessions">
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="mb-3 px-1">
+            <Select value={workerFilter} onChange={(event) => setWorkerFilter(event.target.value)} className="h-8 text-xs">
+              <option value="all">All workers</option>
+              {workerOptions.map((worker) => (
+                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)}</option>
+              ))}
+            </Select>
+          </div>
           <div className="space-y-1">
             {sessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions.</div> : null}
-            {sessions.map((session) => (
-              <button
-                key={session.id}
-                draggable
-                className={cn(
-                  "w-full rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-secondary",
-                  activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
-                )}
-                onClick={() => attach(session.id)}
-                onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
-                onDragEnd={() => setDropTarget(null)}
-              >
-                <div className="truncate text-sm font-medium">{session.id}</div>
-                <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
-                <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
-              </button>
+            {sessions.length > 0 && groupedSessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions for this worker.</div> : null}
+            {groupedSessions.map((group) => (
+              <div key={group.workerId} className="space-y-1 pb-2">
+                <div className="px-2 pb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                  <div className="truncate">{group.worker ? workerDisplayLabel(group.worker) : group.workerId}</div>
+                  <div className="truncate text-[10px] normal-case tracking-normal text-muted-foreground/80">
+                    {group.worker?.addr || group.workerId} · {group.sessions.length} session{group.sessions.length === 1 ? "" : "s"}
+                  </div>
+                </div>
+                {group.sessions.map((session) => (
+                  <button
+                    key={session.id}
+                    draggable
+                    className={cn(
+                      "w-full rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-secondary",
+                      activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
+                    )}
+                    onClick={() => attach(session.id)}
+                    onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
+                    onDragEnd={() => setDropTarget(null)}
+                  >
+                    <div className="truncate text-sm font-medium">{session.name || session.id}</div>
+                    <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
+                    <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
+                  </button>
+                ))}
+              </div>
             ))}
           </div>
         </div>
@@ -374,8 +414,8 @@ function App() {
           <div className="text-xs font-medium uppercase text-muted-foreground">Create</div>
           <Select value={createForm.worker_id} onChange={(event) => setCreateForm({ ...createForm, worker_id: event.target.value })}>
             <option value="">Select worker</option>
-            {workers.map((worker) => (
-              <option key={worker.id} value={worker.id}>{worker.id}</option>
+            {workerOptions.map((worker) => (
+              <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)}</option>
             ))}
           </Select>
           <Input value={createForm.name} onChange={(event) => setCreateForm({ ...createForm, name: event.target.value })} placeholder="session name" />
@@ -403,6 +443,19 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <div className="hidden max-w-[280px] min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 py-1 sm:flex">
+              <div className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
+                <UserRound className="h-3.5 w-3.5" />
+              </div>
+              <div className="min-w-0">
+                <div className="truncate text-xs font-medium">{currentUser?.name || "Guest control"}</div>
+                <div className="truncate text-[11px] text-muted-foreground">{currentUser?.email || "Use sign in or direct token access."}</div>
+              </div>
+            </div>
+            <Button variant="secondary" size="sm" onClick={() => setAuthOpen(true)}>
+              {currentUser ? <UserRound className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
+              {currentUser ? "Account" : "Sign in"}
+            </Button>
             <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
           </div>
         </header>
@@ -421,6 +474,151 @@ function App() {
           />
         </div>
       </main>
+      <AuthModal
+        open={authOpen}
+        authMode={authMode}
+        authForm={authForm}
+        currentUser={currentUser}
+        token={tokenDraft}
+        joinSignal={joinSignal}
+        onClose={() => setAuthOpen(false)}
+        onModeChange={setAuthMode}
+        onFormChange={setAuthForm}
+        onTokenChange={setTokenDraft}
+        onSubmit={submitAuth}
+        onApplyDirectToken={() => void applyDirectToken()}
+        onGenerateJoinSignal={() => void generateJoinSignal()}
+        onOAuth={(provider) => void startOAuth(provider)}
+      />
+    </div>
+  );
+}
+
+function AuthModal({
+  open,
+  authMode,
+  authForm,
+  currentUser,
+  token,
+  joinSignal,
+  onClose,
+  onModeChange,
+  onFormChange,
+  onTokenChange,
+  onSubmit,
+  onApplyDirectToken,
+  onGenerateJoinSignal,
+  onOAuth,
+}: {
+  open: boolean;
+  authMode: AuthMode;
+  authForm: { email: string; password: string; name: string };
+  currentUser: AuthUser | null;
+  token: string;
+  joinSignal: SignalPayload | null;
+  onClose: () => void;
+  onModeChange: (mode: AuthMode) => void;
+  onFormChange: (form: { email: string; password: string; name: string }) => void;
+  onTokenChange: (token: string) => void;
+  onSubmit: (event: React.FormEvent) => void;
+  onApplyDirectToken: () => void;
+  onGenerateJoinSignal: () => void;
+  onOAuth: (provider: "github" | "google") => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <Card className="w-full max-w-md bg-card/95 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold">Control access</div>
+            <div className="text-xs text-muted-foreground">
+              {currentUser ? `${currentUser.name} · ${currentUser.email}` : "Register or sign in to sync browser access."}
+            </div>
+          </div>
+          <Button variant="ghost" size="icon-sm" onClick={onClose} title="Close">
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="space-y-4 p-4">
+          <div className="grid grid-cols-2 rounded-md bg-secondary p-1">
+            <Button variant={authMode === "login" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("login")} type="button">
+              <LogIn className="h-4 w-4" />
+              Sign in
+            </Button>
+            <Button variant={authMode === "register" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("register")} type="button">
+              <UserPlus className="h-4 w-4" />
+              Register
+            </Button>
+          </div>
+          <form className="space-y-2" onSubmit={onSubmit}>
+            <Input type="email" value={authForm.email} onChange={(event) => onFormChange({ ...authForm, email: event.target.value })} placeholder="email" autoComplete="email" />
+            {authMode === "register" ? (
+              <Input value={authForm.name} onChange={(event) => onFormChange({ ...authForm, name: event.target.value })} placeholder="display name" autoComplete="name" />
+            ) : null}
+            <Input type="password" value={authForm.password} onChange={(event) => onFormChange({ ...authForm, password: event.target.value })} placeholder="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} />
+            <Button variant="secondary" className="w-full" type="submit">
+              {authMode === "register" ? <UserPlus className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
+              {authMode === "register" ? "Create account" : "Sign in"}
+            </Button>
+          </form>
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")}>
+              <Github className="h-4 w-4" />
+              GitHub
+            </Button>
+            <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")}>
+              <Globe className="h-4 w-4" />
+              Google
+            </Button>
+          </div>
+          <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
+            <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
+            <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
+            <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken}>
+              <RefreshCw className="h-4 w-4" />
+              Use token
+            </Button>
+          </div>
+          {currentUser ? (
+            <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-medium uppercase text-muted-foreground">Join signal</div>
+                  <div className="text-[11px] text-muted-foreground">Add new worker or control devices into your tenant.</div>
+                </div>
+                <Button variant="secondary" size="sm" type="button" onClick={onGenerateJoinSignal}>
+                  <Plus className="h-4 w-4" />
+                  Generate
+                </Button>
+              </div>
+              {joinSignal ? (
+                <div className="space-y-2 text-xs">
+                  <SignalCommand title="Signal" value={joinSignal.signal} mono={false} />
+                  <SignalCommand title="Worker install" value={joinSignal.worker_command} />
+                  <SignalCommand title="Control install" value={joinSignal.control_command} />
+                  <SignalCommand title="Web Control" value={joinSignal.control_url} mono={false} />
+                  <div className="text-[11px] text-muted-foreground">
+                    Tenant {joinSignal.tenant_id} · expires {new Date(joinSignal.expires_at).toLocaleString()}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function SignalCommand({ title, value, mono = true }: { title: string; value: string; mono?: boolean }) {
+  return (
+    <div className="space-y-1">
+      <div className="text-[11px] font-medium uppercase text-muted-foreground">{title}</div>
+      <div className={cn("rounded-md border border-border bg-card px-2 py-2 text-[11px] text-foreground", mono && "font-mono")}>
+        {value}
+      </div>
     </div>
   );
 }
@@ -1056,6 +1254,51 @@ function errorDetail(text: string) {
   } catch {
     return text;
   }
+}
+
+function readStoredUser(): AuthUser | null {
+  const value = localStorage.getItem("agentmux.user");
+  if (!value) return null;
+  try {
+    const user = JSON.parse(value) as AuthUser;
+    if (!user?.email) return null;
+    return user;
+  } catch {
+    return null;
+  }
+}
+
+function workerDisplayLabel(worker: WorkerView) {
+  return worker.name && worker.name !== worker.id ? `${worker.name} (${worker.id})` : worker.id;
+}
+
+function buildWorkerSessionGroups(workers: WorkerView[], sessions: SessionView[], workerFilter: string): WorkerSessionGroup[] {
+  const sessionMap = new Map<string, SessionView[]>();
+  for (const session of sessions) {
+    if (workerFilter !== "all" && session.worker_id !== workerFilter) continue;
+    const bucket = sessionMap.get(session.worker_id) || [];
+    bucket.push(session);
+    sessionMap.set(session.worker_id, bucket);
+  }
+
+  const groups: WorkerSessionGroup[] = [];
+  for (const worker of workers) {
+    if (workerFilter !== "all" && worker.id !== workerFilter) continue;
+    const workerSessions = (sessionMap.get(worker.id) || []).slice().sort((left, right) => (left.name || left.id).localeCompare(right.name || right.id));
+    if (workerSessions.length === 0) continue;
+    groups.push({ worker, workerId: worker.id, sessions: workerSessions });
+    sessionMap.delete(worker.id);
+  }
+
+  for (const [workerId, workerSessions] of Array.from(sessionMap.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+    groups.push({
+      worker: null,
+      workerId,
+      sessions: workerSessions.slice().sort((left, right) => (left.name || left.id).localeCompare(right.name || right.id)),
+    });
+  }
+
+  return groups;
 }
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

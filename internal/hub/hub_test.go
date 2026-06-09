@@ -117,9 +117,10 @@ func TestLandingPageIncludesOpenSourceIdentityAndBilingualVisuals(t *testing.T) 
 }
 
 func TestSignalIncludesControlURL(t *testing.T) {
-	server := New(":0", "", nil)
+	server := New(":0", "secret", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
 	req.Host = "agentmux.test"
+	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
 
 	server.handleSignals(rec, req)
@@ -148,12 +149,13 @@ func TestSignalIncludesControlURL(t *testing.T) {
 }
 
 func TestSignalUsesConfiguredPublicURL(t *testing.T) {
-	server, err := NewWithOptions(ServerOptions{Addr: ":0", PublicURL: "https://mux.example.com/"})
+	server, err := NewWithOptions(ServerOptions{Addr: ":0", Token: "secret", PublicURL: "https://mux.example.com/"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
 	req.Host = "internal.local"
+	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
 
 	server.handleSignals(rec, req)
@@ -233,9 +235,10 @@ func TestRootMarkAssetEndpoint(t *testing.T) {
 }
 
 func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
-	server := New(":0", "", nil)
+	server := New(":0", "secret", nil)
 	signalReq := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
 	signalReq.Host = "agentmux.test"
+	signalReq.Header.Set("Authorization", "Bearer secret")
 	signalRec := httptest.NewRecorder()
 	server.handleSignals(signalRec, signalReq)
 	if signalRec.Code != http.StatusCreated {
@@ -328,6 +331,46 @@ func TestControlCredentialSeesOnlyTenantWorkers(t *testing.T) {
 	}
 	if len(payload.Workers) != 1 || payload.Workers[0].ID != "a" {
 		t.Fatalf("expected only tenant A worker, got %+v", payload.Workers)
+	}
+}
+
+func TestControlCredentialMintsSignalForOwnTenant(t *testing.T) {
+	server := New(":0", "", nil)
+	body := []byte(`{"email":"user@example.com","password":"password123","name":"User","device_name":"browser"}`)
+	registerReq := httptest.NewRequest(http.MethodPost, "/api/auth/register", bytes.NewReader(body))
+	registerRec := httptest.NewRecorder()
+	server.handleAuthRegister(registerRec, registerReq)
+	if registerRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected register status: %d body=%s", registerRec.Code, registerRec.Body.String())
+	}
+	var registerPayload authCredentialResponse
+	if err := json.NewDecoder(registerRec.Body).Decode(&registerPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	req.Host = "agentmux.test"
+	req.Header.Set("Authorization", "Bearer "+registerPayload.Credential)
+	rec := httptest.NewRecorder()
+	server.handleSignals(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected signal status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := payload["tenant_id"]; got != registerPayload.TenantID {
+		t.Fatalf("expected tenant %s, got %#v", registerPayload.TenantID, got)
+	}
+
+	exchanged, err := server.auth.Exchange(exchangeRequest{Signal: payload["signal"].(string), Role: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exchanged.TenantID != registerPayload.TenantID {
+		t.Fatalf("expected exchanged worker tenant %s, got %s", registerPayload.TenantID, exchanged.TenantID)
 	}
 }
 

@@ -27,6 +27,7 @@ type authStore struct {
 
 type AuthStore interface {
 	MintSignal(ttl time.Duration, uses int, scopes []string) (mintedSignal, error)
+	MintSignalForTenant(tenantID string, ttl time.Duration, uses int, scopes []string) (mintedSignal, error)
 	Exchange(req exchangeRequest) (exchangedCredential, error)
 	Register(req registerRequest) (authCredentialResponse, error)
 	Login(req loginRequest) (authCredentialResponse, error)
@@ -134,6 +135,10 @@ func newAuthStore() *authStore {
 }
 
 func (s *authStore) MintSignal(ttl time.Duration, uses int, scopes []string) (mintedSignal, error) {
+	return s.MintSignalForTenant("", ttl, uses, scopes)
+}
+
+func (s *authStore) MintSignalForTenant(tenantID string, ttl time.Duration, uses int, scopes []string) (mintedSignal, error) {
 	if ttl <= 0 {
 		ttl = defaultSignalTTL
 	}
@@ -148,10 +153,14 @@ func (s *authStore) MintSignal(ttl time.Duration, uses int, scopes []string) (mi
 		return mintedSignal{}, err
 	}
 	now := time.Now().UTC()
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		tenantID = "anon_" + randomID()
+	}
 	entry := signalEntry{
 		Hash:          tokenHash(token),
 		ID:            "sig_" + randomID(),
-		TenantID:      "anon_" + randomID(),
+		TenantID:      tenantID,
 		ExpiresAt:     now.Add(ttl),
 		UsesRemaining: uses,
 		Scopes:        append([]string(nil), scopes...),

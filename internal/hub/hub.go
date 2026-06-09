@@ -244,7 +244,16 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	minted, err := s.auth.MintSignal(defaultSignalTTL, 0, nil)
+	auth, ok := s.authenticateRole(r, "control")
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	tenantID := ""
+	if !auth.Admin {
+		tenantID = auth.Credential.TenantID
+	}
+	minted, err := s.auth.MintSignalForTenant(tenantID, defaultSignalTTL, 0, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

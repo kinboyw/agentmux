@@ -88,6 +88,10 @@ func (s *sqliteAuthStore) migrate() error {
 }
 
 func (s *sqliteAuthStore) MintSignal(ttl time.Duration, uses int, scopes []string) (mintedSignal, error) {
+	return s.MintSignalForTenant("", ttl, uses, scopes)
+}
+
+func (s *sqliteAuthStore) MintSignalForTenant(tenantID string, ttl time.Duration, uses int, scopes []string) (mintedSignal, error) {
 	if ttl <= 0 {
 		ttl = defaultSignalTTL
 	}
@@ -102,10 +106,14 @@ func (s *sqliteAuthStore) MintSignal(ttl time.Duration, uses int, scopes []strin
 		return mintedSignal{}, err
 	}
 	now := time.Now().UTC()
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		tenantID = "anon_" + randomID()
+	}
 	entry := signalEntry{
 		Hash:          tokenHash(token),
 		ID:            "sig_" + randomID(),
-		TenantID:      "anon_" + randomID(),
+		TenantID:      tenantID,
 		ExpiresAt:     now.Add(ttl),
 		UsesRemaining: uses,
 		Scopes:        append([]string(nil), scopes...),
