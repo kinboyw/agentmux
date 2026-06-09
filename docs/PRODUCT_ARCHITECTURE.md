@@ -397,7 +397,7 @@ The Go CLI should remain a debug tool. The product-grade control should be web.
 GitHub Actions now provide two tracks:
 
 - CI on pushes and pull requests: Go tests, Web Control build, binary build.
-- Release on `v*` tags: cross-compiled Linux, macOS, and Windows tarballs.
+- Release on `v*` tags: cross-compiled Linux and macOS tarballs. Windows assets are deferred until the terminal backend has a native ConPTY path.
 
 The release build rebuilds Web Control and embeds it into `internal/hub/webdist`
 before compiling the Go binary.

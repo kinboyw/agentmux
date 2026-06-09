@@ -23,9 +23,6 @@ jobs:
             goarch: amd64
           - goos: darwin
             goarch: arm64
-          - goos: windows
-            goarch: amd64
-            ext: .exe
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
