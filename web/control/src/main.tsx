@@ -9,7 +9,9 @@ import {
   LayoutGrid,
   LogIn,
   Plus,
+  Power,
   RefreshCw,
+  Search,
   SplitSquareHorizontal,
   SplitSquareVertical,
   UserPlus,
@@ -136,9 +138,15 @@ function App() {
   const [workerFilter, setWorkerFilter] = React.useState("all");
   const [tokenDraft, setTokenDraft] = React.useState(initialToken);
   const [joinSignal, setJoinSignal] = React.useState<SignalPayload | null>(null);
+  const [createOpen, setCreateOpen] = React.useState(false);
+  const [joinOpen, setJoinOpen] = React.useState(false);
+  const [joinLoading, setJoinLoading] = React.useState(false);
+  const [workerSearch, setWorkerSearch] = React.useState("");
+  const [pendingFocusSessionId, setPendingFocusSessionId] = React.useState<string | null>(null);
   const [layout, setLayout] = React.useState<LayoutNode>({ type: "pane", id: initialPaneId });
   const [activePane, setActivePane] = React.useState<string>(initialPaneId);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
+  const sessionButtonRefs = React.useRef<Record<string, HTMLButtonElement | null>>({});
   const [status, setStatus] = React.useState<Status>({
     tone: "idle",
     title: "No session attached",
@@ -161,6 +169,11 @@ function App() {
     [workerOptions, sessions, workerFilter],
   );
 
+  const filteredCreateWorkers = React.useMemo(
+    () => filterWorkers(workerOptions, workerSearch),
+    [workerOptions, workerSearch],
+  );
+
   React.useEffect(() => {
     if (initialSignal) {
       void exchangeSignal(initialSignal);
@@ -174,6 +187,15 @@ function App() {
       setCreateForm((form) => ({ ...form, worker_id: workers[0].id }));
     }
   }, [workers, createForm.worker_id]);
+
+  React.useEffect(() => {
+    if (!pendingFocusSessionId) return;
+    const node = sessionButtonRefs.current[pendingFocusSessionId];
+    if (!node) return;
+    node.scrollIntoView({ block: "nearest" });
+    node.focus();
+    setPendingFocusSessionId(null);
+  }, [pendingFocusSessionId, sessions, workerFilter]);
 
   async function exchangeSignal(signal: string) {
     setStatus({ tone: "warn", title: "Exchanging signal", detail: "Requesting a browser credential." });
@@ -218,12 +240,28 @@ function App() {
 
   async function createSession(event: React.FormEvent) {
     event.preventDefault();
+    const targetSessionID = `${createForm.worker_id}/${createForm.name}`;
     const res = await apiFetch("/api/sessions", { method: "POST", body: JSON.stringify(createForm) });
     if (!res.ok) {
       setStatus({ tone: "err", title: "Create failed", detail: await res.text() });
       return;
     }
     setStatus({ tone: "warn", title: "Create queued", detail: `${createForm.worker_id}/${createForm.name}` });
+    setCreateOpen(false);
+    setWorkerFilter(createForm.worker_id);
+    void focusCreatedSession(targetSessionID, createForm.worker_id);
+  }
+
+  async function killSession(session: SessionView) {
+    const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      setStatus({ tone: "err", title: "Exit failed", detail: await res.text() });
+      return;
+    }
+    setStatus({ tone: "warn", title: "Exit queued", detail: `${session.worker_id}/${session.name}` });
+    setLayout((node) => clearSessionFromLayout(node, session.id));
     window.setTimeout(() => void refreshAll(), 700);
   }
 
@@ -281,14 +319,45 @@ function App() {
   }
 
   async function generateJoinSignal() {
+    setJoinLoading(true);
     const res = await apiFetch("/api/signals", { method: "POST" });
     if (!res.ok) {
+      setJoinLoading(false);
       setStatus({ tone: "err", title: "Signal generation failed", detail: await res.text() });
       return;
     }
     const data = (await res.json()) as SignalPayload;
     setJoinSignal(data);
+    setJoinLoading(false);
     setStatus({ tone: "ok", title: "Join signal ready", detail: `${data.tenant_id} · expires ${new Date(data.expires_at).toLocaleString()}` });
+  }
+
+  async function openJoinModal() {
+    setJoinOpen(true);
+    if (!joinSignal && token.trim()) {
+      await generateJoinSignal();
+    }
+  }
+
+  async function focusCreatedSession(sessionID: string, workerID: string) {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const res = await apiFetch("/api/sessions");
+      if (res.ok) {
+        const payload = await res.json();
+        const nextSessions = payload.sessions || [];
+        setSessions(nextSessions);
+        const found = nextSessions.find((session: SessionView) => session.id === sessionID);
+        if (found) {
+          attach(found.id);
+          setWorkerFilter(workerID);
+          setPendingFocusSessionId(found.id);
+          setStatus({ tone: "ok", title: "Session ready", detail: found.id });
+          return;
+        }
+      }
+      await sleep(350);
+    }
+    await refreshAll();
   }
 
   async function startOAuth(provider: "github" | "google") {
@@ -390,42 +459,55 @@ function App() {
                   </div>
                 </div>
                 {group.sessions.map((session) => (
-                  <button
+                  <div
                     key={session.id}
-                    draggable
                     className={cn(
-                      "w-full rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-secondary",
+                      "rounded-md border border-transparent hover:border-border hover:bg-secondary",
                       activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
                     )}
-                    onClick={() => attach(session.id)}
-                    onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
-                    onDragEnd={() => setDropTarget(null)}
                   >
-                    <div className="truncate text-sm font-medium">{session.name || session.id}</div>
-                    <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
-                    <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
-                  </button>
+                    <div className="flex items-start gap-1">
+                      <button
+                        ref={(node) => {
+                          sessionButtonRefs.current[session.id] = node;
+                        }}
+                        type="button"
+                        draggable
+                        className="min-w-0 flex-1 px-2 py-1.5 text-left"
+                        onClick={() => attach(session.id)}
+                        onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
+                        onDragEnd={() => setDropTarget(null)}
+                      >
+                        <div className="truncate text-sm font-medium">{session.name || session.id}</div>
+                        <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
+                        <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
+                      </button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="mt-1 mr-1 shrink-0"
+                        onClick={() => void killSession(session)}
+                        title="Exit session"
+                      >
+                        <Power className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
                 ))}
               </div>
             ))}
           </div>
         </div>
-        <form className="space-y-2 border-t border-border p-3" onSubmit={createSession}>
-          <div className="text-xs font-medium uppercase text-muted-foreground">Create</div>
-          <Select value={createForm.worker_id} onChange={(event) => setCreateForm({ ...createForm, worker_id: event.target.value })}>
-            <option value="">Select worker</option>
-            {workerOptions.map((worker) => (
-              <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)}</option>
-            ))}
-          </Select>
-          <Input value={createForm.name} onChange={(event) => setCreateForm({ ...createForm, name: event.target.value })} placeholder="session name" />
-          <Input value={createForm.cwd} onChange={(event) => setCreateForm({ ...createForm, cwd: event.target.value })} placeholder="working directory" />
-          <Input value={createForm.command} onChange={(event) => setCreateForm({ ...createForm, command: event.target.value })} placeholder="command" />
-          <Button className="w-full" type="submit">
+        <div className="grid grid-cols-2 gap-2 border-t border-border p-3">
+          <Button variant="secondary" onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" />
-            Create Session
+            Create
           </Button>
-        </form>
+          <Button variant="secondary" onClick={() => void openJoinModal()}>
+            <UserPlus className="h-4 w-4" />
+            Join
+          </Button>
+        </div>
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
@@ -480,15 +562,31 @@ function App() {
         authForm={authForm}
         currentUser={currentUser}
         token={tokenDraft}
-        joinSignal={joinSignal}
         onClose={() => setAuthOpen(false)}
         onModeChange={setAuthMode}
         onFormChange={setAuthForm}
         onTokenChange={setTokenDraft}
         onSubmit={submitAuth}
         onApplyDirectToken={() => void applyDirectToken()}
-        onGenerateJoinSignal={() => void generateJoinSignal()}
         onOAuth={(provider) => void startOAuth(provider)}
+      />
+      <CreateSessionModal
+        open={createOpen}
+        createForm={createForm}
+        workerSearch={workerSearch}
+        workers={filteredCreateWorkers}
+        onClose={() => setCreateOpen(false)}
+        onSubmit={createSession}
+        onWorkerSearchChange={setWorkerSearch}
+        onFormChange={setCreateForm}
+      />
+      <JoinSignalModal
+        open={joinOpen}
+        joinSignal={joinSignal}
+        loading={joinLoading}
+        tokenReady={!!token.trim()}
+        onClose={() => setJoinOpen(false)}
+        onGenerate={() => void generateJoinSignal()}
       />
     </div>
   );
@@ -500,14 +598,12 @@ function AuthModal({
   authForm,
   currentUser,
   token,
-  joinSignal,
   onClose,
   onModeChange,
   onFormChange,
   onTokenChange,
   onSubmit,
   onApplyDirectToken,
-  onGenerateJoinSignal,
   onOAuth,
 }: {
   open: boolean;
@@ -515,14 +611,12 @@ function AuthModal({
   authForm: { email: string; password: string; name: string };
   currentUser: AuthUser | null;
   token: string;
-  joinSignal: SignalPayload | null;
   onClose: () => void;
   onModeChange: (mode: AuthMode) => void;
   onFormChange: (form: { email: string; password: string; name: string }) => void;
   onTokenChange: (token: string) => void;
   onSubmit: (event: React.FormEvent) => void;
   onApplyDirectToken: () => void;
-  onGenerateJoinSignal: () => void;
   onOAuth: (provider: "github" | "google") => void;
 }) {
   if (!open) return null;
@@ -581,31 +675,6 @@ function AuthModal({
               Use token
             </Button>
           </div>
-          {currentUser ? (
-            <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-xs font-medium uppercase text-muted-foreground">Join signal</div>
-                  <div className="text-[11px] text-muted-foreground">Add new worker or control devices into your tenant.</div>
-                </div>
-                <Button variant="secondary" size="sm" type="button" onClick={onGenerateJoinSignal}>
-                  <Plus className="h-4 w-4" />
-                  Generate
-                </Button>
-              </div>
-              {joinSignal ? (
-                <div className="space-y-2 text-xs">
-                  <SignalCommand title="Signal" value={joinSignal.signal} mono={false} />
-                  <SignalCommand title="Worker install" value={joinSignal.worker_command} />
-                  <SignalCommand title="Control install" value={joinSignal.control_command} />
-                  <SignalCommand title="Web Control" value={joinSignal.control_url} mono={false} />
-                  <div className="text-[11px] text-muted-foreground">
-                    Tenant {joinSignal.tenant_id} · expires {new Date(joinSignal.expires_at).toLocaleString()}
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
         </div>
       </Card>
     </div>
@@ -619,6 +688,135 @@ function SignalCommand({ title, value, mono = true }: { title: string; value: st
       <div className={cn("rounded-md border border-border bg-card px-2 py-2 text-[11px] text-foreground", mono && "font-mono")}>
         {value}
       </div>
+    </div>
+  );
+}
+
+function JoinSignalModal({
+  open,
+  joinSignal,
+  loading,
+  tokenReady,
+  onClose,
+  onGenerate,
+}: {
+  open: boolean;
+  joinSignal: SignalPayload | null;
+  loading: boolean;
+  tokenReady: boolean;
+  onClose: () => void;
+  onGenerate: () => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <Card className="w-full max-w-2xl bg-card/95 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold">Join devices</div>
+            <div className="text-xs text-muted-foreground">Generate a tenant-scoped signal and copy commands for Worker and Control endpoints.</div>
+          </div>
+          <Button variant="ghost" size="icon-sm" onClick={onClose} title="Close">
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="space-y-4 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs text-muted-foreground">
+              {tokenReady ? "Signal can be reused to add remote workers, CLI control, or Web Control." : "Sign in or apply a control token before generating join commands."}
+            </div>
+            <Button variant="secondary" size="sm" type="button" onClick={onGenerate} disabled={!tokenReady || loading}>
+              <UserPlus className="h-4 w-4" />
+              {loading ? "Generating..." : "Generate"}
+            </Button>
+          </div>
+          {joinSignal ? (
+            <div className="grid gap-3 md:grid-cols-2">
+              <SignalCommand title="Signal" value={joinSignal.signal} mono={false} />
+              <SignalCommand title="Web Control" value={joinSignal.control_url} mono={false} />
+              <SignalCommand title="Worker join" value={joinSignal.worker_command} />
+              <SignalCommand title="Control join" value={joinSignal.control_command} />
+              <div className="md:col-span-2 text-[11px] text-muted-foreground">
+                Tenant {joinSignal.tenant_id} · expires {new Date(joinSignal.expires_at).toLocaleString()}
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-md border border-dashed border-border bg-background/70 px-3 py-8 text-center text-sm text-muted-foreground">
+              {loading ? "Generating join commands..." : "No join signal yet."}
+            </div>
+          )}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function CreateSessionModal({
+  open,
+  createForm,
+  workerSearch,
+  workers,
+  onClose,
+  onSubmit,
+  onWorkerSearchChange,
+  onFormChange,
+}: {
+  open: boolean;
+  createForm: { worker_id: string; name: string; cwd: string; command: string };
+  workerSearch: string;
+  workers: WorkerView[];
+  onClose: () => void;
+  onSubmit: (event: React.FormEvent) => void;
+  onWorkerSearchChange: (value: string) => void;
+  onFormChange: React.Dispatch<React.SetStateAction<{ worker_id: string; name: string; cwd: string; command: string }>>;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <Card className="w-full max-w-md bg-card/95 shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <div>
+            <div className="text-sm font-semibold">Create session</div>
+            <div className="text-xs text-muted-foreground">Launch a new shell or agent process on a selected worker.</div>
+          </div>
+          <Button variant="ghost" size="icon-sm" onClick={onClose} title="Close">
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        <form className="space-y-3 p-4" onSubmit={onSubmit}>
+          <div className="space-y-2">
+            <div className="text-xs font-medium uppercase text-muted-foreground">Worker</div>
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={workerSearch}
+                onChange={(event) => onWorkerSearchChange(event.target.value)}
+                placeholder="Filter workers"
+                className="pl-9"
+              />
+            </div>
+            <Select value={createForm.worker_id} onChange={(event) => onFormChange((form) => ({ ...form, worker_id: event.target.value }))}>
+              <option value="">Select worker</option>
+              {workers.map((worker) => (
+                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)}</option>
+              ))}
+            </Select>
+            {workers.length === 0 ? <div className="text-xs text-muted-foreground">No workers matched the current filter.</div> : null}
+          </div>
+          <Input value={createForm.name} onChange={(event) => onFormChange((form) => ({ ...form, name: event.target.value }))} placeholder="session name" />
+          <Input value={createForm.cwd} onChange={(event) => onFormChange((form) => ({ ...form, cwd: event.target.value }))} placeholder="working directory" />
+          <Input value={createForm.command} onChange={(event) => onFormChange((form) => ({ ...form, command: event.target.value }))} placeholder="command" />
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" type="button" onClick={onClose}>Cancel</Button>
+            <Button type="submit">
+              <Plus className="h-4 w-4" />
+              Create Session
+            </Button>
+          </div>
+        </form>
+      </Card>
     </div>
   );
 }
@@ -1093,6 +1291,13 @@ function firstPaneId(node: LayoutNode): string {
   return node.type === "pane" ? node.id : firstPaneId(node.children[0]);
 }
 
+function clearSessionFromLayout(node: LayoutNode, sessionId: string): LayoutNode {
+  if (node.type === "pane") {
+    return node.sessionId === sessionId ? { ...node, sessionId: undefined } : node;
+  }
+  return { ...node, children: node.children.map((child) => clearSessionFromLayout(child, sessionId)) };
+}
+
 function setDragPayload(event: React.DragEvent, payload: DragPayload) {
   event.dataTransfer.effectAllowed = payload.kind === "pane" ? "move" : "copyMove";
   event.dataTransfer.setData(dragMime, JSON.stringify(payload));
@@ -1256,6 +1461,10 @@ function errorDetail(text: string) {
   }
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function readStoredUser(): AuthUser | null {
   const value = localStorage.getItem("agentmux.user");
   if (!value) return null;
@@ -1270,6 +1479,15 @@ function readStoredUser(): AuthUser | null {
 
 function workerDisplayLabel(worker: WorkerView) {
   return worker.name && worker.name !== worker.id ? `${worker.name} (${worker.id})` : worker.id;
+}
+
+function filterWorkers(workers: WorkerView[], query: string) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return workers;
+  return workers.filter((worker) => {
+    const haystacks = [worker.id, worker.name, worker.addr, workerDisplayLabel(worker)];
+    return haystacks.some((value) => value.toLowerCase().includes(needle));
+  });
 }
 
 function buildWorkerSessionGroups(workers: WorkerView[], sessions: SessionView[], workerFilter: string): WorkerSessionGroup[] {
