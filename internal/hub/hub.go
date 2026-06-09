@@ -119,6 +119,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/", s.handleLanding)
 	mux.HandleFunc("/agentmux-mark.svg", s.handleRootAsset)
 	mux.HandleFunc("/install.sh", s.handleInstallScript)
+	mux.HandleFunc("/device", s.handleDevicePage)
 	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/assets/", s.handleWebAssets)
 	mux.HandleFunc("/docassets/", s.handleDocAssets)
@@ -128,6 +129,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/exchange", s.handleExchange)
 	mux.HandleFunc("/api/auth/register", s.handleAuthRegister)
 	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/device/start", s.handleDeviceStart)
+	mux.HandleFunc("/api/auth/device/poll", s.handleDevicePoll)
+	mux.HandleFunc("/api/auth/device/approve", s.handleDeviceApprove)
 	mux.HandleFunc("/api/auth/oauth/", s.handleAuthOAuth)
 	mux.HandleFunc("/api/workers", s.requireRole("control", s.handleWorkers))
 	mux.HandleFunc("/api/sessions", s.requireRole("control", s.handleSessions))
@@ -253,7 +257,7 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 	if !auth.Admin {
 		tenantID = auth.Credential.TenantID
 	}
-	minted, err := s.auth.MintSignalForTenant(tenantID, defaultSignalTTL, 0, nil)
+	minted, err := s.auth.MintSignalForTenant(tenantID, defaultSignalTTL, 0, []string{"worker:join"})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -269,8 +273,8 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 		"reusable":        minted.UsesRemaining < 0,
 		"scopes":          minted.Scopes,
 		"worker_command":  installWorkerCommand(baseURL, minted.Signal),
-		"control_command": installControlCommand(baseURL, minted.Signal),
-		"control_url":     controlPageURL(baseURL, minted.Signal),
+		"control_command": installControlCommand(baseURL),
+		"control_url":     baseURL + "/control",
 	})
 }
 
@@ -326,6 +330,75 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleDeviceStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req deviceStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	response, err := s.auth.StartDeviceAuth(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	baseURL := s.requestBaseURL(r)
+	response.VerificationURL = baseURL + "/device"
+	response.VerificationURLComplete = baseURL + "/device?user_code=" + url.QueryEscape(response.UserCode)
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func (s *Server) handleDevicePoll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req devicePollRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	response, err := s.auth.PollDeviceAuth(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleDeviceApprove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req deviceApproveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	credential, err := s.auth.ApproveDeviceAuth(req)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleDevicePage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	data := struct {
+		UserCode string
+	}{UserCode: r.URL.Query().Get("user_code")}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = deviceTemplate.Execute(w, data)
 }
 
 func (s *Server) handleAuthOAuth(w http.ResponseWriter, r *http.Request) {
@@ -1003,7 +1076,7 @@ case "$ROLE" in
     exec "$BIN" worker join --hub "$HUB_WS" "$@"
     ;;
   control)
-    exec "$TUI_BIN" join --hub "$HUB_HTTP" "$@"
+    exec "$BIN" control login --hub "$HUB_HTTP" "$@"
     ;;
   *)
     echo "usage: install.sh worker|control [agentmux flags]" >&2
@@ -1011,17 +1084,6 @@ case "$ROLE" in
     ;;
 esac
 `
-
-func controlPageURL(baseURL string, token string) string {
-	u, err := url.Parse(baseURL + "/control")
-	if err != nil {
-		return baseURL + "/control"
-	}
-	q := u.Query()
-	q.Set("signal", token)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
 
 func serveEmbeddedControl(w http.ResponseWriter, r *http.Request) bool {
 	dist, err := fs.Sub(webDist, "webdist")
@@ -1036,6 +1098,66 @@ func serveEmbeddedControl(w http.ResponseWriter, r *http.Request) bool {
 	_, _ = w.Write(index)
 	return true
 }
+
+var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentMux Device Login</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #050607; color: #eef2f3; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 50% 0%, rgba(53,201,143,.18), transparent 34%), #050607; }
+    main { width: min(420px, calc(100vw - 32px)); border: 1px solid rgba(255,255,255,.12); border-radius: 8px; background: rgba(13,16,18,.92); box-shadow: 0 24px 80px rgba(0,0,0,.45); }
+    header { padding: 20px 22px 14px; border-bottom: 1px solid rgba(255,255,255,.1); }
+    h1 { margin: 0; font-size: 18px; letter-spacing: 0; }
+    p { margin: 8px 0 0; color: #9aa4aa; font-size: 13px; line-height: 1.5; }
+    form { display: grid; gap: 12px; padding: 18px 22px 22px; }
+    label { display: grid; gap: 6px; font-size: 12px; color: #9aa4aa; }
+    input { height: 38px; border-radius: 6px; border: 1px solid rgba(255,255,255,.14); background: #07090a; color: #eef2f3; padding: 0 11px; font-size: 14px; outline: none; }
+    input:focus { border-color: #35c98f; box-shadow: 0 0 0 2px rgba(53,201,143,.2); }
+    button { height: 38px; border: 1px solid #35c98f; border-radius: 6px; background: #35c98f; color: #02110b; font-weight: 650; cursor: pointer; }
+    #status { min-height: 18px; font-size: 12px; color: #9aa4aa; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>AgentMux device login</h1>
+      <p>Confirm the code shown in your terminal, then sign in to authorize this Control device.</p>
+    </header>
+    <form id="form">
+      <label>Code<input id="user_code" name="user_code" autocomplete="one-time-code" value="{{.UserCode}}" required></label>
+      <label>Email<input id="email" name="email" type="email" autocomplete="email" required></label>
+      <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Authorize Control</button>
+      <div id="status"></div>
+    </form>
+  </main>
+  <script>
+    document.getElementById('form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const status = document.getElementById('status');
+      status.textContent = 'Authorizing...';
+      const body = {
+        user_code: document.getElementById('user_code').value,
+        email: document.getElementById('email').value,
+        password: document.getElementById('password').value
+      };
+      const res = await fetch('/api/auth/device/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        status.textContent = await res.text();
+        return;
+      }
+      status.textContent = 'Authorized. You can return to your terminal.';
+    });
+  </script>
+</body>
+</html>`))
 
 var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html>
 <html lang="en">
@@ -1322,7 +1444,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
           </div>
           <div class="command">
             <div class="command-title"><span data-i18n="controlStep">Control side</span></div>
-            <pre data-i18n="controlStepBody">After the Worker is connected, open Web Control to preview sessions and create or attach tmux-backed agent workspaces.</pre>
+            <pre data-i18n="controlStepBody">After the Worker is connected, sign in to Web Control or run agentmux control login to manage tmux-backed agent workspaces.</pre>
           </div>
         </div>
       </section>
@@ -1356,7 +1478,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       </section>
 
       <footer class="footer">
-        <span data-i18n="footerSecurity">Default admin token stays local. Signals exchange into scoped credentials.</span>
+        <span data-i18n="footerSecurity">Default admin token stays local. Worker signals exchange into scoped credentials; Control devices sign in.</span>
         <span><span data-i18n="footerDocs">Docs</span>: README.md · docs/USAGE.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md · <a class="with-icon" href="{{.GitHubURL}}" rel="noreferrer"><svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>{{.ReleaseRepo}}</a></span>
       </footer>
     </main>
@@ -1408,14 +1530,14 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workerStep: 'Worker side',
         workerStepBody: 'Click Generate to create a short-lived command for the machine running tmux and agents.',
         controlStep: 'Control side',
-        controlStepBody: 'After the Worker is connected, open Web Control to preview sessions and create or attach tmux-backed agent workspaces.',
+        controlStepBody: 'After the Worker is connected, sign in to Web Control or run agentmux control login to manage tmux-backed agent workspaces.',
         selfHostTitle: 'Self-host Hub',
         selfHostLead: 'Only use this when you want to run your own Hub. The Docker image already defaults to port 8081 and stores data under /var/lib/agentmux.',
         runHubBinary: 'Run Hub with binary',
         runHubDocker: 'Run Hub with Docker',
         runHubPersist: 'Optional Docker persistence',
         quickTunnel: 'Optional tunnel when Hub has no public URL',
-        footerSecurity: 'Default admin token stays local. Signals exchange into scoped credentials.',
+        footerSecurity: 'Default admin token stays local. Worker signals exchange into scoped credentials; Control devices sign in.',
         footerDocs: 'Docs',
         generating: 'Generating signal...',
         failed: 'Failed: ',
@@ -1423,7 +1545,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         signal: 'Signal',
         workerCommand: 'Worker install command',
         webControl: 'Web Control',
-        controlCommand: 'Control app command',
+        controlCommand: 'Control login command',
         copy: 'Copy',
         copied: 'Copied'
       },
@@ -1460,14 +1582,14 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workerStep: 'Worker 侧',
         workerStepBody: '点击生成，为运行 tmux 和 agent 的机器创建一条限时 Worker 接入命令。',
         controlStep: 'Control 侧',
-        controlStepBody: 'Worker 接入后，打开 Web Control 预览会话，并创建或 attach tmux agent 工作区。',
+        controlStepBody: 'Worker 接入后，登录 Web Control 或运行 agentmux control login 来管理 tmux agent 工作区。',
         selfHostTitle: '自托管 Hub',
         selfHostLead: '只有当你想运行自己的 Hub 时才需要这里。Docker 镜像已默认使用 8081 端口，并把数据放在 /var/lib/agentmux。',
         runHubBinary: '用二进制运行 Hub',
         runHubDocker: '用 Docker 运行 Hub',
         runHubPersist: '可选 Docker 持久化',
         quickTunnel: 'Hub 无公网地址时可选穿透',
-        footerSecurity: '默认管理员 token 保持本地使用。信令会交换为受限凭证。',
+        footerSecurity: '默认管理员 token 保持本地使用。Worker 信令会交换为受限凭证；Control 设备通过登录接入。',
         footerDocs: '文档',
         generating: '正在生成信令...',
         failed: '失败：',
@@ -1475,7 +1597,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         signal: '信令',
         workerCommand: 'Worker 安装命令',
         webControl: '网页控制台',
-        controlCommand: 'Control 应用命令',
+        controlCommand: 'Control 登录命令',
         copy: '复制',
         copied: '已复制'
       }

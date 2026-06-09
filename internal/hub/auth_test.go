@@ -24,12 +24,8 @@ func TestAuthStoreSignalExchange(t *testing.T) {
 	if _, ok := store.Credential(credential.Credential); !ok {
 		t.Fatal("expected credential to authorize")
 	}
-	controlCredential, err := store.Exchange(exchangeRequest{Signal: minted.Signal, Role: "control"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if controlCredential.Credential == credential.Credential || controlCredential.Role != "control" {
-		t.Fatalf("unexpected control credential: %+v", controlCredential)
+	if _, err := store.Exchange(exchangeRequest{Signal: minted.Signal, Role: "control"}); err == nil {
+		t.Fatal("expected worker join signal to reject control exchange")
 	}
 }
 
@@ -99,12 +95,67 @@ func TestSQLiteAuthStorePersistsUsersAndSignals(t *testing.T) {
 	if loggedIn.TenantID != registered.TenantID {
 		t.Fatalf("tenant was not persisted: got %s want %s", loggedIn.TenantID, registered.TenantID)
 	}
-	credential, err := reopened.Exchange(exchangeRequest{Signal: minted.Signal, Role: "control"})
+	credential, err := reopened.Exchange(exchangeRequest{Signal: minted.Signal, Role: "worker"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if credential.TenantID != minted.TenantID || credential.Credential == "" {
 		t.Fatalf("unexpected persisted signal exchange: %+v", credential)
+	}
+}
+
+func TestAuthStoreDeviceLogin(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		testAuthStoreDeviceLogin(t, newAuthStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		store, err := OpenSQLiteAuthStore(t.TempDir() + "/agentmux.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		testAuthStoreDeviceLogin(t, store)
+	})
+}
+
+func testAuthStoreDeviceLogin(t *testing.T, store AuthStore) {
+	t.Helper()
+	registered, err := store.Register(registerRequest{
+		Email: "device@example.com", Password: "password123", Name: "Device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := store.StartDeviceAuth(deviceStartRequest{DeviceID: "cli", DeviceName: "CLI"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PollDeviceAuth(devicePollRequest{DeviceCode: start.DeviceCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending, got %+v", pending)
+	}
+	approved, err := store.ApproveDeviceAuth(deviceApproveRequest{
+		UserCode: start.UserCode, Email: "device@example.com", Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approved.TenantID != registered.TenantID || approved.Role != "control" {
+		t.Fatalf("unexpected approved credential: %+v", approved)
+	}
+	polled, err := store.PollDeviceAuth(devicePollRequest{DeviceCode: start.DeviceCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polled.Status != "approved" || polled.Credential == nil || polled.Credential.Credential != approved.Credential {
+		t.Fatalf("unexpected poll response: %+v", polled)
 	}
 }
 

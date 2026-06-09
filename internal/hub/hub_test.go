@@ -27,6 +27,27 @@ func TestAuthorized(t *testing.T) {
 	if server.authorized(req) {
 		t.Fatal("missing token should not authorize")
 	}
+	registered, err := server.auth.Register(registerRequest{
+		Email:      "user@example.com",
+		Password:   "password123",
+		Name:       "User",
+		DeviceName: "browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+registered.Credential)
+	if !server.authorized(req) {
+		t.Fatal("registered credential should authorize")
+	}
+	if !server.authorizedRole(req, "control") {
+		t.Fatal("control credential should authorize control routes")
+	}
+	if server.authorizedRole(req, "worker") {
+		t.Fatal("control credential should not authorize worker routes")
+	}
+
 	minted, err := server.auth.MintSignal(time.Minute, 1, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -35,21 +56,6 @@ func TestAuthorized(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+minted.Signal)
 	if server.authorized(req) {
 		t.Fatal("raw signal should not authorize normal APIs")
-	}
-	exchanged, err := server.auth.Exchange(exchangeRequest{Signal: minted.Signal, Role: "control"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	req.Header.Set("Authorization", "Bearer "+exchanged.Credential)
-	if !server.authorized(req) {
-		t.Fatal("exchanged credential should authorize")
-	}
-	if !server.authorizedRole(req, "control") {
-		t.Fatal("control credential should authorize control routes")
-	}
-	if server.authorizedRole(req, "worker") {
-		t.Fatal("control credential should not authorize worker routes")
 	}
 }
 
@@ -116,7 +122,7 @@ func TestLandingPageIncludesOpenSourceIdentityAndBilingualVisuals(t *testing.T) 
 	}
 }
 
-func TestSignalIncludesControlURL(t *testing.T) {
+func TestSignalIncludesWorkerJoinCommand(t *testing.T) {
 	server := New(":0", "secret", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
 	req.Host = "agentmux.test"
@@ -133,7 +139,7 @@ func TestSignalIncludesControlURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	controlURL, ok := payload["control_url"].(string)
-	if !ok || !strings.HasPrefix(controlURL, "http://agentmux.test/control?signal=amx_sig_") {
+	if !ok || controlURL != "http://agentmux.test/control" {
 		t.Fatalf("unexpected control_url: %#v", payload["control_url"])
 	}
 	signal, ok := payload["signal"].(string)
@@ -143,7 +149,7 @@ func TestSignalIncludesControlURL(t *testing.T) {
 	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL http://agentmux.test/install.sh") || strings.Contains(got, "go run") {
 		t.Fatalf("unexpected worker command: %s", got)
 	}
-	if got := payload["control_command"].(string); !strings.Contains(got, "curl -fsSL http://agentmux.test/install.sh") || strings.Contains(got, "go run") {
+	if got := payload["control_command"].(string); got != "agentmux control login --hub 'http://agentmux.test'" {
 		t.Fatalf("unexpected control command: %s", got)
 	}
 }
@@ -167,7 +173,7 @@ func TestSignalUsesConfiguredPublicURL(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if got := payload["control_url"].(string); !strings.HasPrefix(got, "https://mux.example.com/control?signal=amx_sig_") {
+	if got := payload["control_url"].(string); got != "https://mux.example.com/control" {
 		t.Fatalf("unexpected control URL: %s", got)
 	}
 	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL https://mux.example.com/install.sh") {
@@ -234,7 +240,7 @@ func TestRootMarkAssetEndpoint(t *testing.T) {
 	}
 }
 
-func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
+func TestSignalExchangeCredentialAuthorizesWorkerRole(t *testing.T) {
 	server := New(":0", "secret", nil)
 	signalReq := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
 	signalReq.Host = "agentmux.test"
@@ -248,7 +254,7 @@ func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
 	if err := json.NewDecoder(signalRec.Body).Decode(&signalPayload); err != nil {
 		t.Fatal(err)
 	}
-	body := []byte(`{"signal":"` + signalPayload["signal"].(string) + `","role":"control","device_name":"test"}`)
+	body := []byte(`{"signal":"` + signalPayload["signal"].(string) + `","role":"worker","device_name":"test"}`)
 	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/exchange", bytes.NewReader(body))
 	exchangeRec := httptest.NewRecorder()
 	server.handleExchange(exchangeRec, exchangeReq)
@@ -259,12 +265,13 @@ func TestSignalExchangeCredentialAuthorizesAPI(t *testing.T) {
 	if err := json.NewDecoder(exchangeRec.Body).Decode(&exchangePayload); err != nil {
 		t.Fatal(err)
 	}
-	apiReq := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
-	apiReq.Header.Set("Authorization", "Bearer "+exchangePayload["credential"].(string))
-	apiRec := httptest.NewRecorder()
-	server.requireRole("control", server.handleSessions)(apiRec, apiReq)
-	if apiRec.Code != http.StatusOK {
-		t.Fatalf("credential did not authorize api: %d body=%s", apiRec.Code, apiRec.Body.String())
+	roleReq := httptest.NewRequest(http.MethodGet, "/api/workers/ws", nil)
+	roleReq.Header.Set("Authorization", "Bearer "+exchangePayload["credential"].(string))
+	if !server.authorizedRole(roleReq, "worker") {
+		t.Fatal("exchanged credential should authorize worker role")
+	}
+	if server.authorizedRole(roleReq, "control") {
+		t.Fatal("worker credential should not authorize control role")
 	}
 }
 
@@ -292,15 +299,20 @@ func TestRegisterCredentialAuthorizesControlAPI(t *testing.T) {
 
 func TestControlCredentialSeesOnlyTenantWorkers(t *testing.T) {
 	server := New(":0", "", nil)
-	mintedA, err := server.auth.MintSignal(time.Minute, 0, nil)
+	controlCredA, err := server.auth.Register(registerRequest{
+		Email:      "tenant-a@example.com",
+		Password:   "password123",
+		Name:       "Tenant A",
+		DeviceName: "browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mintedA, err := server.auth.MintSignalForTenant(controlCredA.TenantID, time.Minute, 0, []string{"worker:join"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	workerCredA, err := server.auth.Exchange(exchangeRequest{Signal: mintedA.Signal, Role: "worker"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	controlCredA, err := server.auth.Exchange(exchangeRequest{Signal: mintedA.Signal, Role: "control"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,6 +383,59 @@ func TestControlCredentialMintsSignalForOwnTenant(t *testing.T) {
 	}
 	if exchanged.TenantID != registerPayload.TenantID {
 		t.Fatalf("expected exchanged worker tenant %s, got %s", registerPayload.TenantID, exchanged.TenantID)
+	}
+	if _, err := server.auth.Exchange(exchangeRequest{Signal: payload["signal"].(string), Role: "control"}); err == nil {
+		t.Fatal("expected worker join signal to reject control exchange")
+	}
+}
+
+func TestDeviceLoginEndpoints(t *testing.T) {
+	server := New(":0", "", nil)
+	registerBody := []byte(`{"email":"device@example.com","password":"password123","name":"Device","device_name":"browser"}`)
+	registerReq := httptest.NewRequest(http.MethodPost, "/api/auth/register", bytes.NewReader(registerBody))
+	registerRec := httptest.NewRecorder()
+	server.handleAuthRegister(registerRec, registerReq)
+	if registerRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected register status: %d body=%s", registerRec.Code, registerRec.Body.String())
+	}
+
+	startBody := []byte(`{"device_id":"cli","device_name":"CLI"}`)
+	startReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/start", bytes.NewReader(startBody))
+	startReq.Host = "agentmux.test"
+	startRec := httptest.NewRecorder()
+	server.handleDeviceStart(startRec, startReq)
+	if startRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected start status: %d body=%s", startRec.Code, startRec.Body.String())
+	}
+	var start deviceStartResponse
+	if err := json.NewDecoder(startRec.Body).Decode(&start); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(start.VerificationURLComplete, "http://agentmux.test/device?user_code=") {
+		t.Fatalf("unexpected verification URL: %s", start.VerificationURLComplete)
+	}
+
+	approveBody := []byte(`{"user_code":"` + start.UserCode + `","email":"device@example.com","password":"password123"}`)
+	approveReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/approve", bytes.NewReader(approveBody))
+	approveRec := httptest.NewRecorder()
+	server.handleDeviceApprove(approveRec, approveReq)
+	if approveRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected approve status: %d body=%s", approveRec.Code, approveRec.Body.String())
+	}
+
+	pollBody := []byte(`{"device_code":"` + start.DeviceCode + `"}`)
+	pollReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/poll", bytes.NewReader(pollBody))
+	pollRec := httptest.NewRecorder()
+	server.handleDevicePoll(pollRec, pollReq)
+	if pollRec.Code != http.StatusOK {
+		t.Fatalf("unexpected poll status: %d body=%s", pollRec.Code, pollRec.Body.String())
+	}
+	var poll devicePollResponse
+	if err := json.NewDecoder(pollRec.Body).Decode(&poll); err != nil {
+		t.Fatal(err)
+	}
+	if poll.Status != "approved" || poll.Credential == nil || poll.Credential.Role != "control" {
+		t.Fatalf("unexpected poll response: %+v", poll)
 	}
 }
 

@@ -724,7 +724,7 @@ function JoinSignalModal({
         <div className="space-y-4 p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="text-xs text-muted-foreground">
-              {tokenReady ? "Signal can be reused to add remote workers, CLI control, or Web Control." : "Sign in or apply a control token before generating join commands."}
+              {tokenReady ? "Signal is used only to add Worker devices. Control devices should sign in with an account." : "Sign in or apply a control token before generating worker join commands."}
             </div>
             <Button variant="secondary" size="sm" type="button" onClick={onGenerate} disabled={!tokenReady || loading}>
               <UserPlus className="h-4 w-4" />
@@ -734,9 +734,9 @@ function JoinSignalModal({
           {joinSignal ? (
             <div className="grid gap-3 md:grid-cols-2">
               <SignalCommand title="Signal" value={joinSignal.signal} mono={false} />
-              <SignalCommand title="Web Control" value={joinSignal.control_url} mono={false} />
               <SignalCommand title="Worker join" value={joinSignal.worker_command} />
-              <SignalCommand title="Control join" value={joinSignal.control_command} />
+              <SignalCommand title="Web Control login" value={joinSignal.control_url} mono={false} />
+              <SignalCommand title="CLI Control login" value={joinSignal.control_command || `agentmux control login --hub ${window.location.origin}`} />
               <div className="md:col-span-2 text-[11px] text-muted-foreground">
                 Tenant {joinSignal.tenant_id} · expires {new Date(joinSignal.expires_at).toLocaleString()}
               </div>

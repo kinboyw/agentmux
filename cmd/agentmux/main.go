@@ -325,6 +325,8 @@ func runControl(ctx context.Context, args []string) {
 		if err := app.Run(ctx); err != nil && err != context.Canceled {
 			fatal(err)
 		}
+	case "login":
+		runControlLogin(ctx, args[1:])
 	case "workers":
 		fs := controlFlags("workers", args[1:])
 		client := newControlClient(ctx, fs)
@@ -393,10 +395,33 @@ func resolveControlAppAuth(ctx context.Context, args []string) (control.AppAuthR
 	if common.hub == "" && (common.token != "" || common.join != "") {
 		common.hub = "http://127.0.0.1:8080"
 	}
+	if common.hub == "" {
+		common.hub = "http://127.0.0.1:8080"
+	}
 	return control.ResolveAppAuth(ctx, control.AppAuthOptions{
 		HubURL: common.hub, Token: common.token, Join: common.join,
-		DeviceID: *deviceID, DeviceName: *deviceName,
+		DeviceID: *deviceID, DeviceName: *deviceName, Login: true,
 	})
+}
+
+func runControlLogin(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	hubURL := fs.String("hub", "http://127.0.0.1:8080", "hub URL")
+	deviceID := fs.String("device-id", "", "stable control device id")
+	deviceName := fs.String("device-name", hostname(), "control device display name")
+	_ = fs.Parse(args)
+	auth, err := control.DeviceLogin(ctx, *hubURL, *deviceID, *deviceName, func(start control.DeviceStartResponse) {
+		fmt.Fprintln(os.Stderr, "Open this URL to sign in:")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, start.VerificationURLComplete)
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "Code: %s\n", start.UserCode)
+		fmt.Fprintln(os.Stderr, "Waiting for browser confirmation...")
+	})
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "control credential saved: tenant=%s device=%s\n", auth.TenantID, auth.DeviceID)
 }
 
 type commonControlFlags struct {
@@ -482,7 +507,7 @@ func usage() {
 }
 
 func controlUsage() {
-	fmt.Fprintln(os.Stderr, "usage: agentmux control <app|workers|list|create|send|stop|attach> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentmux control <login|app|workers|list|create|send|stop|attach> [options]")
 }
 
 func workerUsage() {

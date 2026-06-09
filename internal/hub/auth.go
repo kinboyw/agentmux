@@ -16,6 +16,7 @@ import (
 const (
 	defaultSignalTTL     = 10 * time.Minute
 	defaultCredentialTTL = 24 * time.Hour
+	defaultDeviceAuthTTL = 10 * time.Minute
 )
 
 type authStore struct {
@@ -23,6 +24,7 @@ type authStore struct {
 	signals     map[string]signalEntry
 	credentials map[string]credentialEntry
 	users       map[string]userEntry
+	devices     map[string]deviceAuthEntry
 }
 
 type AuthStore interface {
@@ -31,6 +33,9 @@ type AuthStore interface {
 	Exchange(req exchangeRequest) (exchangedCredential, error)
 	Register(req registerRequest) (authCredentialResponse, error)
 	Login(req loginRequest) (authCredentialResponse, error)
+	StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error)
+	ApproveDeviceAuth(req deviceApproveRequest) (authCredentialResponse, error)
+	PollDeviceAuth(req devicePollRequest) (devicePollResponse, error)
 	Credential(token string) (credentialEntry, bool)
 }
 
@@ -74,6 +79,20 @@ type userEntry struct {
 	PasswordSalt string
 	PasswordHash string
 	CreatedAt    time.Time
+}
+
+type deviceAuthEntry struct {
+	DeviceCodeHash string
+	UserCodeHash   string
+	UserCode       string
+	DeviceID       string
+	DeviceName     string
+	Status         string
+	UserEmail      string
+	Credential     string
+	ExpiresAt      time.Time
+	CreatedAt      time.Time
+	ApprovedAt     time.Time
 }
 
 type exchangedCredential struct {
@@ -126,11 +145,43 @@ type loginRequest struct {
 	DeviceName string `json:"device_name"`
 }
 
+type deviceStartRequest struct {
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+}
+
+type deviceStartResponse struct {
+	DeviceCode              string    `json:"device_code"`
+	UserCode                string    `json:"user_code"`
+	VerificationURL         string    `json:"verification_url"`
+	VerificationURLComplete string    `json:"verification_url_complete"`
+	ExpiresAt               time.Time `json:"expires_at"`
+	Interval                int       `json:"interval"`
+}
+
+type deviceApproveRequest struct {
+	UserCode string `json:"user_code"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type devicePollRequest struct {
+	DeviceCode string `json:"device_code"`
+}
+
+type devicePollResponse struct {
+	Status     string                  `json:"status"`
+	Credential *authCredentialResponse `json:"credential,omitempty"`
+	Interval   int                     `json:"interval,omitempty"`
+	ExpiresAt  time.Time               `json:"expires_at,omitempty"`
+}
+
 func newAuthStore() *authStore {
 	return &authStore{
 		signals:     map[string]signalEntry{},
 		credentials: map[string]credentialEntry{},
 		users:       map[string]userEntry{},
+		devices:     map[string]deviceAuthEntry{},
 	}
 }
 
@@ -146,7 +197,7 @@ func (s *authStore) MintSignalForTenant(tenantID string, ttl time.Duration, uses
 		uses = -1
 	}
 	if len(scopes) == 0 {
-		scopes = []string{"worker:join", "control:join"}
+		scopes = []string{"worker:join"}
 	}
 	token, err := randomToken("amx_sig_")
 	if err != nil {
@@ -275,6 +326,117 @@ func (s *authStore) Login(req loginRequest) (authCredentialResponse, error) {
 	return s.issueCredentialLocked(user, "control", req.DeviceID, req.DeviceName, now)
 }
 
+func (s *authStore) StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error) {
+	deviceCode, err := randomToken("amx_dev_")
+	if err != nil {
+		return deviceStartResponse{}, err
+	}
+	userCode, err := randomUserCode()
+	if err != nil {
+		return deviceStartResponse{}, err
+	}
+	now := time.Now().UTC()
+	deviceID := strings.TrimSpace(req.DeviceID)
+	if deviceID == "" {
+		deviceID = "dev_" + randomID()
+	}
+	entry := deviceAuthEntry{
+		DeviceCodeHash: tokenHash(deviceCode),
+		UserCodeHash:   tokenHash(normalizeUserCode(userCode)),
+		UserCode:       userCode,
+		DeviceID:       deviceID,
+		DeviceName:     strings.TrimSpace(req.DeviceName),
+		Status:         "pending",
+		ExpiresAt:      now.Add(defaultDeviceAuthTTL),
+		CreatedAt:      now,
+	}
+	s.mu.Lock()
+	s.cleanupLocked(now)
+	s.devices[entry.DeviceCodeHash] = entry
+	s.mu.Unlock()
+	return deviceStartResponse{
+		DeviceCode: deviceCode, UserCode: userCode,
+		ExpiresAt: entry.ExpiresAt, Interval: 2,
+	}, nil
+}
+
+func (s *authStore) ApproveDeviceAuth(req deviceApproveRequest) (authCredentialResponse, error) {
+	code := normalizeUserCode(req.UserCode)
+	if code == "" {
+		return authCredentialResponse{}, fmt.Errorf("user code is required")
+	}
+	email := normalizeEmail(req.Email)
+	if email == "" || req.Password == "" {
+		return authCredentialResponse{}, fmt.Errorf("email and password are required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	user, ok := s.users[email]
+	if !ok || !passwordMatches(req.Password, user.PasswordSalt, user.PasswordHash) {
+		return authCredentialResponse{}, fmt.Errorf("invalid email or password")
+	}
+	var deviceHash string
+	var device deviceAuthEntry
+	for hash, entry := range s.devices {
+		if entry.UserCodeHash == tokenHash(code) {
+			deviceHash = hash
+			device = entry
+			break
+		}
+	}
+	if deviceHash == "" || now.After(device.ExpiresAt) {
+		return authCredentialResponse{}, fmt.Errorf("invalid or expired device code")
+	}
+	if device.Status != "pending" {
+		return authCredentialResponse{}, fmt.Errorf("device authorization is %s", device.Status)
+	}
+	credential, err := s.issueCredentialLocked(user, "control", device.DeviceID, device.DeviceName, now)
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	device.Status = "approved"
+	device.UserEmail = user.Email
+	device.Credential = credential.Credential
+	device.ApprovedAt = now
+	s.devices[deviceHash] = device
+	return credential, nil
+}
+
+func (s *authStore) PollDeviceAuth(req devicePollRequest) (devicePollResponse, error) {
+	if req.DeviceCode == "" {
+		return devicePollResponse{}, fmt.Errorf("device code is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	device, ok := s.devices[tokenHash(req.DeviceCode)]
+	if !ok || now.After(device.ExpiresAt) {
+		return devicePollResponse{Status: "expired"}, nil
+	}
+	if device.Status != "approved" {
+		return devicePollResponse{Status: device.Status, Interval: 2, ExpiresAt: device.ExpiresAt}, nil
+	}
+	credential, ok := s.credentials[tokenHash(device.Credential)]
+	if !ok {
+		return devicePollResponse{}, fmt.Errorf("approved credential is missing")
+	}
+	user, ok := s.users[device.UserEmail]
+	if !ok {
+		return devicePollResponse{}, fmt.Errorf("approved user is missing")
+	}
+	response := authCredentialResponse{
+		Credential: device.Credential, CredentialID: credential.ID, TenantID: credential.TenantID,
+		Role: credential.Role, DeviceID: credential.DeviceID, ExpiresAt: credential.ExpiresAt,
+		Scopes: append([]string(nil), credential.Scopes...),
+		User:   authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+	}
+	delete(s.devices, tokenHash(req.DeviceCode))
+	return devicePollResponse{Status: "approved", Credential: &response}, nil
+}
+
 func (s *authStore) issueCredentialLocked(user userEntry, role, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
 	credential, err := randomToken("amx_cred_")
 	if err != nil {
@@ -325,6 +487,11 @@ func (s *authStore) cleanupLocked(now time.Time) {
 			delete(s.credentials, hash)
 		}
 	}
+	for hash, entry := range s.devices {
+		if now.After(entry.ExpiresAt) {
+			delete(s.devices, hash)
+		}
+	}
 }
 
 func credentialScopes(role string) []string {
@@ -350,6 +517,23 @@ func randomID() string {
 	return base64.RawURLEncoding.EncodeToString(raw[:])
 }
 
+func randomUserCode() (string, error) {
+	var raw [5]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	out := make([]byte, 9)
+	for i := range out {
+		if i == 4 {
+			out[i] = '-'
+			continue
+		}
+		out[i] = alphabet[int(raw[i%len(raw)])%len(alphabet)]
+	}
+	return string(out), nil
+}
+
 func tokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
@@ -359,8 +543,8 @@ func installWorkerCommand(baseURL string, signal string) string {
 	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- worker --join %s --name \"$(hostname)\"", baseURL, shellQuote(signal))
 }
 
-func installControlCommand(baseURL string, signal string) string {
-	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- control --join %s", baseURL, shellQuote(signal))
+func installControlCommand(baseURL string) string {
+	return fmt.Sprintf("agentmux control login --hub %s", shellQuote(baseURL))
 }
 
 func websocketBase(baseURL string) string {
@@ -379,6 +563,15 @@ func shellQuote(value string) string {
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func normalizeUserCode(code string) string {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	code = strings.ReplaceAll(code, "-", "")
+	if len(code) > 4 {
+		code = code[:4] + "-" + code[4:]
+	}
+	return code
 }
 
 func passwordDigest(password string) (string, string, error) {
