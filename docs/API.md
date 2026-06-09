@@ -81,8 +81,8 @@ Response:
   "uses_remaining": -1,
   "reusable": true,
   "scopes": ["worker:join", "control:join"],
-  "worker_command": "go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join 'amx_sig_...' --name $(hostname)",
-  "control_command": "go run ./cmd/agentmux control list --hub http://127.0.0.1:8081 --join 'amx_sig_...'",
+  "worker_command": "curl -fsSL http://127.0.0.1:8081/install.sh | sh -s -- worker --join 'amx_sig_...' --name \"$(hostname)\"",
+  "control_command": "curl -fsSL http://127.0.0.1:8081/install.sh | sh -s -- control --join 'amx_sig_...'",
   "control_url": "http://127.0.0.1:8081/control?signal=amx_sig_..."
 }
 ```

@@ -127,6 +127,12 @@ func TestSignalIncludesControlURL(t *testing.T) {
 	if !ok || !strings.HasPrefix(signal, "amx_sig_") {
 		t.Fatalf("unexpected signal: %#v", payload["signal"])
 	}
+	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL http://agentmux.test/install.sh") || strings.Contains(got, "go run") {
+		t.Fatalf("unexpected worker command: %s", got)
+	}
+	if got := payload["control_command"].(string); !strings.Contains(got, "curl -fsSL http://agentmux.test/install.sh") || strings.Contains(got, "go run") {
+		t.Fatalf("unexpected control command: %s", got)
+	}
 }
 
 func TestSignalUsesConfiguredPublicURL(t *testing.T) {
@@ -150,8 +156,8 @@ func TestSignalUsesConfiguredPublicURL(t *testing.T) {
 	if got := payload["control_url"].(string); !strings.HasPrefix(got, "https://mux.example.com/control?signal=amx_sig_") {
 		t.Fatalf("unexpected control URL: %s", got)
 	}
-	if got := payload["worker_command"].(string); !strings.Contains(got, "--hub wss://mux.example.com") {
-		t.Fatalf("worker command did not use wss public URL: %s", got)
+	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL https://mux.example.com/install.sh") {
+		t.Fatalf("worker command did not use public install script URL: %s", got)
 	}
 }
 
@@ -193,6 +199,24 @@ func TestDocAssetsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "AgentMux mark") {
 		t.Fatalf("unexpected doc asset body: %s", rec.Body.String())
+	}
+}
+
+func TestRootMarkAssetEndpoint(t *testing.T) {
+	server := New(":0", "", nil)
+	req := httptest.NewRequest(http.MethodGet, "/agentmux-mark.svg", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleRootAsset(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/svg+xml" {
+		t.Fatalf("unexpected content type: %s", got)
+	}
+	if !strings.Contains(rec.Body.String(), "AgentMux mark") {
+		t.Fatalf("unexpected root asset body: %s", rec.Body.String())
 	}
 }
 

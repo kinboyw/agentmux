@@ -347,11 +347,11 @@ func tokenHash(token string) string {
 }
 
 func installWorkerCommand(baseURL string, signal string) string {
-	return fmt.Sprintf("go run ./cmd/agentmux worker --hub %s --join %s --name $(hostname)", websocketBase(baseURL), shellQuote(signal))
+	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- worker --join %s --name \"$(hostname)\"", baseURL, shellQuote(signal))
 }
 
 func installControlCommand(baseURL string, signal string) string {
-	return fmt.Sprintf("go run ./cmd/agentmux control list --hub %s --join %s", baseURL, shellQuote(signal))
+	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- control --join %s", baseURL, shellQuote(signal))
 }
 
 func websocketBase(baseURL string) string {

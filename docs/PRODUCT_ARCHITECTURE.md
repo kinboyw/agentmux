@@ -253,10 +253,9 @@ go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join amx_sig_xxx --name
 `--join` performs signal exchange and uses the returned credential as the
 runtime bearer token. `--token` remains as a local development/admin override.
 
-The current `/install.sh` endpoint is intentionally conservative: it uses an
-existing `agentmux` binary from `PATH`, or builds from source when run inside the
-repository. Release assets from GitHub Actions will later let the script fetch
-the correct OS/architecture binary automatically.
+The `/install.sh` endpoint is intentionally conservative: it uses an existing
+`agentmux` binary from `PATH`, builds from source when run inside a checkout, or
+downloads the matching Linux/macOS release archive from GitHub.
 
 ## Trust and Token Model
 

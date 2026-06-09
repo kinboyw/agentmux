@@ -117,6 +117,7 @@ func defaultReleaseRepo(repo string) string {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleLanding)
+	mux.HandleFunc("/agentmux-mark.svg", s.handleRootAsset)
 	mux.HandleFunc("/install.sh", s.handleInstallScript)
 	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/assets/", s.handleWebAssets)
@@ -200,6 +201,23 @@ func (s *Server) handleDocAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.StripPrefix("/docassets/", http.FileServer(http.FS(assets))).ServeHTTP(w, r)
+}
+
+func (s *Server) handleRootAsset(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/agentmux-mark.svg" {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := webDist.ReadFile("webdist/agentmux-mark.svg")
+	if err != nil {
+		data, err = webDist.ReadFile("docassets/agentmux-mark.svg")
+	}
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/svg+xml")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
@@ -1253,14 +1271,14 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="panel-head">
           <div>
             <h2 data-i18n="quickTitle">Quick Start</h2>
-            <p data-i18n="quickLead">Generate a signal, then use the commands below before it expires.</p>
+            <p data-i18n="quickLead">Install the release binary through the generated script, then connect before the signal expires.</p>
           </div>
           <button id="mint2" data-i18n="generate">Generate</button>
         </div>
         <div id="result" class="grid">
           <div class="command">
-            <div class="command-title"><span data-i18n="localHub">Local hub</span></div>
-            <pre>agentmux hub --addr 0.0.0.0:8080 --data ./agentmux.db --public-url {{.BaseURL}}</pre>
+            <div class="command-title"><span data-i18n="installBinary">Install binary</span></div>
+            <pre>curl -fsSL {{.BaseURL}}/install.sh | sh -s -- control --join amx_sig_...</pre>
           </div>
           <div class="command">
             <div class="command-title"><span data-i18n="cloudflareTunnel">Cloudflare tunnel</span></div>
@@ -1313,9 +1331,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: 'Multi-pane Web Control',
         workspaceBody: 'Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.',
         quickTitle: 'Quick Start',
-        quickLead: 'Generate a signal, then use the commands below before it expires.',
+        quickLead: 'Install the release binary through the generated script, then connect before the signal expires.',
         generate: 'Generate',
-        localHub: 'Local hub',
+        installBinary: 'Install binary',
         cloudflareTunnel: 'Cloudflare tunnel',
         footerSecurity: 'Default admin token stays local. Signals exchange into scoped credentials.',
         footerDocs: 'Docs',
@@ -1323,11 +1341,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         failed: 'Failed: ',
         signalReady: 'Signal ready · expires ',
         signal: 'Signal',
-        workerDev: 'Worker source/dev',
-        workerScript: 'Worker one-line script',
+        workerCommand: 'Worker install command',
         webControl: 'Web Control',
-        controlCLI: 'Control CLI',
-        controlScript: 'Control app script',
+        controlCommand: 'Control app command',
         copy: 'Copy',
         copied: 'Copied'
       },
@@ -1358,9 +1374,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: '多窗格网页控制台',
         workspaceBody: '在紧凑的浏览器工作区里操作多个长期运行的 tmux agent 会话。',
         quickTitle: '快速开始',
-        quickLead: '生成一个信令，然后在过期前使用下面的命令接入。',
+        quickLead: '通过生成的脚本安装 release 二进制，然后在信令过期前完成接入。',
         generate: '生成',
-        localHub: '本地 Hub',
+        installBinary: '安装二进制',
         cloudflareTunnel: 'Cloudflare Tunnel',
         footerSecurity: '默认管理员 token 保持本地使用。信令会交换为受限凭证。',
         footerDocs: '文档',
@@ -1368,11 +1384,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         failed: '失败：',
         signalReady: '信令已就绪 · 过期时间 ',
         signal: '信令',
-        workerDev: 'Worker 源码/开发模式',
-        workerScript: 'Worker 一行安装脚本',
+        workerCommand: 'Worker 安装命令',
         webControl: '网页控制台',
-        controlCLI: 'Control CLI',
-        controlScript: 'Control 应用脚本',
+        controlCommand: 'Control 应用命令',
         copy: '复制',
         copied: '已复制'
       }
@@ -1407,11 +1421,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       status.textContent = t('signalReady') + new Date(data.expires_at).toLocaleString();
       result.innerHTML =
         commandBlock(t('signal'), signal, false) +
-        commandBlock(t('workerDev'), data.worker_command, true) +
-        commandBlock(t('workerScript'), 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- worker --join ' + shellQuote(signal) + ' --name "$(hostname)"', true) +
+        commandBlock(t('workerCommand'), data.worker_command, true) +
         commandBlock(t('webControl'), data.control_url, false) +
-        commandBlock(t('controlCLI'), data.control_command, true) +
-        commandBlock(t('controlScript'), 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- control --join ' + shellQuote(signal), true);
+        commandBlock(t('controlCommand'), data.control_command, true);
     }
     function setLanguage(lang) {
       currentLang = dictionaries[lang] ? lang : 'en';
