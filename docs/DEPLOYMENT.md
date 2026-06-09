@@ -92,7 +92,7 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- control --join 'amx_sig
 By default the script downloads release assets from:
 
 ```text
-https://github.com/SiriusNEO/agentmux/releases
+https://github.com/kinboyw/agentmux/releases
 ```
 
 Override this at Hub startup if your repo path differs:

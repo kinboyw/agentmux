@@ -45,7 +45,7 @@ func runHub(ctx context.Context, args []string) {
 	token := fs.String("token", os.Getenv("AGENTMUX_TOKEN"), "shared auth token")
 	data := fs.String("data", os.Getenv("AGENTMUX_DATA"), "SQLite database path for persistent hub state")
 	publicURL := fs.String("public-url", os.Getenv("AGENTMUX_PUBLIC_URL"), "external hub URL used for generated HTTPS/WSS commands")
-	releaseRepo := fs.String("release-repo", getenv("AGENTMUX_RELEASE_REPO", "SiriusNEO/agentmux"), "GitHub owner/repo used by generated install.sh")
+	releaseRepo := fs.String("release-repo", getenv("AGENTMUX_RELEASE_REPO", "kinboyw/agentmux"), "GitHub owner/repo used by generated install.sh")
 	_ = fs.Parse(args)
 	var authStore hub.AuthStore
 	if *data != "" {

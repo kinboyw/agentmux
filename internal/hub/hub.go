@@ -109,7 +109,7 @@ func defaultAuthStore(store AuthStore) AuthStore {
 func defaultReleaseRepo(repo string) string {
 	repo = strings.TrimSpace(repo)
 	if repo == "" {
-		return "SiriusNEO/agentmux"
+		return "kinboyw/agentmux"
 	}
 	return repo
 }
