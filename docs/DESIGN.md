@@ -66,6 +66,8 @@ The only required invariant is:
 
 > The agent must believe it is running in an ordinary shell inside tmux.
 
+![AgentMux shell-layer design](assets/visuals/agentmux-5-agent-unaware-shell-layer-v1.png)
+
 AgentMux never modifies agent binaries, never injects plugins, and never uses
 agent-specific remote APIs. The worker either creates:
 
@@ -106,4 +108,3 @@ The architecture leaves room for:
 - session recording
 - RBAC
 - direct PTY bridge
-

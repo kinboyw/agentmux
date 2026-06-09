@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="docs/assets/brand/agentmux-logo.svg" alt="AgentMux" width="520">
+</p>
+
 # AgentMux
+
+[English](README.md) | [中文](README.zh-CN.md)
 
 AgentMux is a tmux-first control plane for long-lived coding-agent sessions.
 It is designed as one Go binary with three roles:
@@ -10,6 +16,8 @@ It is designed as one Go binary with three roles:
 
 The agent is intentionally unaware of AgentMux. Codex, Claude, Gemini, OpenCode,
 or a shell simply run inside tmux. Worker observes and controls tmux.
+
+![AgentMux system architecture](docs/assets/visuals/agentmux-1-system-architecture-v1.png)
 
 ## Quick Start
 
@@ -51,6 +59,8 @@ Current credentials and users are in-memory; restarting the Hub clears them.
 GitHub and Google buttons are wired to OAuth provider endpoints, but providers
 are not configured yet.
 
+![AgentMux Web Control workspace](docs/assets/visuals/agentmux-4-web-control-workspace-v1.png)
+
 Persistent Hub mode uses SQLite:
 
 ```bash
@@ -77,6 +87,8 @@ Cloudflare terminates HTTPS and forwards WebSocket upgrades to the Go Hub. The
 Hub generates `wss://...` worker URLs automatically when the public URL is
 HTTPS.
 
+![AgentMux Cloudflare deployment](docs/assets/visuals/agentmux-3-cloudflare-deployment-v1.png)
+
 See [Deployment](docs/DEPLOYMENT.md) for Docker Compose, systemd, Cloudflare
 Tunnel, and release install script details.
 
@@ -89,6 +101,8 @@ Signal-based onboarding:
 
 Signals look like `amx_sig_...` and are exchanged for scoped `amx_cred_...`
 credentials before normal API or WebSocket access.
+
+![AgentMux signal onboarding](docs/assets/visuals/agentmux-2-zero-tier-style-onboarding-v1.png)
 
 Terminal 1:
 
@@ -140,3 +154,4 @@ mise exec -- go build -o dist/agentmux ./cmd/agentmux
 - [Deployment](docs/DEPLOYMENT.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Visual Prompt Library](docs/visual-prompts/README.md)
+- [GitHub Repository Metadata](docs/GITHUB.md)

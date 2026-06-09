@@ -79,6 +79,31 @@ func TestHandleControlPage(t *testing.T) {
 	}
 }
 
+func TestLandingPageIncludesOpenSourceIdentityAndBilingualVisuals(t *testing.T) {
+	server := New(":0", "", nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "agentmux.test"
+	rec := httptest.NewRecorder()
+
+	server.handleLanding(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"https://github.com/kinboyw/agentmux",
+		`data-lang="zh"`,
+		`data-full="/docassets/system-architecture.png"`,
+		`id="lightbox"`,
+		"把所有 agent 会话收回到一个 Hub。",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("landing page missing %q", want)
+		}
+	}
+}
+
 func TestSignalIncludesControlURL(t *testing.T) {
 	server := New(":0", "", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
@@ -153,6 +178,21 @@ func TestInstallScriptEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(body, "releases/latest/download") {
 		t.Fatalf("release download path missing from install script:\n%s", body)
+	}
+}
+
+func TestDocAssetsEndpoint(t *testing.T) {
+	server := New(":0", "", nil)
+	req := httptest.NewRequest(http.MethodGet, "/docassets/agentmux-mark.svg", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleDocAssets(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "AgentMux mark") {
+		t.Fatalf("unexpected doc asset body: %s", rec.Body.String())
 	}
 }
 

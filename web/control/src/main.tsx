@@ -12,7 +12,6 @@ import {
   RefreshCw,
   SplitSquareHorizontal,
   SplitSquareVertical,
-  TerminalSquare,
   UserPlus,
   X,
 } from "lucide-react";
@@ -288,7 +287,7 @@ function App() {
       <aside className={cn("flex h-full shrink-0 flex-col border-r border-border bg-card transition-all", sidebarOpen ? "w-80" : "w-0 overflow-hidden")}>
         <div className="flex h-14 items-center justify-between border-b border-border px-3">
           <div className="flex items-center gap-2 text-sm font-semibold">
-            <TerminalSquare className="h-4 w-4 text-primary" />
+            <img src="/agentmux-mark.svg" alt="" className="h-5 w-5 rounded-md" />
             AgentMux
           </div>
           <Button variant="ghost" size="icon" onClick={() => setSidebarOpen(false)} title="Hide sidebar">

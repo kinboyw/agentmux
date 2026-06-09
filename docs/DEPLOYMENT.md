@@ -4,6 +4,8 @@ AgentMux Hub is a single Go binary. The production path is to run the Hub on a
 server, keep SQLite on local disk, and put HTTPS/WSS in front of it with
 Cloudflare Tunnel or another reverse proxy.
 
+![AgentMux Cloudflare deployment](assets/visuals/agentmux-3-cloudflare-deployment-v1.png)
+
 ## Binary + Cloudflare Tunnel
 
 Install a release binary into `/usr/local/bin/agentmux`, then create config:

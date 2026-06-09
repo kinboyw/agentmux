@@ -28,6 +28,8 @@ Add a browser control surface using xterm.js.
 
 This should become the preferred UI for phones and laptops.
 
+![AgentMux Web Control workspace](assets/visuals/agentmux-4-web-control-workspace-v1.png)
+
 ## Phase 3: Signal Exchange And Tenant-Aware Auth
 
 Replace prototype direct join-token auth with a bootstrap exchange model.
@@ -81,3 +83,5 @@ Expected benefits:
 
 This is more complex than byte streaming because terminal output is a stateful
 protocol, not plain text.
+
+![AgentMux relay versus direct mode](assets/visuals/agentmux-7-relay-vs-direct-mode-v1.png)

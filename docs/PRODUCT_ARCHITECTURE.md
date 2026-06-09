@@ -16,6 +16,8 @@ The core invariant remains:
 > Workers own local tmux/PTY state. Hub coordinates identity, discovery, routing,
 > and policy. Control renders and operates sessions.
 
+![AgentMux system architecture](assets/visuals/agentmux-1-system-architecture-v1.png)
+
 ## Roles
 
 ### Hub
@@ -118,6 +120,8 @@ HTTP storage service. It is not the simplest persistence backend for the current
 Go binary because D1 is exposed inside Cloudflare Workers rather than as a local
 SQLite file.
 
+![AgentMux Cloudflare deployment](assets/visuals/agentmux-3-cloudflare-deployment-v1.png)
+
 ## Onboarding Model
 
 ### Anonymous Flow
@@ -216,6 +220,8 @@ Response:
 The current in-memory implementation may issue reusable credentials for a short
 period. Production credentials should be revocable, auditable, tenant-scoped,
 and persisted.
+
+![AgentMux token and tenant model](assets/visuals/agentmux-6-token-and-tenant-model-v1.png)
 
 ## Deployment Command
 
@@ -351,6 +357,8 @@ Hub responsibilities in direct mode:
 - fall back to relay mode
 
 Direct mode should be optional. Relay mode remains the reliable default.
+
+![AgentMux relay versus direct mode](assets/visuals/agentmux-7-relay-vs-direct-mode-v1.png)
 
 ## Plan B: Headless Terminal State
 

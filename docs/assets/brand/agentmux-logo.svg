@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 128" role="img" aria-labelledby="title desc">
+  <title id="title">AgentMux logo</title>
+  <desc id="desc">AgentMux wordmark with terminal-hub mark.</desc>
+  <defs>
+    <linearGradient id="agentmux-logo-gradient" x1="18" y1="14" x2="110" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#35c98f"/>
+      <stop offset="1" stop-color="#76a9ff"/>
+    </linearGradient>
+    <filter id="agentmux-logo-glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.207 0 0 0 0 0.788 0 0 0 0 0.561 0 0 0 .32 0"/>
+      <feBlend in="SourceGraphic"/>
+    </filter>
+  </defs>
+  <rect width="520" height="128" rx="28" fill="#070909"/>
+  <g transform="translate(10 10)">
+    <rect width="108" height="108" rx="24" fill="#101414" stroke="#273131" stroke-width="2"/>
+    <g filter="url(#agentmux-logo-glow)">
+      <path d="M20 33l18 21-18 21" fill="none" stroke="url(#agentmux-logo-gradient)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M44 75h18" fill="none" stroke="#edf5f2" stroke-width="8" stroke-linecap="round"/>
+      <circle cx="72" cy="33" r="7" fill="#35c98f"/>
+      <circle cx="80" cy="54" r="7" fill="#76a9ff"/>
+      <circle cx="72" cy="75" r="7" fill="#35c98f"/>
+      <path d="M61 54h19M72 40v28" fill="none" stroke="url(#agentmux-logo-gradient)" stroke-width="5" stroke-linecap="round"/>
+    </g>
+  </g>
+  <text x="146" y="76" fill="#edf5f2" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="46" font-weight="760" letter-spacing="0">AgentMux</text>
+  <text x="149" y="102" fill="#9fb0aa" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="15" font-weight="500" letter-spacing="0">tmux-first control plane for coding agents</text>
+</svg>

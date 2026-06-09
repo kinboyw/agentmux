@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">AgentMux mark</title>
+  <desc id="desc">A terminal prompt routed through a hub into multiple session paths.</desc>
+  <defs>
+    <linearGradient id="agentmux-mark-gradient" x1="18" y1="14" x2="110" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#35c98f"/>
+      <stop offset="1" stop-color="#76a9ff"/>
+    </linearGradient>
+    <filter id="agentmux-mark-glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.207 0 0 0 0 0.788 0 0 0 0 0.561 0 0 0 .38 0"/>
+      <feBlend in="SourceGraphic"/>
+    </filter>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#070909"/>
+  <rect x="11" y="11" width="106" height="106" rx="23" fill="#101414" stroke="#273131" stroke-width="2"/>
+  <g filter="url(#agentmux-mark-glow)">
+    <path d="M31 43l18 21-18 21" fill="none" stroke="url(#agentmux-mark-gradient)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M55 85h18" fill="none" stroke="#edf5f2" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="83" cy="43" r="7" fill="#35c98f"/>
+    <circle cx="91" cy="64" r="7" fill="#76a9ff"/>
+    <circle cx="83" cy="85" r="7" fill="#35c98f"/>
+    <path d="M72 64h19M83 50v28" fill="none" stroke="url(#agentmux-mark-gradient)" stroke-width="5" stroke-linecap="round"/>
+  </g>
+</svg>

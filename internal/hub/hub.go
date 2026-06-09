@@ -21,7 +21,7 @@ import (
 	"private/agentmux/internal/ws"
 )
 
-//go:embed webdist
+//go:embed webdist docassets
 var webDist embed.FS
 
 type Server struct {
@@ -120,6 +120,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/install.sh", s.handleInstallScript)
 	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/assets/", s.handleWebAssets)
+	mux.HandleFunc("/docassets/", s.handleDocAssets)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/signals", s.handleSignals)
 	mux.HandleFunc("/api/join-tokens", s.handleJoinTokens)
@@ -190,6 +191,15 @@ func (s *Server) handleWebAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.FileServer(http.FS(dist)).ServeHTTP(w, r)
+}
+
+func (s *Server) handleDocAssets(w http.ResponseWriter, r *http.Request) {
+	assets, err := fs.Sub(webDist, "docassets")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.StripPrefix("/docassets/", http.FileServer(http.FS(assets))).ServeHTTP(w, r)
 }
 
 func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
@@ -994,161 +1004,450 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
   <style>
     :root {
       color-scheme: dark;
-      --bg: #070909;
-      --panel: #101414;
-      --panel-2: #171d1d;
-      --line: #273131;
-      --text: #edf5f2;
+      --bg: #050707;
+      --panel: rgba(13, 18, 18, .78);
+      --panel-2: rgba(22, 29, 29, .88);
+      --line: rgba(132, 154, 146, .22);
+      --text: #edf7f3;
       --muted: #9fb0aa;
-      --accent: #35c98f;
-      --accent-2: #76a9ff;
-      --warn: #f2b84b;
+      --accent: #36d693;
+      --accent-2: #79a9ff;
+      --accent-3: #b68cff;
+      --warn: #f2c14e;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     * { box-sizing: border-box; }
-    html { min-height: 100%; background: var(--bg); }
-    body { margin: 0; background: radial-gradient(circle at 70% 10%, rgba(53, 201, 143, .14), transparent 32rem), var(--bg); color: var(--text); }
+    html { min-height: 100%; background: var(--bg); scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        linear-gradient(120deg, rgba(54, 214, 147, .12), transparent 34%),
+        radial-gradient(circle at 78% 12%, rgba(121, 169, 255, .18), transparent 28rem),
+        radial-gradient(circle at 22% 42%, rgba(182, 140, 255, .12), transparent 30rem),
+        var(--bg);
+      overflow-x: hidden;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -20%;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 25% 22%, rgba(54, 214, 147, .16), transparent 26rem),
+        radial-gradient(circle at 76% 28%, rgba(121, 169, 255, .14), transparent 24rem),
+        linear-gradient(115deg, transparent 20%, rgba(255, 255, 255, .045), transparent 44%);
+      filter: blur(20px);
+      opacity: .82;
+      animation: auroraShift 16s ease-in-out infinite alternate;
+    }
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,.8), transparent 72%);
+    }
     a { color: inherit; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .shell { min-height: 100vh; display: flex; flex-direction: column; }
-    .nav { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(7, 9, 9, .78); backdrop-filter: blur(18px); position: sticky; top: 0; z-index: 10; }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 750; letter-spacing: 0; }
-    .mark { width: 24px; height: 24px; border-radius: 6px; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 0 22px rgba(53, 201, 143, .35); }
-    .navlinks { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 14px; }
+    button, .button {
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: rgba(18, 24, 24, .86);
+      color: var(--text);
+      padding: 0 14px;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+      transition: transform .18s ease, border-color .18s ease, background .18s ease;
+    }
+    button:hover, .button:hover { transform: translateY(-1px); border-color: rgba(54, 214, 147, .45); }
+    button.primary, .button.primary { background: linear-gradient(135deg, var(--accent), #8df3c5); border-color: transparent; color: #06130e; font-weight: 760; }
+    .shell { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; }
+    .nav {
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(5, 7, 7, .72);
+      backdrop-filter: blur(22px);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 780; letter-spacing: 0; }
+    .mark { width: 30px; height: 30px; border-radius: 8px; box-shadow: 0 0 24px rgba(54, 214, 147, .3); }
+    .navlinks { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 14px; }
     .navlinks a { text-decoration: none; }
-    main { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
-    .hero { display: grid; grid-template-columns: minmax(0, 1fr) 500px; gap: 36px; align-items: center; padding: 56px 0 34px; }
-    h1 { margin: 0; font-size: clamp(42px, 7vw, 76px); line-height: .96; letter-spacing: 0; max-width: 760px; }
-    .lead { margin: 22px 0 0; max-width: 660px; color: var(--muted); font-size: 18px; line-height: 1.6; }
+    .lang { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 3px; background: rgba(7, 10, 10, .72); }
+    .lang button { min-height: 26px; border: 0; border-radius: 999px; padding: 0 9px; color: var(--muted); background: transparent; font-size: 12px; }
+    .lang button.active { background: rgba(54, 214, 147, .18); color: var(--text); }
+    main { width: min(1360px, calc(100% - 44px)); margin: 0 auto; }
+    .hero { display: grid; grid-template-columns: minmax(0, .9fr) minmax(540px, 1.15fr); gap: 34px; align-items: center; padding: 62px 0 36px; }
+    h1 { margin: 0; font-size: clamp(43px, 6.4vw, 84px); line-height: .95; letter-spacing: 0; max-width: 780px; }
+    .lead { margin: 22px 0 0; max-width: 710px; color: var(--muted); font-size: 18px; line-height: 1.62; }
     .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 28px; }
-    button, .button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); color: var(--text); padding: 0 14px; font: inherit; text-decoration: none; cursor: pointer; }
-    button.primary, .button.primary { background: var(--accent); border-color: var(--accent); color: #06130e; font-weight: 750; }
-    .status { color: var(--muted); font-size: 13px; }
-    .terminal { border: 1px solid var(--line); border-radius: 8px; background: #050606; overflow: hidden; box-shadow: 0 24px 80px rgba(0, 0, 0, .35); }
-    .terminal-head { height: 34px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 0 12px; color: var(--muted); font-size: 12px; background: #0d1111; }
-    .terminal-body { padding: 16px; min-height: 320px; display: grid; align-content: start; gap: 12px; }
-    .line { color: #c9d8d2; font-size: 13px; line-height: 1.55; }
-    .line b { color: var(--accent); font-weight: 650; }
-    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; padding: 24px 0 50px; }
-    .card { border: 1px solid var(--line); border-radius: 8px; background: rgba(16, 20, 20, .82); padding: 18px; }
+    .status { width: 100%; color: var(--muted); font-size: 13px; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; color: #cfe0da; font-size: 13px; background: rgba(10, 14, 14, .66); margin-bottom: 18px; }
+    .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--accent); box-shadow: 0 0 18px rgba(54, 214, 147, .85); }
+    .hero-visual {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(5, 7, 7, .84);
+      overflow: hidden;
+      box-shadow: 0 28px 90px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .04);
+      transform: perspective(1400px) rotateY(-3deg) rotateX(2deg);
+    }
+    .visual-button { width: 100%; display: block; min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent; text-align: left; transform: none; }
+    .visual-button:hover { transform: none; }
+    .hero-visual img, .visual img { display: block; width: 100%; height: auto; }
+    .hero-visual .caption { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding: 10px 12px; color: var(--muted); font-size: 12px; background: rgba(6, 8, 8, .7); }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; padding: 22px 0 52px; }
+    .card, .panel, .visual {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
+      backdrop-filter: blur(18px);
+    }
+    .card { padding: 18px; }
     .card h2 { margin: 0 0 8px; font-size: 16px; }
     .card p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
-    .panel { border: 1px solid var(--line); border-radius: 8px; background: rgba(16, 20, 20, .9); padding: 18px; margin-bottom: 50px; }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+    .section-head h2, .panel h2 { margin: 0; font-size: 24px; }
+    .section-head p, .panel p { margin: 5px 0 0; color: var(--muted); line-height: 1.5; }
+    .visuals { display: grid; gap: 18px; padding: 0 0 56px; }
+    .visual { display: grid; grid-template-columns: minmax(0, 1.36fr) minmax(280px, .64fr); overflow: hidden; transition: transform .18s ease, border-color .18s ease; }
+    .visual:hover { transform: translateY(-2px); border-color: rgba(54, 214, 147, .42); }
+    .visual:nth-child(even) { grid-template-columns: minmax(280px, .64fr) minmax(0, 1.36fr); }
+    .visual:nth-child(even) .visual-copy { order: -1; border-left: 0; border-right: 1px solid var(--line); }
+    .visual .visual-button { background: #050707; }
+    .visual img { min-height: 280px; object-fit: cover; }
+    .visual-copy { padding: 20px; border-left: 1px solid var(--line); display: flex; flex-direction: column; justify-content: center; }
+    .visual h2 { margin: 0 0 8px; font-size: 19px; }
+    .visual p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
+    .visual .hint { margin-top: 14px; color: #cce7dc; font-size: 12px; }
+    .panel { padding: 18px; margin-bottom: 52px; }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
-    .panel h2 { margin: 0; font-size: 22px; }
-    .panel p { margin: 4px 0 0; color: var(--muted); }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-    .command { border: 1px solid var(--line); border-radius: 7px; background: #060808; overflow: hidden; }
+    .command { border: 1px solid var(--line); border-radius: 7px; background: rgba(3, 5, 5, .82); overflow: hidden; }
     .command-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; padding: 8px 10px; }
     pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #d7e5df; font-size: 13px; line-height: 1.55; }
-    .pill { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; color: var(--muted); font-size: 13px; }
-    .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--accent); }
     .footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; padding: 18px 0 34px; display: flex; justify-content: space-between; gap: 16px; }
-    @media (max-width: 900px) {
+    .lightbox { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center; padding: 26px; background: rgba(0, 0, 0, .76); backdrop-filter: blur(16px); }
+    .lightbox.open { display: flex; }
+    .lightbox-panel { width: min(1340px, 100%); max-height: min(88vh, 900px); border: 1px solid var(--line); border-radius: 8px; background: #050707; overflow: hidden; box-shadow: 0 28px 120px rgba(0, 0, 0, .58); }
+    .lightbox-head { height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 0 12px; color: var(--muted); }
+    .lightbox img { display: block; width: 100%; max-height: calc(88vh - 44px); object-fit: contain; background: #050707; }
+    @keyframes auroraShift {
+      from { transform: translate3d(-2%, -1%, 0) scale(1); }
+      to { transform: translate3d(2%, 1.5%, 0) scale(1.04); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, body::before { animation: none !important; transition: none !important; }
+      html { scroll-behavior: auto; }
+    }
+    @media (max-width: 1000px) {
       .nav { padding: 0 18px; }
-      .navlinks { display: none; }
-      main { width: min(100% - 28px, 720px); }
-      .hero, .grid, .cards { grid-template-columns: 1fr; }
-      .hero { padding-top: 34px; }
+      .navlinks a.hide-small { display: none; }
+      main { width: min(100% - 28px, 760px); }
+      .hero, .grid, .cards, .visual, .visual:nth-child(even) { grid-template-columns: 1fr; }
+      .hero { padding-top: 36px; }
+      .hero-visual { transform: none; }
+      .visual-copy, .visual:nth-child(even) .visual-copy { order: 0; border-left: 0; border-right: 0; border-top: 1px solid var(--line); }
+      .visual img { min-height: 0; object-fit: contain; }
+      .section-head, .panel-head, .footer { align-items: flex-start; flex-direction: column; }
+    }
+    @media (max-width: 620px) {
+      .navlinks { gap: 8px; }
+      .navlinks a:not(.github-link) { display: none; }
+      h1 { font-size: 42px; }
+      .lead { font-size: 16px; }
+      .lightbox { padding: 10px; }
     }
   </style>
 </head>
 <body>
   <div class="shell">
     <nav class="nav">
-      <div class="brand"><span class="mark"></span><span>AgentMux</span></div>
+      <div class="brand"><img class="mark" src="/docassets/agentmux-mark.svg" alt=""><span>AgentMux</span></div>
       <div class="navlinks">
-        <a href="/control">Web Control</a>
-        <a href="/install.sh">install.sh</a>
-        <a href="#quickstart">Quick Start</a>
+        <a href="/control" data-i18n="navControl">Web Control</a>
+        <a class="hide-small" href="/install.sh">install.sh</a>
+        <a class="hide-small" href="#quickstart" data-i18n="navQuick">Quick Start</a>
+        <a class="github-link" href="https://github.com/kinboyw/agentmux" rel="noreferrer" data-i18n="navGithub">GitHub</a>
+        <div class="lang" aria-label="Language">
+          <button type="button" data-lang="en">EN</button>
+          <button type="button" data-lang="zh">中</button>
+        </div>
       </div>
     </nav>
     <main>
       <section class="hero">
         <div>
-          <div class="pill"><span class="dot"></span>tmux-first remote control plane for coding agents</div>
-          <h1>Bring every agent session back to one hub.</h1>
-          <p class="lead">AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux sessions, Hub routes identity and WebSockets, Control gives you a browser and CLI surface from anywhere.</p>
+          <div class="pill"><span class="dot"></span><span data-i18n="eyebrow">Open-source tmux control plane for coding agents</span></div>
+          <h1 data-i18n="heroTitle">Bring every agent session back to one hub.</h1>
+          <p class="lead" data-i18n="heroLead">AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux sessions, Hub routes identity and WebSockets, Control gives you a browser and CLI surface from anywhere.</p>
           <div class="actions">
-            <button id="mint" class="primary">Generate join signal</button>
-            <a class="button" href="/control">Open Web Control</a>
+            <button id="mint" class="primary" data-i18n="generateSignal">Generate join signal</button>
+            <a class="button" href="/control" data-i18n="openControl">Open Web Control</a>
+            <a class="button" href="https://github.com/kinboyw/agentmux" rel="noreferrer" data-i18n="openGithub">Open-source on GitHub</a>
             <span id="status" class="status">Hub {{.BaseURL}} · Worker {{.WSURL}}</span>
           </div>
         </div>
-        <div class="terminal" aria-label="AgentMux flow">
-          <div class="terminal-head"><span>agentmux flow</span><span>wss relay</span></div>
-          <div class="terminal-body">
-            <div class="line"><b>1.</b> Generate a short-lived signal from this page.</div>
-            <div class="line"><b>2.</b> Run one command on a worker machine.</div>
-            <div class="line"><b>3.</b> Open Web Control and split sessions into panes.</div>
-            <div class="line"><b>4.</b> The agent only sees a local tmux terminal.</div>
-          </div>
+        <div class="hero-visual" aria-label="AgentMux system architecture">
+          <button class="visual-button" type="button" data-full="/docassets/system-architecture.png" data-title="System architecture">
+            <img src="/docassets/system-architecture.png" alt="AgentMux system architecture diagram">
+          </button>
+          <div class="caption"><span data-i18n="heroVisual">Hub, Worker, Control and WSS relay architecture</span><span data-i18n="clickZoom">Click to inspect</span></div>
         </div>
       </section>
 
       <section class="cards">
-        <div class="card"><h2>Agent-unaware</h2><p>No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.</p></div>
-        <div class="card"><h2>Cloudflare-ready</h2><p>Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.</p></div>
-        <div class="card"><h2>Multi-session control</h2><p>The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.</p></div>
+        <div class="card"><h2 data-i18n="cardAgentTitle">Agent-unaware</h2><p data-i18n="cardAgentBody">No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.</p></div>
+        <div class="card"><h2 data-i18n="cardCloudTitle">Cloudflare-ready</h2><p data-i18n="cardCloudBody">Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.</p></div>
+        <div class="card"><h2 data-i18n="cardControlTitle">Multi-session control</h2><p data-i18n="cardControlBody">The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.</p></div>
+      </section>
+
+      <section aria-label="AgentMux architecture visuals">
+        <div class="section-head">
+          <div>
+            <h2 data-i18n="visualTitle">Architecture in practice</h2>
+            <p data-i18n="visualLead">Large technical diagrams are embedded directly into the Hub landing page and can be opened for detail review.</p>
+          </div>
+        </div>
+        <div class="visuals">
+          <article class="visual">
+            <button class="visual-button" type="button" data-full="/docassets/onboarding.png" data-title="Signal onboarding">
+              <img src="/docassets/onboarding.png" alt="AgentMux signal onboarding flow">
+            </button>
+            <div class="visual-copy"><h2 data-i18n="onboardingTitle">Signal onboarding</h2><p data-i18n="onboardingBody">Generate a short-lived signal, exchange it for scoped credentials, then connect workers and controls.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
+          </article>
+          <article class="visual">
+            <button class="visual-button" type="button" data-full="/docassets/cloudflare-deployment.png" data-title="Cloudflare deployment">
+              <img src="/docassets/cloudflare-deployment.png" alt="AgentMux Cloudflare deployment topology">
+            </button>
+            <div class="visual-copy"><h2 data-i18n="cloudflareTitle">Cloudflare-ready deployment</h2><p data-i18n="cloudflareBody">Keep Hub and SQLite on your server while Cloudflare terminates HTTPS and WSS through a tunnel.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
+          </article>
+          <article class="visual">
+            <button class="visual-button" type="button" data-full="/docassets/web-control-workspace.png" data-title="Web Control workspace">
+              <img src="/docassets/web-control-workspace.png" alt="AgentMux Web Control multi-pane workspace">
+            </button>
+            <div class="visual-copy"><h2 data-i18n="workspaceTitle">Multi-pane Web Control</h2><p data-i18n="workspaceBody">Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
+          </article>
+        </div>
       </section>
 
       <section id="quickstart" class="panel">
         <div class="panel-head">
           <div>
-            <h2>Quick Start</h2>
-            <p>Generate a signal, then use the commands below before it expires.</p>
+            <h2 data-i18n="quickTitle">Quick Start</h2>
+            <p data-i18n="quickLead">Generate a signal, then use the commands below before it expires.</p>
           </div>
-          <button id="mint2">Generate</button>
+          <button id="mint2" data-i18n="generate">Generate</button>
         </div>
         <div id="result" class="grid">
           <div class="command">
-            <div class="command-title"><span>Local hub</span></div>
+            <div class="command-title"><span data-i18n="localHub">Local hub</span></div>
             <pre>agentmux hub --addr 0.0.0.0:8080 --data ./agentmux.db --public-url {{.BaseURL}}</pre>
           </div>
           <div class="command">
-            <div class="command-title"><span>Cloudflare tunnel</span></div>
+            <div class="command-title"><span data-i18n="cloudflareTunnel">Cloudflare tunnel</span></div>
             <pre>cloudflared tunnel --url http://127.0.0.1:8080</pre>
           </div>
         </div>
       </section>
 
       <footer class="footer">
-        <span>Default admin token stays local. Signals exchange into scoped credentials.</span>
-        <span>Docs: README.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md</span>
+        <span data-i18n="footerSecurity">Default admin token stays local. Signals exchange into scoped credentials.</span>
+        <span><span data-i18n="footerDocs">Docs</span>: README.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md · <a href="https://github.com/kinboyw/agentmux" rel="noreferrer">github.com/kinboyw/agentmux</a></span>
       </footer>
     </main>
   </div>
+  <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Image preview">
+    <div class="lightbox-panel">
+      <div class="lightbox-head"><span id="lightbox-title">Preview</span><button id="lightbox-close" type="button">Esc</button></div>
+      <img id="lightbox-img" alt="">
+    </div>
+  </div>
   <script>
+    const baseStatus = 'Hub {{.BaseURL}} · Worker {{.WSURL}}';
     const result = document.getElementById('result');
     const status = document.getElementById('status');
+    const dictionaries = {
+      en: {
+        navControl: 'Web Control',
+        navQuick: 'Quick Start',
+        navGithub: 'GitHub',
+        eyebrow: 'Open-source tmux control plane for coding agents',
+        heroTitle: 'Bring every agent session back to one hub.',
+        heroLead: 'AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux sessions, Hub routes identity and WebSockets, Control gives you a browser and CLI surface from anywhere.',
+        generateSignal: 'Generate join signal',
+        openControl: 'Open Web Control',
+        openGithub: 'Open-source on GitHub',
+        heroVisual: 'Hub, Worker, Control and WSS relay architecture',
+        clickZoom: 'Click to inspect',
+        cardAgentTitle: 'Agent-unaware',
+        cardAgentBody: 'No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.',
+        cardCloudTitle: 'Cloudflare-ready',
+        cardCloudBody: 'Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.',
+        cardControlTitle: 'Multi-session control',
+        cardControlBody: 'The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.',
+        visualTitle: 'Architecture in practice',
+        visualLead: 'Large technical diagrams are embedded directly into the Hub landing page and can be opened for detail review.',
+        onboardingTitle: 'Signal onboarding',
+        onboardingBody: 'Generate a short-lived signal, exchange it for scoped credentials, then connect workers and controls.',
+        cloudflareTitle: 'Cloudflare-ready deployment',
+        cloudflareBody: 'Keep Hub and SQLite on your server while Cloudflare terminates HTTPS and WSS through a tunnel.',
+        workspaceTitle: 'Multi-pane Web Control',
+        workspaceBody: 'Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.',
+        quickTitle: 'Quick Start',
+        quickLead: 'Generate a signal, then use the commands below before it expires.',
+        generate: 'Generate',
+        localHub: 'Local hub',
+        cloudflareTunnel: 'Cloudflare tunnel',
+        footerSecurity: 'Default admin token stays local. Signals exchange into scoped credentials.',
+        footerDocs: 'Docs',
+        generating: 'Generating signal...',
+        failed: 'Failed: ',
+        signalReady: 'Signal ready · expires ',
+        signal: 'Signal',
+        workerDev: 'Worker source/dev',
+        workerScript: 'Worker one-line script',
+        webControl: 'Web Control',
+        controlCLI: 'Control CLI',
+        controlScript: 'Control app script',
+        copy: 'Copy',
+        copied: 'Copied'
+      },
+      zh: {
+        navControl: '网页控制台',
+        navQuick: '快速开始',
+        navGithub: 'GitHub',
+        eyebrow: '面向 coding agent 的开源 tmux 控制平面',
+        heroTitle: '把所有 agent 会话收回到一个 Hub。',
+        heroLead: 'AgentMux 让 Codex、Claude、Gemini、OpenCode 和普通 shell 完全无感。Worker 管理本地 tmux 会话，Hub 负责身份与 WebSocket 路由，Control 让你从浏览器或 CLI 在任意设备接管会话。',
+        generateSignal: '生成接入信令',
+        openControl: '打开网页控制台',
+        openGithub: '在 GitHub 查看源码',
+        heroVisual: 'Hub、Worker、Control 与 WSS 中继架构',
+        clickZoom: '点击查看大图',
+        cardAgentTitle: 'Agent 无感',
+        cardAgentBody: '不依赖 agent SDK、回调服务或厂商远程能力。AgentMux 在 shell/tmux 层接入，agent 只看到本地终端。',
+        cardCloudTitle: '适配 Cloudflare',
+        cardCloudBody: 'Hub 可以放在 Cloudflare Tunnel 或反向代理之后。HTTPS 自动对应 WSS，Worker 默认只需要出站连接。',
+        cardControlTitle: '多会话控制',
+        cardControlBody: 'Web Control 支持可调整窗格、拖拽布局、会话创建，以及浏览器侧凭证。',
+        visualTitle: '架构如何落地',
+        visualLead: '关键技术图示直接嵌入 Hub 落地页，点击即可放大查看细节。',
+        onboardingTitle: '信令接入流程',
+        onboardingBody: '生成限时信令，交换为受限凭证，然后接入 Worker 与 Control。',
+        cloudflareTitle: 'Cloudflare 部署形态',
+        cloudflareBody: 'Hub 和 SQLite 留在自己的服务器上，由 Cloudflare 通过 Tunnel 承载 HTTPS 与 WSS。',
+        workspaceTitle: '多窗格网页控制台',
+        workspaceBody: '在紧凑的浏览器工作区里操作多个长期运行的 tmux agent 会话。',
+        quickTitle: '快速开始',
+        quickLead: '生成一个信令，然后在过期前使用下面的命令接入。',
+        generate: '生成',
+        localHub: '本地 Hub',
+        cloudflareTunnel: 'Cloudflare Tunnel',
+        footerSecurity: '默认管理员 token 保持本地使用。信令会交换为受限凭证。',
+        footerDocs: '文档',
+        generating: '正在生成信令...',
+        failed: '失败：',
+        signalReady: '信令已就绪 · 过期时间 ',
+        signal: '信令',
+        workerDev: 'Worker 源码/开发模式',
+        workerScript: 'Worker 一行安装脚本',
+        webControl: '网页控制台',
+        controlCLI: 'Control CLI',
+        controlScript: 'Control 应用脚本',
+        copy: '复制',
+        copied: '已复制'
+      }
+    };
+    let currentLang = localStorage.getItem('agentmux.lang') || ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+    if (!dictionaries[currentLang]) currentLang = 'en';
     document.getElementById('mint').addEventListener('click', mint);
     document.getElementById('mint2').addEventListener('click', mint);
+    document.querySelectorAll('[data-lang]').forEach(button => {
+      button.addEventListener('click', () => setLanguage(button.getAttribute('data-lang')));
+    });
+    document.querySelectorAll('[data-full]').forEach(button => {
+      button.addEventListener('click', () => openLightbox(button.getAttribute('data-full'), button.getAttribute('data-title')));
+    });
+    document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
+    document.getElementById('lightbox').addEventListener('click', event => {
+      if (event.target.id === 'lightbox') closeLightbox();
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') closeLightbox();
+    });
+    setLanguage(currentLang);
     async function mint() {
-      status.textContent = 'Generating signal...';
+      status.textContent = t('generating');
       const res = await fetch('/api/signals', { method: 'POST' });
       if (!res.ok) {
-        status.textContent = 'Failed: ' + await res.text();
+        status.textContent = t('failed') + await res.text();
         return;
       }
       const data = await res.json();
-      status.textContent = 'Signal ready · expires ' + new Date(data.expires_at).toLocaleString();
+      const signal = data.signal || data.token;
+      status.textContent = t('signalReady') + new Date(data.expires_at).toLocaleString();
       result.innerHTML =
-        commandBlock('Signal', data.signal || data.token, false) +
-        commandBlock('Worker source/dev', data.worker_command, true) +
-        commandBlock('Worker one-line script', 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- worker --join ' + shellQuote(data.signal || data.token) + ' --name "$(hostname)"', true) +
-        commandBlock('Web Control', data.control_url, false) +
-        commandBlock('Control CLI', data.control_command, true) +
-        commandBlock('Control app script', 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- control --join ' + shellQuote(data.signal || data.token), true);
+        commandBlock(t('signal'), signal, false) +
+        commandBlock(t('workerDev'), data.worker_command, true) +
+        commandBlock(t('workerScript'), 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- worker --join ' + shellQuote(signal) + ' --name "$(hostname)"', true) +
+        commandBlock(t('webControl'), data.control_url, false) +
+        commandBlock(t('controlCLI'), data.control_command, true) +
+        commandBlock(t('controlScript'), 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- control --join ' + shellQuote(signal), true);
+    }
+    function setLanguage(lang) {
+      currentLang = dictionaries[lang] ? lang : 'en';
+      localStorage.setItem('agentmux.lang', currentLang);
+      document.documentElement.lang = currentLang === 'zh' ? 'zh-CN' : 'en';
+      document.querySelectorAll('[data-i18n]').forEach(node => {
+        const key = node.getAttribute('data-i18n');
+        if (dictionaries[currentLang][key]) node.textContent = dictionaries[currentLang][key];
+      });
+      document.querySelectorAll('[data-lang]').forEach(button => {
+        button.classList.toggle('active', button.getAttribute('data-lang') === currentLang);
+      });
+      if (status.textContent === '' || status.textContent.startsWith('Hub ')) status.textContent = baseStatus;
+    }
+    function t(key) {
+      return dictionaries[currentLang][key] || dictionaries.en[key] || key;
     }
     function commandBlock(title, value, copyable) {
       return '<div class="command"><div class="command-title"><span>' + escapeHTML(title) + '</span>' +
-        (copyable ? '<button data-copy="' + escapeAttr(value) + '" onclick="copyValue(this)">Copy</button>' : '') +
+        (copyable ? '<button data-copy="' + escapeAttr(value) + '" onclick="copyValue(this)">' + escapeHTML(t('copy')) + '</button>' : '') +
         '</div><pre>' + escapeHTML(value) + '</pre></div>';
     }
     async function copyValue(button) {
       await navigator.clipboard.writeText(button.getAttribute('data-copy') || '');
-      button.textContent = 'Copied';
-      setTimeout(() => button.textContent = 'Copy', 1000);
+      button.textContent = t('copied');
+      setTimeout(() => button.textContent = t('copy'), 1000);
+    }
+    function openLightbox(src, title) {
+      document.getElementById('lightbox-title').textContent = title || 'Preview';
+      const image = document.getElementById('lightbox-img');
+      image.src = src;
+      image.alt = title || 'Preview';
+      document.getElementById('lightbox').classList.add('open');
+    }
+    function closeLightbox() {
+      document.getElementById('lightbox').classList.remove('open');
     }
     function shellQuote(value) {
       return "'" + String(value).replace(/'/g, "'\\''") + "'";
