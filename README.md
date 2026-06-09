@@ -77,6 +77,9 @@ Cloudflare terminates HTTPS and forwards WebSocket upgrades to the Go Hub. The
 Hub generates `wss://...` worker URLs automatically when the public URL is
 HTTPS.
 
+See [Deployment](docs/DEPLOYMENT.md) for Docker Compose, systemd, Cloudflare
+Tunnel, and release install script details.
+
 Signal-based onboarding:
 
 1. Open `http://127.0.0.1:8081/`.
@@ -134,4 +137,5 @@ mise exec -- go build -o dist/agentmux ./cmd/agentmux
 - [Design](docs/DESIGN.md)
 - [Product Architecture](docs/PRODUCT_ARCHITECTURE.md)
 - [API](docs/API.md)
+- [Deployment](docs/DEPLOYMENT.md)
 - [Roadmap](docs/ROADMAP.md)

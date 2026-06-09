@@ -1,0 +1,7 @@
+tunnel: agentmux
+credentials-file: /etc/cloudflared/agentmux.json
+
+ingress:
+  - hostname: hub.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404

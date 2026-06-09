@@ -1,0 +1,9 @@
+.git
+.github
+.tmp
+dist
+agentmux
+*.db
+*.db-*
+web/control/node_modules
+web/control/dist

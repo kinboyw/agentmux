@@ -1,0 +1,22 @@
+[Unit]
+Description=AgentMux Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentmux
+Group=agentmux
+EnvironmentFile=/etc/agentmux/agentmux.env
+ExecStart=/usr/local/bin/agentmux hub --addr 127.0.0.1:8080 --data ${AGENTMUX_DATA} --public-url ${AGENTMUX_PUBLIC_URL}
+Restart=on-failure
+RestartSec=3
+StateDirectory=agentmux
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agentmux
+
+[Install]
+WantedBy=multi-user.target

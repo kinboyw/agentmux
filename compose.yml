@@ -1,0 +1,23 @@
+services:
+  hub:
+    build:
+      context: .
+    image: agentmux:local
+    restart: unless-stopped
+    command:
+      - hub
+      - --addr
+      - 0.0.0.0:8080
+      - --data
+      - /var/lib/agentmux/agentmux.db
+      - --public-url
+      - ${AGENTMUX_PUBLIC_URL:-http://127.0.0.1:8080}
+    environment:
+      AGENTMUX_TOKEN: ${AGENTMUX_TOKEN:-}
+    ports:
+      - "${AGENTMUX_BIND:-127.0.0.1:8080}:8080"
+    volumes:
+      - agentmux-data:/var/lib/agentmux
+
+volumes:
+  agentmux-data:

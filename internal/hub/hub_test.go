@@ -131,7 +131,10 @@ func TestSignalUsesConfiguredPublicURL(t *testing.T) {
 }
 
 func TestInstallScriptEndpoint(t *testing.T) {
-	server := New(":0", "", nil)
+	server, err := NewWithOptions(ServerOptions{Addr: ":0", ReleaseRepo: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
 	req.Host = "agentmux.test"
 	rec := httptest.NewRecorder()
@@ -144,6 +147,12 @@ func TestInstallScriptEndpoint(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "agentmux") || !strings.Contains(body, "ws://agentmux.test") {
 		t.Fatalf("unexpected install script:\n%s", body)
+	}
+	if !strings.Contains(body, "REPO=\"${AGENTMUX_REPO:-owner/repo}\"") {
+		t.Fatalf("release repo missing from install script:\n%s", body)
+	}
+	if !strings.Contains(body, "releases/latest/download") {
+		t.Fatalf("release download path missing from install script:\n%s", body)
 	}
 }
 

@@ -25,10 +25,11 @@ import (
 var webDist embed.FS
 
 type Server struct {
-	addr      string
-	token     string
-	publicURL string
-	logger    *slog.Logger
+	addr        string
+	token       string
+	publicURL   string
+	releaseRepo string
+	logger      *slog.Logger
 
 	mu          sync.RWMutex
 	workers     map[string]*workerConn
@@ -71,11 +72,12 @@ func New(addr, token string, logger *slog.Logger) *Server {
 }
 
 type ServerOptions struct {
-	Addr      string
-	Token     string
-	PublicURL string
-	Logger    *slog.Logger
-	AuthStore AuthStore
+	Addr        string
+	Token       string
+	PublicURL   string
+	ReleaseRepo string
+	Logger      *slog.Logger
+	AuthStore   AuthStore
 }
 
 func NewWithOptions(options ServerOptions) (*Server, error) {
@@ -87,6 +89,7 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		addr:        options.Addr,
 		token:       options.Token,
 		publicURL:   strings.TrimRight(options.PublicURL, "/"),
+		releaseRepo: defaultReleaseRepo(options.ReleaseRepo),
 		logger:      logger,
 		workers:     map[string]*workerConn{},
 		sessions:    map[string]protocol.SessionView{},
@@ -101,6 +104,14 @@ func defaultAuthStore(store AuthStore) AuthStore {
 		return store
 	}
 	return newAuthStore()
+}
+
+func defaultReleaseRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return "SiriusNEO/agentmux"
+	}
+	return repo
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -188,7 +199,7 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := s.requestBaseURL(r)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
-	_, _ = fmt.Fprintf(w, installScriptTemplate, baseURL, websocketBase(baseURL))
+	_, _ = fmt.Fprintf(w, installScriptTemplate, s.releaseRepo, baseURL, websocketBase(baseURL))
 }
 
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
@@ -892,6 +903,7 @@ set -eu
 ROLE="${1:-worker}"
 shift || true
 
+REPO="${AGENTMUX_REPO:-%s}"
 VERSION="${AGENTMUX_VERSION:-latest}"
 HUB_HTTP="%s"
 HUB_WS="%s"
@@ -904,9 +916,33 @@ if command -v agentmux >/dev/null 2>&1; then
   BIN="$(command -v agentmux)"
 elif command -v go >/dev/null 2>&1 && [ -f "./cmd/agentmux/main.go" ]; then
   go build -o "$BIN" ./cmd/agentmux
+elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+  esac
+  case "$os" in
+    linux|darwin) ;;
+    *) echo "unsupported OS: $os" >&2; exit 1 ;;
+  esac
+  asset="agentmux-${os}-${arch}.tar.gz"
+  if [ "$VERSION" = "latest" ]; then
+    url="https://github.com/${REPO}/releases/latest/download/${asset}"
+  else
+    url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+  fi
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  echo "Downloading $url" >&2
+  curl -fsSL "$url" -o "$tmp/$asset"
+  tar -xzf "$tmp/$asset" -C "$tmp"
+  install -m 0755 "$tmp/agentmux-${os}-${arch}" "$BIN"
 else
   echo "agentmux binary is not installed." >&2
-  echo "Install a release binary into PATH, or run this script from a source checkout with Go installed." >&2
+  echo "Install curl+tar, put agentmux in PATH, or run this script from a source checkout with Go installed." >&2
   exit 1
 fi
 
