@@ -566,7 +566,7 @@ func (a *App) promptCreate(ctx context.Context) {
 		a.status = "create failed"
 		return
 	}
-	a.status = "create queued"
+	a.status = "session created"
 	time.Sleep(300 * time.Millisecond)
 	a.refresh(ctx)
 }

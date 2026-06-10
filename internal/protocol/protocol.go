@@ -14,6 +14,7 @@ const (
 	TypeSessionSync     = "session.sync"
 	TypeSessionPreview  = "session.preview"
 	TypeSessionCreate   = "session.create"
+	TypeSessionCreated  = "session.created"
 	TypeSessionKill     = "session.kill"
 	TypeTerminalOpen    = "terminal.open"
 	TypeTerminalClose   = "terminal.close"

@@ -42,6 +42,7 @@ type Server struct {
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
 	previews    map[string]chan protocol.Envelope
+	creates     map[string]chan protocol.Envelope
 	auth        AuthStore
 	rateLimiter *rateLimiter
 }
@@ -161,6 +162,7 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
 		previews:    map[string]chan protocol.Envelope{},
+		creates:     map[string]chan protocol.Envelope{},
 		auth:        defaultAuthStore(options.AuthStore),
 		rateLimiter: newRateLimiter(10, time.Minute),
 	}, nil
@@ -654,14 +656,21 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "worker is disabled")
 			return
 		}
-		if err := s.sendToWorker(req.WorkerID, protocol.TypeSessionCreate, protocol.Session{
+		if err := s.requestSessionCreate(r.Context(), req.WorkerID, protocol.Session{
 			Name: req.Name, CWD: req.CWD, Command: req.Command,
-		}, "", ""); err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+		}); err != nil {
+			status := http.StatusBadGateway
+			var rejected sessionCreateRejected
+			if errors.As(err, &rejected) {
+				status = http.StatusBadRequest
+			} else if strings.Contains(err.Error(), "worker not connected") || strings.Contains(err.Error(), "worker send queue full") {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, err.Error())
 			return
 		}
 		go s.requestSessionSync(req.WorkerID)
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "queued"})
+		writeJSON(w, http.StatusCreated, map[string]string{"status": "created"})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -885,9 +894,16 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 		s.publish(env.StreamID, env)
 	case protocol.TypeSessionPreview:
 		s.completePreview(env)
+	case protocol.TypeSessionCreated:
+		s.completeCreate(env)
 	case protocol.TypeError:
-		if env.ID != "" && s.completePreview(env) {
-			return
+		if env.ID != "" {
+			if s.completeCreate(env) {
+				return
+			}
+			if s.completePreview(env) {
+				return
+			}
 		}
 		s.publish(env.StreamID, env)
 	}
@@ -1115,6 +1131,76 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 func (s *Server) requestSessionSync(workerID string) {
 	time.Sleep(150 * time.Millisecond)
 	_ = s.sendToWorker(workerID, protocol.TypeSessionSync, nil, "", "")
+}
+
+type sessionCreateRejected struct {
+	message string
+}
+
+func (e sessionCreateRejected) Error() string {
+	return e.message
+}
+
+func (s *Server) requestSessionCreate(ctx context.Context, workerID string, session protocol.Session) error {
+	requestID := "create_" + randomID()
+	sessionID := protocol.SessionID(workerID, session.Name)
+	reply := make(chan protocol.Envelope, 1)
+	s.logger.Debug("session create request start", "worker", workerID, "session_id", sessionID, "request_id", requestID, "cwd", session.CWD, "command", session.Command)
+	s.mu.Lock()
+	s.creates[requestID] = reply
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.creates, requestID)
+		s.mu.Unlock()
+	}()
+
+	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionCreate, session, session.Name, sessionID, requestID); err != nil {
+		s.logger.Debug("session create request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
+		return err
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		s.logger.Debug("session create request timed out", "worker", workerID, "session_id", sessionID, "request_id", requestID)
+		return fmt.Errorf("session create timed out")
+	case env := <-reply:
+		if env.Type == protocol.TypeError {
+			var payload protocol.ErrorPayload
+			_ = env.DecodePayload(&payload)
+			message := strings.TrimSpace(payload.Message)
+			if message == "" {
+				message = "worker rejected session create"
+			}
+			s.logger.Debug("session create request rejected", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", message)
+			return sessionCreateRejected{message: message}
+		}
+		if env.Type != protocol.TypeSessionCreated {
+			return fmt.Errorf("unexpected session create response: %s", env.Type)
+		}
+		s.logger.Debug("session create request complete", "worker", workerID, "session_id", sessionID, "request_id", requestID)
+		return nil
+	}
+}
+
+func (s *Server) completeCreate(env protocol.Envelope) bool {
+	if env.ID == "" {
+		return false
+	}
+	s.mu.RLock()
+	reply := s.creates[env.ID]
+	s.mu.RUnlock()
+	if reply == nil {
+		return false
+	}
+	select {
+	case reply <- env:
+	default:
+	}
+	return true
 }
 
 func (s *Server) completePreview(env protocol.Envelope) bool {
@@ -2451,7 +2537,7 @@ var controlTemplate = template.Must(template.New("control").Parse(`<!doctype htm
         setStatus('Create failed', await res.text(), 'err');
         return;
       }
-      setStatus('Create queued', workerID + '/' + payload.name, 'warn');
+      setStatus('Session created', workerID + '/' + payload.name, 'ok');
       setTimeout(refreshAll, 700);
     });
 

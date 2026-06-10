@@ -169,8 +169,11 @@ Request:
 Response:
 
 ```json
-{"status":"queued"}
+{"status":"created"}
 ```
+
+The hub waits for the worker to confirm the session creation. Worker-side CWD
+or command validation errors are returned as `400 Bad Request`.
 
 ### `POST /api/sessions/{worker}/{name}/input`
 

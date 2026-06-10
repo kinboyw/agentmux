@@ -6,6 +6,7 @@ import {
   Bug,
   ChevronLeft,
   ChevronRight,
+  Eye,
   Github,
   Globe,
   Keyboard,
@@ -84,12 +85,31 @@ type LayoutNode = PaneNode | SplitNode;
 type WorkspaceTab = {
   id: string;
   title: string;
+  renamed?: boolean;
   layout: LayoutNode;
   activePane: string;
 };
 
-type TerminalSettings = {
+type WorkspaceState = {
+  tabs: WorkspaceTab[];
+  activeTabId: string;
+};
+
+type CreateSessionForm = {
+  worker_id: string;
+  name: string;
+  cwd: string;
+  command: string;
+};
+
+type RecentCWDState = Record<string, string[]>;
+
+type WorkerTerminalSettings = {
   tmuxPrefix: string;
+};
+
+type TerminalSettings = {
+  workers: Record<string, WorkerTerminalSettings>;
 };
 
 type PreviewState = {
@@ -161,6 +181,8 @@ type DropTarget = {
 };
 
 const dragMime = "application/x-agentmux-drag";
+const defaultTmuxPrefix = "\x02";
+let terminalInputSuppressedUntil = 0;
 const query = new URLSearchParams(window.location.search);
 const initialSignal = query.get("signal") || "";
 const queryToken = query.get("token") || "";
@@ -168,10 +190,10 @@ const initialToken = queryToken || localStorage.getItem("agentmux.token") || "";
 const initialTokenExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.token_expires_at") || "";
 const initialRefreshToken = queryToken ? "" : localStorage.getItem("agentmux.refresh_token") || "";
 const initialRefreshExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.refresh_expires_at") || "";
-const initialPaneId: string = crypto.randomUUID();
-const initialTabId: string = crypto.randomUUID();
 const initialUser = readStoredUser();
 const initialTerminalSettings = readTerminalSettings();
+const initialWorkspaceState = readWorkspaceState();
+const initialRecentCWDs = readRecentCWDs();
 
 function App() {
   const [token, setToken] = React.useState(initialToken);
@@ -195,10 +217,9 @@ function App() {
   const [sessionSearch, setSessionSearch] = React.useState("");
   const [mainView, setMainView] = React.useState<MainView>("overview");
   const [terminalSettings, setTerminalSettings] = React.useState<TerminalSettings>(initialTerminalSettings);
-  const [tabs, setTabs] = React.useState<WorkspaceTab[]>([
-    { id: initialTabId, title: "Workspace 1", layout: { type: "pane", id: initialPaneId }, activePane: initialPaneId },
-  ]);
-  const [activeTabId, setActiveTabId] = React.useState(initialTabId);
+  const [tabs, setTabs] = React.useState<WorkspaceTab[]>(initialWorkspaceState.tabs);
+  const [activeTabId, setActiveTabId] = React.useState(initialWorkspaceState.activeTabId);
+  const [recentCWDs, setRecentCWDs] = React.useState<RecentCWDState>(initialRecentCWDs);
   const [previewStates, setPreviewStates] = React.useState<Record<string, PreviewState>>({});
   const [pendingFocusSessionId, setPendingFocusSessionId] = React.useState<string | null>(null);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
@@ -216,7 +237,7 @@ function App() {
     title: "No session attached",
     detail: "Open a session from the sidebar.",
   });
-  const [createForm, setCreateForm] = React.useState({
+  const [createForm, setCreateForm] = React.useState<CreateSessionForm>({
     worker_id: "",
     name: "demo",
     cwd: ".",
@@ -238,6 +259,11 @@ function App() {
     [workerOptions, workerSearch],
   );
 
+  const createCWDOptions = React.useMemo(
+    () => buildCWDOptions(createForm.worker_id, sessions, recentCWDs),
+    [createForm.worker_id, sessions, recentCWDs],
+  );
+
   const visibleSessions = React.useMemo(
     () => filterSessions(sessions, workerOptions, workerFilter, sessionSearch),
     [sessions, workerOptions, workerFilter, sessionSearch],
@@ -247,11 +273,14 @@ function App() {
   const workerByID = React.useMemo(() => new Map(workerOptions.map((worker) => [worker.id, worker])), [workerOptions]);
   const activeTab = React.useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0], [tabs, activeTabId]);
   const activePane = activeTab.activePane;
-  const layout = activeTab.layout;
 
   React.useEffect(() => {
     authRef.current = { token, tokenExpiresAt, refreshToken, refreshExpiresAt };
   }, [token, tokenExpiresAt, refreshToken, refreshExpiresAt]);
+
+  React.useEffect(() => {
+    localStorage.setItem("agentmux.workspace_state", JSON.stringify({ tabs, activeTabId }));
+  }, [tabs, activeTabId]);
 
   React.useEffect(() => {
     const markActivity = () => {
@@ -339,16 +368,36 @@ function App() {
 
   async function createSession(event: React.FormEvent) {
     event.preventDefault();
-    const targetSessionID = `${createForm.worker_id}/${createForm.name}`;
-    const res = await apiFetch("/api/sessions", { method: "POST", body: JSON.stringify(createForm) });
+    const payload = {
+      ...createForm,
+      worker_id: createForm.worker_id.trim(),
+      name: createForm.name.trim(),
+      cwd: createForm.cwd.trim() || ".",
+      command: createForm.command.trim(),
+    };
+    const targetSessionID = `${payload.worker_id}/${payload.name}`;
+    const res = await apiFetch("/api/sessions", { method: "POST", body: JSON.stringify(payload) });
     if (!res.ok) {
       setStatus({ tone: "err", title: "Create failed", detail: await res.text() });
       return;
     }
-    setStatus({ tone: "warn", title: "Create queued", detail: `${createForm.worker_id}/${createForm.name}` });
+    rememberRecentCWD(payload.worker_id, payload.cwd);
+    setStatus({ tone: "ok", title: "Session created", detail: targetSessionID });
     setCreateOpen(false);
-    setWorkerFilter(createForm.worker_id);
-    void focusCreatedSession(targetSessionID, createForm.worker_id);
+    setWorkerFilter(payload.worker_id);
+    void focusCreatedSession(targetSessionID, payload.worker_id);
+  }
+
+  function rememberRecentCWD(workerID: string, cwd: string) {
+    const normalized = cwd.trim() || ".";
+    setRecentCWDs((current) => {
+      const next = {
+        ...current,
+        [workerID]: uniqueStrings([normalized, ...(current[workerID] || [])], 8),
+      };
+      localStorage.setItem("agentmux.recent_cwds", JSON.stringify(next));
+      return next;
+    });
   }
 
   async function killSession(session: SessionView) {
@@ -360,7 +409,13 @@ function App() {
       return;
     }
     setStatus({ tone: "warn", title: "Exit queued", detail: `${session.worker_id}/${session.name}` });
-    setTabs((items) => items.map((tab) => ({ ...tab, layout: clearSessionFromLayout(tab.layout, session.id) })));
+    setTabs((items) =>
+      items.map((tab) => {
+        const nextLayout = clearSessionFromLayout(tab.layout, session.id);
+        const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
+        return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab, nextLayout) };
+      }),
+    );
     window.setTimeout(() => void refreshAll(), 700);
   }
 
@@ -562,35 +617,55 @@ function App() {
     if (data.url) window.location.href = data.url;
   }
 
-  function setActivePane(paneId: string) {
-    setTabs((items) => items.map((tab) => (tab.id === activeTabId ? { ...tab, activePane: paneId } : tab)));
+  function updateTab(tabId: string, update: (tab: WorkspaceTab) => WorkspaceTab) {
+    setTabs((items) => items.map((tab) => (tab.id === tabId ? update(tab) : tab)));
   }
 
-  function setLayout(update: React.SetStateAction<LayoutNode>) {
-    setTabs((items) =>
-      items.map((tab) => {
-        if (tab.id !== activeTabId) return tab;
-        const nextLayout = typeof update === "function" ? (update as (node: LayoutNode) => LayoutNode)(tab.layout) : update;
-        const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
-        return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab.title, nextLayout) };
-      }),
-    );
+  function setActivePaneForTab(tabId: string, paneId: string) {
+    updateTab(tabId, (tab) => ({ ...tab, activePane: paneId }));
+  }
+
+  function setLayoutForTab(tabId: string, update: React.SetStateAction<LayoutNode>) {
+    updateTab(tabId, (tab) => {
+      const nextLayout = typeof update === "function" ? (update as (node: LayoutNode) => LayoutNode)(tab.layout) : update;
+      const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
+      return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab, nextLayout) };
+    });
+  }
+
+  function renameWorkspaceTab(tabId: string, nextTitle: string) {
+    const title = nextTitle.trim();
+    if (!title) return;
+    updateTab(tabId, (tab) => ({ ...tab, title, renamed: true }));
+  }
+
+  function focusAttachedSession(sessionId: string) {
+    for (const tab of tabs) {
+      const pane = collectPanes(tab.layout).find((candidate) => candidate.sessionId === sessionId);
+      if (!pane) continue;
+      setActiveTabId(tab.id);
+      setActivePaneForTab(tab.id, pane.id);
+      setMainView("workspace");
+      return true;
+    }
+    return false;
   }
 
   async function attach(sessionId: string, target: "current" | "new-tab" = "current") {
     await ensureFreshAccessToken();
+    if (focusAttachedSession(sessionId)) return;
     setMainView("workspace");
     if (target === "new-tab") {
-      const tab = newWorkspaceTab(sessionId, tabTitleForSession(sessionId));
+      const tab = newWorkspaceTab(sessionId, workspaceTitleForSession(sessionId));
       setTabs((items) => [...items, tab]);
       setActiveTabId(tab.id);
       return;
     }
-    setLayout((node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
+    setLayoutForTab(activeTabId, (node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
   }
 
   function createWorkspaceTab(sessionId?: string) {
-    const tab = newWorkspaceTab(sessionId, sessionId ? tabTitleForSession(sessionId) : `Workspace ${tabs.length + 1}`);
+    const tab = newWorkspaceTab(sessionId, sessionId ? workspaceTitleForSession(sessionId) : `Workspace ${tabs.length + 1}`);
     setTabs((items) => [...items, tab]);
     setActiveTabId(tab.id);
     setMainView("workspace");
@@ -650,46 +725,61 @@ function App() {
     await refreshAll();
   }
 
-  function splitPaneById(paneId: string, direction: SplitDirection) {
-    const pane = newPane();
-    setLayout((node) => splitPaneNode(node, paneId, direction, pane).node);
-    setActivePane(pane.id);
+  function updateWorkerTerminalSettings(workerId: string, next: WorkerTerminalSettings) {
+    setTerminalSettings((current) => {
+      const updated = { ...current, workers: { ...current.workers, [workerId]: next } };
+      localStorage.setItem("agentmux.terminal_settings", JSON.stringify(updated));
+      return updated;
+    });
   }
 
-  function dropOnPane(targetPaneId: string, zone: DropZone, payload: DragPayload) {
+  function detachSession(sessionId: string) {
+    setTabs((items) =>
+      items.map((tab) => {
+        const nextLayout = clearSessionFromLayout(tab.layout, sessionId);
+        const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
+        return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab, nextLayout) };
+      }),
+    );
+    setStatus({ tone: "idle", title: "Detached from workspace", detail: sessionId });
+  }
+
+  function splitPaneById(tabId: string, paneId: string, direction: SplitDirection) {
+    const pane = newPane();
+    setLayoutForTab(tabId, (node) => splitPaneNode(node, paneId, direction, pane).node);
+    setActivePaneForTab(tabId, pane.id);
+  }
+
+  function dropOnPane(tabId: string, targetPaneId: string, zone: DropZone, payload: DragPayload) {
     setDropTarget(null);
     if (payload.kind === "session") {
       const pane = zone === "center" ? undefined : newPane(payload.sessionId);
-      setLayout((node) => {
+      setLayoutForTab(tabId, (node) => {
         if (zone === "center") return updatePane(node, targetPaneId, (pane) => ({ ...pane, sessionId: payload.sessionId }));
         return insertPaneRelative(node, targetPaneId, zone, pane!).node;
       });
-      setActivePane(pane?.id || targetPaneId);
+      setActivePaneForTab(tabId, pane?.id || targetPaneId);
       return;
     }
     if (payload.paneId === targetPaneId) return;
     if (zone === "center") {
-      setLayout((node) => swapPaneSessions(node, payload.paneId, targetPaneId));
-      setActivePane(targetPaneId);
+      setLayoutForTab(tabId, (node) => swapPaneSessions(node, payload.paneId, targetPaneId));
+      setActivePaneForTab(tabId, targetPaneId);
       return;
     }
-    setLayout((node) => {
+    setLayoutForTab(tabId, (node) => {
       const extracted = extractPane(node, payload.paneId);
       if (!extracted.pane || !extracted.node || !findPane(extracted.node, targetPaneId)) return node;
       const inserted = insertPaneRelative(extracted.node, targetPaneId, zone, extracted.pane);
       return inserted.inserted ? inserted.node : node;
     });
-    setActivePane(payload.paneId);
+    setActivePaneForTab(tabId, payload.paneId);
   }
 
-  function closePane(id: string) {
-    setLayout((node) => {
+  function closePane(tabId: string, id: string) {
+    setLayoutForTab(tabId, (node) => {
       const result = removePane(node, id);
-      const next = result.node || newPane();
-      if (id === activePane || !findPane(next, activePane)) {
-        setActivePane(firstPaneId(next));
-      }
-      return next;
+      return result.node || newPane();
     });
   }
 
@@ -765,15 +855,24 @@ function App() {
                         <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
                         <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
                       </button>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        className="mt-1 mr-1 shrink-0"
-                        onClick={() => void killSession(session)}
-                        title="Exit session"
-                      >
-                        <Power className="h-4 w-4" />
-                      </Button>
+                      <div className="mt-1 mr-1 flex shrink-0 items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => void attach(session.id, "new-tab")}
+                          title="Open in new tab"
+                        >
+                          <Plus className="h-4 w-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => void killSession(session)}
+                          title="Exit session"
+                        >
+                          <Power className="h-4 w-4" />
+                        </Button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -801,12 +900,22 @@ function App() {
                 <ChevronRight className="h-4 w-4" />
               </Button>
             ) : null}
-            <div className="flex items-center gap-1 rounded-md border border-border bg-background p-0.5">
-              <Button variant={mainView === "overview" ? "secondary" : "ghost"} size="xs" onClick={() => setMainView("overview")}>
+            <div className="flex items-center gap-1 rounded-md border border-primary/40 bg-primary/10 p-0.5 shadow-sm shadow-primary/10">
+              <Button
+                variant={mainView === "overview" ? "default" : "ghost"}
+                size="sm"
+                className={cn("h-8", mainView !== "overview" && "text-muted-foreground hover:text-foreground")}
+                onClick={() => setMainView("overview")}
+              >
                 <Server className="h-3.5 w-3.5" />
                 Overview
               </Button>
-              <Button variant={mainView === "workspace" ? "secondary" : "ghost"} size="xs" onClick={() => setMainView("workspace")}>
+              <Button
+                variant={mainView === "workspace" ? "default" : "ghost"}
+                size="sm"
+                className={cn("h-8", mainView !== "workspace" && "text-muted-foreground hover:text-foreground")}
+                onClick={() => setMainView("workspace")}
+              >
                 <LayoutGrid className="h-3.5 w-3.5" />
                 Workspace
               </Button>
@@ -833,8 +942,8 @@ function App() {
             <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
           </div>
         </header>
-        <div className="min-h-0 flex-1">
-          {mainView === "overview" ? (
+        <div className="relative min-h-0 flex-1">
+          <div className={cn("absolute inset-0 min-h-0 min-w-0", mainView === "overview" ? "block" : "invisible pointer-events-none")}>
             <OverviewPage
               workers={workerOptions}
               sessions={visibleSessions}
@@ -847,29 +956,35 @@ function App() {
               onSessionSearchChange={setSessionSearch}
               onAttach={(session) => void attach(session.id)}
               onAttachNewTab={(session) => void attach(session.id, "new-tab")}
+              onDetach={(session) => detachSession(session.id)}
               onLoadPreview={(session, force) => void loadSessionPreview(session, force)}
               onKillSession={(session) => void killSession(session)}
               onUpdateWorker={(worker, patch) => void updateWorker(worker, patch)}
             />
-          ) : (
+          </div>
+          <div className={cn("absolute inset-0 min-h-0 min-w-0", mainView === "workspace" ? "block" : "invisible pointer-events-none")}>
             <WorkspaceView
               tabs={tabs}
               activeTabId={activeTabId}
-              layout={layout}
-              activePane={activePane}
+              visible={mainView === "workspace"}
+              sessionByID={sessionByID}
+              workerByID={workerByID}
+              terminalSettings={terminalSettings}
               token={token}
               dropTarget={dropTarget}
               onActiveTabChange={setActiveTabId}
               onCreateTab={() => createWorkspaceTab()}
               onCloseTab={closeWorkspaceTab}
-              onFocusPane={setActivePane}
+              onRenameTab={renameWorkspaceTab}
+              onFocusPane={setActivePaneForTab}
               onSplitPane={splitPaneById}
               onClosePane={closePane}
               onDropTarget={setDropTarget}
               onDropPayload={dropOnPane}
+              onTerminalSettingsChange={updateWorkerTerminalSettings}
               setStatus={setStatus}
             />
-          )}
+          </div>
         </div>
       </main>
       <AuthModal
@@ -892,10 +1007,12 @@ function App() {
         createForm={createForm}
         workerSearch={workerSearch}
         workers={filteredCreateWorkers}
+        cwdOptions={createCWDOptions}
         onClose={() => setCreateOpen(false)}
         onSubmit={createSession}
         onWorkerSearchChange={setWorkerSearch}
         onFormChange={setCreateForm}
+        onSelectCWD={(cwd) => setCreateForm((form) => ({ ...form, cwd }))}
       />
       <JoinSignalModal
         open={joinOpen}
@@ -921,6 +1038,7 @@ function OverviewPage({
   onSessionSearchChange,
   onAttach,
   onAttachNewTab,
+  onDetach,
   onLoadPreview,
   onKillSession,
   onUpdateWorker,
@@ -936,6 +1054,7 @@ function OverviewPage({
   onSessionSearchChange: (query: string) => void;
   onAttach: (session: SessionView) => void;
   onAttachNewTab: (session: SessionView) => void;
+  onDetach: (session: SessionView) => void;
   onLoadPreview: (session: SessionView, force?: boolean) => void;
   onKillSession: (session: SessionView) => void;
   onUpdateWorker: (worker: WorkerView, patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
@@ -1018,6 +1137,7 @@ function OverviewPage({
                     preview={previewStates[session.id]}
                     onAttach={() => onAttach(session)}
                     onAttachNewTab={() => onAttachNewTab(session)}
+                    onDetach={() => onDetach(session)}
                     onLoadPreview={(force) => onLoadPreview(session, force)}
                     onKill={() => onKillSession(session)}
                   />
@@ -1101,6 +1221,7 @@ function SessionPreviewCard({
   preview,
   onAttach,
   onAttachNewTab,
+  onDetach,
   onLoadPreview,
   onKill,
 }: {
@@ -1110,6 +1231,7 @@ function SessionPreviewCard({
   preview?: PreviewState;
   onAttach: () => void;
   onAttachNewTab: () => void;
+  onDetach: () => void;
   onLoadPreview: (force?: boolean) => void;
   onKill: () => void;
 }) {
@@ -1148,10 +1270,17 @@ function SessionPreviewCard({
       </button>
       <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-2">
         <div className="flex items-center gap-1">
-          <Button variant="secondary" size="xs" type="button" onClick={onAttach}>
-            <Monitor className="h-3.5 w-3.5" />
-            Attach
-          </Button>
+          {active ? (
+            <Button variant="secondary" size="xs" type="button" onClick={onDetach}>
+              <Unplug className="h-3.5 w-3.5" />
+              Detach
+            </Button>
+          ) : (
+            <Button variant="secondary" size="xs" type="button" onClick={onAttach}>
+              <Monitor className="h-3.5 w-3.5" />
+              Attach
+            </Button>
+          )}
           <Button variant="ghost" size="xs" type="button" onClick={onAttachNewTab}>
             <Plus className="h-3.5 w-3.5" />
             Tab
@@ -1159,7 +1288,7 @@ function SessionPreviewCard({
         </div>
         <div className="flex items-center gap-1">
           <Button variant="ghost" size="icon-sm" type="button" onClick={() => onLoadPreview(true)} title="Refresh active pane preview">
-            <Eye className="h-4 w-4" />
+            <RefreshCw className="h-4 w-4" />
           </Button>
           <Button variant="ghost" size="icon-sm" type="button" onClick={onKill} title="Exit session">
             <Power className="h-4 w-4" />
@@ -1173,34 +1302,42 @@ function SessionPreviewCard({
 function WorkspaceView({
   tabs,
   activeTabId,
-  layout,
-  activePane,
+  visible,
+  sessionByID,
+  workerByID,
+  terminalSettings,
   token,
   dropTarget,
   onActiveTabChange,
   onCreateTab,
   onCloseTab,
+  onRenameTab,
   onFocusPane,
   onSplitPane,
   onClosePane,
   onDropTarget,
   onDropPayload,
+  onTerminalSettingsChange,
   setStatus,
 }: {
   tabs: WorkspaceTab[];
   activeTabId: string;
-  layout: LayoutNode;
-  activePane: string;
+  visible: boolean;
+  sessionByID: Map<string, SessionView>;
+  workerByID: Map<string, WorkerView>;
+  terminalSettings: TerminalSettings;
   token: string;
   dropTarget: DropTarget | null;
   onActiveTabChange: (tabID: string) => void;
   onCreateTab: () => void;
   onCloseTab: (tabID: string) => void;
-  onFocusPane: (id: string) => void;
-  onSplitPane: (paneId: string, direction: SplitDirection) => void;
-  onClosePane: (id: string) => void;
+  onRenameTab: (tabID: string, title: string) => void;
+  onFocusPane: (tabID: string, paneID: string) => void;
+  onSplitPane: (tabID: string, paneId: string, direction: SplitDirection) => void;
+  onClosePane: (tabID: string, id: string) => void;
   onDropTarget: (target: DropTarget | null) => void;
-  onDropPayload: (paneId: string, zone: DropZone, payload: DragPayload) => void;
+  onDropPayload: (tabID: string, paneId: string, zone: DropZone, payload: DragPayload) => void;
+  onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
   return (
@@ -1213,17 +1350,22 @@ function WorkspaceView({
               key={tab.id}
               type="button"
               className={cn(
-                "flex h-7 max-w-[220px] shrink-0 items-center gap-1 rounded-md border px-2 text-xs transition-colors",
+                "flex h-7 min-w-[112px] max-w-[260px] shrink-0 items-center rounded-md border px-2 text-xs transition-colors",
                 tab.id === activeTabId ? "border-primary/50 bg-primary/10 text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground",
               )}
               onClick={() => onActiveTabChange(tab.id)}
+              onDoubleClick={() => {
+                const title = window.prompt("Workspace name", tab.title);
+                if (title !== null) onRenameTab(tab.id, title);
+              }}
+              title="Double-click to rename workspace"
             >
-              <span className="truncate">{tab.title}</span>
+              <span className="min-w-0 flex-1 truncate text-left">{tab.title}</span>
               {tabs.length > 1 ? (
                 <span
                   role="button"
                   tabIndex={0}
-                  className="grid h-4 w-4 place-items-center rounded hover:bg-secondary"
+                  className="ml-1 grid h-4 w-4 shrink-0 place-items-center rounded hover:bg-secondary"
                   onClick={(event) => {
                     event.stopPropagation();
                     onCloseTab(tab.id);
@@ -1239,19 +1381,29 @@ function WorkspaceView({
           <Plus className="h-4 w-4" />
         </Button>
       </div>
-      <div className="min-h-0 flex-1">
-        <LayoutRenderer
-          node={layout}
-          activePane={activePane}
-          token={token}
-          onFocusPane={onFocusPane}
-          onSplitPane={onSplitPane}
-          onClosePane={onClosePane}
-          dropTarget={dropTarget}
-          onDropTarget={onDropTarget}
-          onDropPayload={onDropPayload}
-          setStatus={setStatus}
-        />
+      <div className="relative min-h-0 flex-1">
+        {tabs.map((tab) => (
+          <div key={tab.id} className={cn("absolute inset-0 min-h-0 min-w-0", tab.id === activeTabId ? "block" : "invisible pointer-events-none")}>
+            <LayoutRenderer
+              tabId={tab.id}
+              node={tab.layout}
+              activePane={visible && tab.id === activeTabId ? tab.activePane : ""}
+              interactive={visible && tab.id === activeTabId}
+              sessionByID={sessionByID}
+              workerByID={workerByID}
+              terminalSettings={terminalSettings}
+              token={token}
+              onFocusPane={onFocusPane}
+              onSplitPane={onSplitPane}
+              onClosePane={onClosePane}
+              dropTarget={dropTarget}
+              onDropTarget={onDropTarget}
+              onDropPayload={onDropPayload}
+              onTerminalSettingsChange={onTerminalSettingsChange}
+              setStatus={setStatus}
+            />
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -1477,25 +1629,29 @@ function CreateSessionModal({
   createForm,
   workerSearch,
   workers,
+  cwdOptions,
   onClose,
   onSubmit,
   onWorkerSearchChange,
   onFormChange,
+  onSelectCWD,
 }: {
   open: boolean;
-  createForm: { worker_id: string; name: string; cwd: string; command: string };
+  createForm: CreateSessionForm;
   workerSearch: string;
   workers: WorkerView[];
+  cwdOptions: string[];
   onClose: () => void;
   onSubmit: (event: React.FormEvent) => void;
   onWorkerSearchChange: (value: string) => void;
-  onFormChange: React.Dispatch<React.SetStateAction<{ worker_id: string; name: string; cwd: string; command: string }>>;
+  onFormChange: React.Dispatch<React.SetStateAction<CreateSessionForm>>;
+  onSelectCWD: (cwd: string) => void;
 }) {
   if (!open) return null;
 
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <Card className="w-full max-w-md bg-card/95 shadow-2xl">
+      <Card className="w-full max-w-lg bg-card/95 shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
             <div className="text-sm font-semibold">Create session</div>
@@ -1526,7 +1682,30 @@ function CreateSessionModal({
             {workers.length === 0 ? <div className="text-xs text-muted-foreground">No workers matched the current filter.</div> : null}
           </div>
           <Input value={createForm.name} onChange={(event) => onFormChange((form) => ({ ...form, name: event.target.value }))} placeholder="session name" />
-          <Input value={createForm.cwd} onChange={(event) => onFormChange((form) => ({ ...form, cwd: event.target.value }))} placeholder="working directory" />
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-medium uppercase text-muted-foreground">Working directory</div>
+              <div className="truncate text-[11px] text-muted-foreground">Validated by worker</div>
+            </div>
+            <Input value={createForm.cwd} onChange={(event) => onFormChange((form) => ({ ...form, cwd: event.target.value }))} placeholder="working directory" />
+            {cwdOptions.length ? (
+              <div className="flex flex-wrap gap-1">
+                {cwdOptions.map((cwd) => (
+                  <Button
+                    key={cwd}
+                    type="button"
+                    variant={createForm.cwd === cwd ? "secondary" : "ghost"}
+                    size="xs"
+                    className="max-w-[220px] px-2"
+                    title={cwd}
+                    onClick={() => onSelectCWD(cwd)}
+                  >
+                    <span className="truncate">{cwd}</span>
+                  </Button>
+                ))}
+              </div>
+            ) : null}
+          </div>
           <Input value={createForm.command} onChange={(event) => onFormChange((form) => ({ ...form, command: event.target.value }))} placeholder="command" />
           <div className="flex justify-end gap-2">
             <Button variant="ghost" type="button" onClick={onClose}>Cancel</Button>
@@ -1542,8 +1721,13 @@ function CreateSessionModal({
 }
 
 function LayoutRenderer({
+  tabId,
   node,
   activePane,
+  interactive,
+  sessionByID,
+  workerByID,
+  terminalSettings,
   token,
   onFocusPane,
   onSplitPane,
@@ -1551,31 +1735,45 @@ function LayoutRenderer({
   dropTarget,
   onDropTarget,
   onDropPayload,
+  onTerminalSettingsChange,
   setStatus,
 }: {
+  tabId: string;
   node: LayoutNode;
   activePane: string;
+  interactive: boolean;
+  sessionByID: Map<string, SessionView>;
+  workerByID: Map<string, WorkerView>;
+  terminalSettings: TerminalSettings;
   token: string;
-  onFocusPane: (id: string) => void;
-  onSplitPane: (paneId: string, direction: SplitDirection) => void;
-  onClosePane: (id: string) => void;
+  onFocusPane: (tabID: string, id: string) => void;
+  onSplitPane: (tabID: string, paneId: string, direction: SplitDirection) => void;
+  onClosePane: (tabID: string, id: string) => void;
   dropTarget: DropTarget | null;
   onDropTarget: (target: DropTarget | null) => void;
-  onDropPayload: (paneId: string, zone: DropZone, payload: DragPayload) => void;
+  onDropPayload: (tabID: string, paneId: string, zone: DropZone, payload: DragPayload) => void;
+  onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
   if (node.type === "pane") {
+    const session = node.sessionId ? sessionByID.get(node.sessionId) || null : null;
+    const worker = session ? workerByID.get(session.worker_id) || null : null;
     return (
       <TerminalPane
         pane={node}
+        session={session}
+        worker={worker}
         active={node.id === activePane}
+        interactive={interactive && node.id === activePane}
+        terminalSettings={terminalSettings}
         token={token}
-        onFocus={() => onFocusPane(node.id)}
-        onSplit={(direction) => onSplitPane(node.id, direction)}
-        onClose={() => onClosePane(node.id)}
+        onFocus={() => onFocusPane(tabId, node.id)}
+        onSplit={(direction) => onSplitPane(tabId, node.id, direction)}
+        onClose={() => onClosePane(tabId, node.id)}
         dropTarget={dropTarget?.paneId === node.id ? dropTarget : null}
         onDropTarget={onDropTarget}
-        onDropPayload={(zone, payload) => onDropPayload(node.id, zone, payload)}
+        onDropPayload={(zone, payload) => onDropPayload(tabId, node.id, zone, payload)}
+        onTerminalSettingsChange={onTerminalSettingsChange}
         setStatus={setStatus}
       />
     );
@@ -1594,8 +1792,13 @@ function LayoutRenderer({
           ) : null}
           <Panel minSize={15} className="min-h-0 min-w-0 overflow-hidden">
             <LayoutRenderer
+              tabId={tabId}
               node={child}
               activePane={activePane}
+              interactive={interactive}
+              sessionByID={sessionByID}
+              workerByID={workerByID}
+              terminalSettings={terminalSettings}
               token={token}
               onFocusPane={onFocusPane}
               onSplitPane={onSplitPane}
@@ -1603,6 +1806,7 @@ function LayoutRenderer({
               dropTarget={dropTarget}
               onDropTarget={onDropTarget}
               onDropPayload={onDropPayload}
+              onTerminalSettingsChange={onTerminalSettingsChange}
               setStatus={setStatus}
             />
           </Panel>
@@ -1614,7 +1818,11 @@ function LayoutRenderer({
 
 function TerminalPane({
   pane,
+  session,
+  worker,
   active,
+  interactive,
+  terminalSettings,
   token,
   onFocus,
   onSplit,
@@ -1622,10 +1830,15 @@ function TerminalPane({
   dropTarget,
   onDropTarget,
   onDropPayload,
+  onTerminalSettingsChange,
   setStatus,
 }: {
   pane: PaneNode;
+  session: SessionView | null;
+  worker: WorkerView | null;
   active: boolean;
+  interactive: boolean;
+  terminalSettings: TerminalSettings;
   token: string;
   onFocus: () => void;
   onSplit: (direction: SplitDirection) => void;
@@ -1633,6 +1846,7 @@ function TerminalPane({
   dropTarget: DropTarget | null;
   onDropTarget: (target: DropTarget | null) => void;
   onDropPayload: (zone: DropZone, payload: DragPayload) => void;
+  onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
   const terminalRef = React.useRef<HTMLDivElement | null>(null);
@@ -1644,11 +1858,34 @@ function TerminalPane({
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
-  const activeRef = React.useRef(active);
+  const activeRef = React.useRef(interactive);
+  const backend = sessionBackendLabel(session || undefined, worker);
+  const isTmux = backend.toLowerCase() === "tmux";
+  const workerTerminalSettings = workerTerminalSettingsFor(terminalSettings, worker?.id);
+  const tmuxPrefix = workerTerminalSettings.tmuxPrefix || defaultTmuxPrefix;
+  const tmuxPrefixLabel = displayControlSequence(tmuxPrefix);
 
   React.useEffect(() => {
-    activeRef.current = active;
-  }, [active]);
+    activeRef.current = interactive;
+  }, [interactive]);
+
+  function sendControlInput(data: string) {
+    if (!pane.sessionId || !streamId.current || !socket.current) return;
+    sendEnvelope(socket.current, "control.input", pane.sessionId, streamId.current, { data });
+  }
+
+  function sendTmuxPrefix() {
+    sendControlInput(tmuxPrefix);
+    terminal.current?.focus();
+  }
+
+  function configureTmuxPrefix() {
+    if (!worker?.id) return;
+    const value = window.prompt(`tmux prefix for ${workerDisplayLabel(worker)}`, tmuxPrefixLabel);
+    if (!value) return;
+    const encoded = parseControlSequence(value);
+    onTerminalSettingsChange(worker.id, { ...workerTerminalSettings, tmuxPrefix: encoded });
+  }
 
   React.useEffect(() => {
     if (!pane.sessionId || !terminalRef.current) return;
@@ -1727,7 +1964,7 @@ function TerminalPane({
       composing.current = false;
       compositionText.current = "";
       suppressNextText.current = data;
-      if (data) sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+      if (data && activeRef.current) sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
       if (helperTextarea) helperTextarea.value = "";
     };
     helperTextarea?.addEventListener("compositionstart", onCompositionStart);
@@ -1744,6 +1981,9 @@ function TerminalPane({
     helperTextarea?.addEventListener("focus", requestShortcutLock);
     helperTextarea?.addEventListener("blur", releaseShortcutLock);
     const dataDisposable = term.onData((data) => {
+      if (terminalInputSuppressed()) return;
+      if (isTerminalDeviceReport(data)) return;
+      if (!activeRef.current) return;
       if (suppressNextText.current && data === suppressNextText.current) {
         suppressNextText.current = "";
         return;
@@ -1753,9 +1993,12 @@ function TerminalPane({
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
     });
     term.attachCustomKeyEventHandler((event) => {
+      if (terminalInputSuppressed()) return true;
+      if (!activeRef.current) return true;
       if (event.type !== "keydown") return true;
       if (!shouldCaptureTerminalKey(event)) return true;
       const data = encodeKeyEvent(event);
+      if (isTerminalDeviceReport(data)) return true;
       if (!data) return true;
       event.preventDefault();
       event.stopPropagation();
@@ -1763,10 +2006,12 @@ function TerminalPane({
       return false;
     });
     const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (terminalInputSuppressed()) return;
       if (!activeRef.current || event.defaultPrevented) return;
       if (!terminalHasKeyboardFocus(event, terminalRef.current)) return;
       if (!shouldCaptureTerminalKey(event)) return;
       const data = encodeKeyEvent(event);
+      if (isTerminalDeviceReport(data)) return;
       if (!data) return;
       event.preventDefault();
       event.stopPropagation();
@@ -1804,7 +2049,10 @@ function TerminalPane({
   return (
     <div
       className={cn("relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
-      onMouseDown={onFocus}
+      onMouseDown={(event) => {
+        if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        onFocus();
+      }}
       onDragOver={(event) => {
         if (!hasAgentMuxDragPayload(event)) return;
         event.preventDefault();
@@ -1824,15 +2072,52 @@ function TerminalPane({
     >
       <div className="flex h-7 items-center justify-between border-b border-border bg-card px-1.5">
         <div
-          className="min-w-0 flex-1 cursor-grab truncate text-xs font-medium text-muted-foreground active:cursor-grabbing"
+          className="flex min-w-0 flex-1 cursor-grab items-center gap-1.5 truncate text-xs font-medium text-muted-foreground active:cursor-grabbing"
           draggable
           onDragStart={(event) => setDragPayload(event, { kind: "pane", paneId: pane.id })}
           onDragEnd={() => onDropTarget(null)}
           title="Drag pane"
         >
-          {pane.sessionId || "Empty pane"}
+          <span className="truncate">{pane.sessionId || "Empty pane"}</span>
+          {pane.sessionId ? <BackendBadge value={backend} /> : null}
         </div>
-        <div className="flex items-center gap-1">
+        <div
+          data-terminal-chrome
+          className="flex items-center gap-1"
+          onPointerDown={stopTerminalChromeEvent}
+          onPointerUp={stopTerminalChromeEvent}
+          onMouseDown={stopTerminalChromeEvent}
+          onMouseUp={stopTerminalChromeEvent}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {isTmux ? (
+            <>
+              <Button
+                variant="ghost"
+                size="xs"
+                className="h-7 px-1.5"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  sendTmuxPrefix();
+                }}
+                title={`Send tmux prefix for ${worker ? workerDisplayLabel(worker) : "worker"} (${tmuxPrefixLabel})`}
+              >
+                <Keyboard className="h-3.5 w-3.5" />
+                {tmuxPrefixLabel}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  configureTmuxPrefix();
+                }}
+                title="Configure tmux prefix"
+              >
+                <Settings className="h-4 w-4" />
+              </Button>
+            </>
+          ) : null}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -1908,23 +2193,24 @@ function newWorkspaceTab(sessionId?: string, title?: string): WorkspaceTab {
   const pane = newPane(sessionId);
   return {
     id: crypto.randomUUID(),
-    title: title || tabTitleForSession(sessionId) || "Workspace",
+    title: title || workspaceTitleForSession(sessionId),
+    renamed: false,
     layout: pane,
     activePane: pane.id,
   };
 }
 
-function titleForTab(currentTitle: string, layout: LayoutNode) {
+function titleForTab(tab: WorkspaceTab, layout: LayoutNode) {
+  if (tab.renamed) return tab.title;
   const sessionIDs = collectPanes(layout).map((pane) => pane.sessionId).filter((id): id is string => Boolean(id));
-  if (sessionIDs.length === 1) return tabTitleForSession(sessionIDs[0]);
+  if (sessionIDs.length === 1) return workspaceTitleForSession(sessionIDs[0]);
   if (sessionIDs.length > 1) return `${sessionIDs.length} sessions`;
-  return currentTitle || "Workspace";
+  return tab.title || "Workspace";
 }
 
-function tabTitleForSession(sessionId?: string) {
+function workspaceTitleForSession(sessionId?: string) {
   if (!sessionId) return "Workspace";
-  const parts = sessionId.split("/");
-  return parts[parts.length - 1] || sessionId;
+  return sessionId;
 }
 
 function updatePane(node: LayoutNode, paneId: string, update: (pane: PaneNode) => PaneNode): LayoutNode {
@@ -2088,6 +2374,23 @@ function base64ToBytes(value: string) {
   return bytes;
 }
 
+function suppressTerminalInput(durationMs = 600) {
+  terminalInputSuppressedUntil = Math.max(terminalInputSuppressedUntil, Date.now() + durationMs);
+}
+
+function terminalInputSuppressed() {
+  return Date.now() < terminalInputSuppressedUntil;
+}
+
+function stopTerminalChromeEvent(event: React.SyntheticEvent) {
+  suppressTerminalInput();
+  event.stopPropagation();
+}
+
+function isTerminalDeviceReport(value: string) {
+  return /^\x1b\[(?:\?|>)?[0-9;]*[cnR]$/.test(value);
+}
+
 function shouldCaptureTerminalKey(event: KeyboardEvent) {
   if (event.isComposing || event.metaKey) return false;
   return true;
@@ -2244,6 +2547,129 @@ function readStoredUser(): AuthUser | null {
   }
 }
 
+function readTerminalSettings(): TerminalSettings {
+  const fallback: TerminalSettings = { workers: {} };
+  const value = localStorage.getItem("agentmux.terminal_settings");
+  if (!value) return fallback;
+  try {
+    const settings = JSON.parse(value) as unknown;
+    return normalizeTerminalSettings(settings);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeTerminalSettings(value: unknown): TerminalSettings {
+  if (!isRecord(value)) return { workers: {} };
+  const legacyPrefix = typeof value.tmuxPrefix === "string" ? migrateLegacyTmuxPrefix(value.tmuxPrefix) : "";
+  const workers: Record<string, WorkerTerminalSettings> = {};
+  if (isRecord(value.workers)) {
+    for (const [workerId, settings] of Object.entries(value.workers)) {
+      if (!workerId || !isRecord(settings)) continue;
+      const tmuxPrefix = typeof settings.tmuxPrefix === "string" ? migrateLegacyTmuxPrefix(settings.tmuxPrefix) : defaultTmuxPrefix;
+      workers[workerId] = { tmuxPrefix };
+    }
+  }
+  if (legacyPrefix) workers.default = { tmuxPrefix: legacyPrefix };
+  return { workers };
+}
+
+function workerTerminalSettingsFor(settings: TerminalSettings, workerId?: string): WorkerTerminalSettings {
+  return {
+    tmuxPrefix: workerId ? settings.workers[workerId]?.tmuxPrefix || settings.workers.default?.tmuxPrefix || defaultTmuxPrefix : defaultTmuxPrefix,
+  };
+}
+
+function migrateLegacyTmuxPrefix(value?: string) {
+  if (!value || value === "\x14") return defaultTmuxPrefix;
+  return value;
+}
+
+function readWorkspaceState(): WorkspaceState {
+  const fallback = defaultWorkspaceState();
+  const value = localStorage.getItem("agentmux.workspace_state");
+  if (!value) return fallback;
+  try {
+    const payload = JSON.parse(value) as { tabs?: unknown; activeTabId?: unknown };
+    const tabs = Array.isArray(payload.tabs)
+      ? payload.tabs.map(normalizeWorkspaceTab).filter((tab): tab is WorkspaceTab => Boolean(tab))
+      : [];
+    if (!tabs.length) return fallback;
+    const activeTabId = typeof payload.activeTabId === "string" && tabs.some((tab) => tab.id === payload.activeTabId)
+      ? payload.activeTabId
+      : tabs[0].id;
+    return { tabs, activeTabId };
+  } catch {
+    return fallback;
+  }
+}
+
+function readRecentCWDs(): RecentCWDState {
+  const value = localStorage.getItem("agentmux.recent_cwds");
+  if (!value) return {};
+  try {
+    const payload = JSON.parse(value);
+    if (!isRecord(payload)) return {};
+    const next: RecentCWDState = {};
+    for (const [workerID, items] of Object.entries(payload)) {
+      if (!workerID || !Array.isArray(items)) continue;
+      next[workerID] = uniqueStrings(items.filter((item): item is string => typeof item === "string"), 8);
+    }
+    return next;
+  } catch {
+    return {};
+  }
+}
+
+function defaultWorkspaceState(): WorkspaceState {
+  const tab = newWorkspaceTab(undefined, "Workspace 1");
+  return { tabs: [tab], activeTabId: tab.id };
+}
+
+function normalizeWorkspaceTab(value: unknown): WorkspaceTab | null {
+  if (!isRecord(value)) return null;
+  const layout = normalizeLayoutNode(value.layout);
+  if (!layout) return null;
+  const activePane = typeof value.activePane === "string" && findPane(layout, value.activePane)
+    ? value.activePane
+    : firstPaneId(layout);
+  const tab: WorkspaceTab = {
+    id: typeof value.id === "string" && value.id ? value.id : crypto.randomUUID(),
+    title: typeof value.title === "string" && value.title.trim() ? value.title.trim() : "Workspace",
+    renamed: value.renamed === true,
+    layout,
+    activePane,
+  };
+  return { ...tab, title: titleForTab(tab, layout) };
+}
+
+function normalizeLayoutNode(value: unknown): LayoutNode | null {
+  if (!isRecord(value) || typeof value.type !== "string") return null;
+  if (value.type === "pane") {
+    return {
+      type: "pane",
+      id: typeof value.id === "string" && value.id ? value.id : crypto.randomUUID(),
+      sessionId: typeof value.sessionId === "string" && value.sessionId ? value.sessionId : undefined,
+    };
+  }
+  if (value.type !== "split") return null;
+  const children = Array.isArray(value.children)
+    ? value.children.map(normalizeLayoutNode).filter((child): child is LayoutNode => Boolean(child))
+    : [];
+  if (!children.length) return null;
+  if (children.length === 1) return children[0];
+  return {
+    type: "split",
+    id: typeof value.id === "string" && value.id ? value.id : crypto.randomUUID(),
+    direction: value.direction === "vertical" ? "vertical" : "horizontal",
+    children,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function workerDisplayLabel(worker: WorkerView) {
   return worker.name && worker.name !== worker.id ? `${worker.name} (${worker.id})` : worker.id;
 }
@@ -2273,6 +2699,28 @@ function filterWorkers(workers: WorkerView[], query: string) {
   });
 }
 
+function buildCWDOptions(workerID: string, sessions: SessionView[], recentCWDs: RecentCWDState) {
+  const scopedSessions = workerID ? sessions.filter((session) => session.worker_id === workerID) : [];
+  return uniqueStrings([
+    ".",
+    ...((workerID && recentCWDs[workerID]) || []),
+    ...scopedSessions.map((session) => session.cwd),
+  ], 10);
+}
+
+function uniqueStrings(values: string[], limit: number) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const item = value.trim();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    result.push(item);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
 function filterSessions(sessions: SessionView[], workers: WorkerView[], workerFilter: string, query: string) {
   const workerByID = new Map(workers.map((worker) => [worker.id, worker]));
   const needle = query.trim().toLowerCase();
@@ -2299,8 +2747,33 @@ function filterSessions(sessions: SessionView[], workers: WorkerView[], workerFi
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function sessionBackendLabel(session: SessionView, worker?: WorkerView | null) {
-  return session.backend || worker?.backend || "unknown";
+function sessionBackendLabel(session?: SessionView | null, worker?: WorkerView | null) {
+  return session?.backend || worker?.backend || "unknown";
+}
+
+function displayControlSequence(value: string) {
+  if (value.length === 1) {
+    const code = value.charCodeAt(0);
+    if (code >= 1 && code <= 26) return `Ctrl-${String.fromCharCode(code + 64).toLowerCase()}`;
+    if (code === 0) return "Ctrl-Space";
+    if (code === 27) return "Esc";
+  }
+  return value;
+}
+
+function parseControlSequence(value: string) {
+  const trimmed = value.trim();
+  const ctrl = /^ctrl[-+ ](.+)$/i.exec(trimmed);
+  if (ctrl) {
+    const key = ctrl[1].trim();
+    if (key.toLowerCase() === "space") return "\x00";
+    if (key.length === 1) return controlSequence(key);
+  }
+  if (/^\\x[0-9a-f]{2}$/i.test(trimmed)) {
+    return String.fromCharCode(Number.parseInt(trimmed.slice(2), 16));
+  }
+  if (trimmed.toLowerCase() === "esc") return "\x1b";
+  return trimmed || defaultTmuxPrefix;
 }
 
 function stripAnsi(value: string) {

@@ -216,13 +216,21 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 		case protocol.TypeSessionCreate:
 			var session protocol.Session
 			if err := env.DecodePayload(&session); err != nil {
-				w.sendError(conn, env.SessionID, err.Error())
+				w.sendRequestError(conn, env.ID, env.SessionID, err.Error())
 				continue
 			}
+			sessionID := protocol.SessionID(w.ID, session.Name)
 			if err := w.Backend.Create(ctx, session.Name, session.CWD, session.Command); err != nil {
-				w.sendError(conn, protocol.SessionID(w.ID, session.Name), err.Error())
+				w.sendRequestError(conn, env.ID, sessionID, err.Error())
 				continue
 			}
+			reply, _ := protocol.NewEnvelope(protocol.TypeSessionCreated, protocol.Session{
+				Name: session.Name, CWD: session.CWD, Command: session.Command, Status: "running", Backend: w.Backend.Name(),
+			})
+			reply.ID = env.ID
+			reply.WorkerID = w.ID
+			reply.SessionID = sessionID
+			_ = writeEnvelope(conn, reply)
 			_ = w.sendSnapshot(ctx, conn)
 		case protocol.TypeSessionKill:
 			name := payloadName(env)

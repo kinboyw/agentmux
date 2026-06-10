@@ -465,6 +465,117 @@ func TestDisabledWorkerRejectsCreateAndAttach(t *testing.T) {
 	}
 }
 
+func TestSessionCreateWaitsForWorkerAck(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 1),
+	}
+	server.registerWorker(worker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions", bytes.NewReader([]byte(`{"worker_id":"local","name":"demo","cwd":"/tmp/demo","command":"bash"}`)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.requireRole("control", server.handleSessions)(rec, req)
+		close(done)
+	}()
+
+	var requestID string
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeSessionCreate {
+			t.Fatalf("unexpected type: %s", env.Type)
+		}
+		requestID = env.ID
+		if requestID == "" {
+			t.Fatal("session.create should include request id")
+		}
+		if env.SessionID != "local/demo" {
+			t.Fatalf("unexpected session id: %s", env.SessionID)
+		}
+		var payload protocol.Session
+		if err := env.DecodePayload(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.CWD != "/tmp/demo" || payload.Command != "bash" {
+			t.Fatalf("unexpected create payload: %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive session.create")
+	}
+
+	reply, err := protocol.NewEnvelope(protocol.TypeSessionCreated, protocol.Session{Name: "demo", CWD: "/tmp/demo", Command: "bash", Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply.ID = requestID
+	reply.SessionID = "local/demo"
+	server.handleWorkerMessage(worker, reply)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("create request did not complete")
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"created"`) {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestSessionCreateReturnsWorkerValidationError(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 1),
+	}
+	server.registerWorker(worker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions", bytes.NewReader([]byte(`{"worker_id":"local","name":"demo","cwd":"/missing","command":"bash"}`)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.requireRole("control", server.handleSessions)(rec, req)
+		close(done)
+	}()
+
+	var requestID string
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeSessionCreate {
+			t.Fatalf("unexpected type: %s", env.Type)
+		}
+		requestID = env.ID
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive session.create")
+	}
+
+	reply, err := protocol.NewEnvelope(protocol.TypeError, protocol.ErrorPayload{Message: "working directory not found"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply.ID = requestID
+	reply.SessionID = "local/demo"
+	server.handleWorkerMessage(worker, reply)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("create request did not complete")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "working directory not found") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
 func TestControlCredentialMintsSignalForOwnTenant(t *testing.T) {
 	server := New(":0", "", nil)
 	body := []byte(`{"email":"user@example.com","password":"password123","name":"User","device_name":"browser"}`)
