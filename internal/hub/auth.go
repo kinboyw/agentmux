@@ -43,6 +43,7 @@ type AuthStore interface {
 	Refresh(req refreshRequest) (authCredentialResponse, error)
 	StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error)
 	ApproveDeviceAuth(req deviceApproveRequest) (authCredentialResponse, error)
+	ApproveDeviceAuthForUser(userEmail, userCode string) (authCredentialResponse, error)
 	PollDeviceAuth(req devicePollRequest) (devicePollResponse, error)
 	DeviceAuthInfo(userCode string) (deviceAuthInfo, bool)
 	Credential(token string) (credentialEntry, bool)
@@ -467,6 +468,50 @@ func (s *authStore) ApproveDeviceAuth(req deviceApproveRequest) (authCredentialR
 		s.devices[deviceHash] = device
 		return authCredentialResponse{}, fmt.Errorf("authorization failed")
 	}
+	return s.approveDeviceAuthForUserLocked(deviceHash, device, user, now)
+}
+
+func (s *authStore) ApproveDeviceAuthForUser(userEmail, userCode string) (authCredentialResponse, error) {
+	code := normalizeUserCode(userCode)
+	if code == "" {
+		return authCredentialResponse{}, fmt.Errorf("user code is required")
+	}
+	email := normalizeEmail(userEmail)
+	if email == "" {
+		return authCredentialResponse{}, fmt.Errorf("authenticated user is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	user, ok := s.users[email]
+	if !ok {
+		return authCredentialResponse{}, fmt.Errorf("authenticated user is missing")
+	}
+	var deviceHash string
+	var device deviceAuthEntry
+	for hash, entry := range s.devices {
+		if entry.UserCodeHash == tokenHash(code) {
+			deviceHash = hash
+			device = entry
+			break
+		}
+	}
+	if deviceHash == "" || now.After(device.ExpiresAt) {
+		return authCredentialResponse{}, fmt.Errorf("authorization failed")
+	}
+	if device.Status != "pending" {
+		return authCredentialResponse{}, fmt.Errorf("device authorization is %s", device.Status)
+	}
+	if device.AttemptCount >= maxDeviceApproveFailures {
+		device.Status = "blocked"
+		s.devices[deviceHash] = device
+		return authCredentialResponse{}, fmt.Errorf("device authorization is blocked")
+	}
+	return s.approveDeviceAuthForUserLocked(deviceHash, device, user, now)
+}
+
+func (s *authStore) approveDeviceAuthForUserLocked(deviceHash string, device deviceAuthEntry, user userEntry, now time.Time) (authCredentialResponse, error) {
 	credential, err := s.issueControlCredentialLocked(user, device.DeviceID, device.DeviceName, now)
 	if err != nil {
 		return authCredentialResponse{}, err
@@ -684,8 +729,12 @@ func installWorkerCommand(baseURL string, signal string) string {
 	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- worker --join %s --name \"$(hostname)\"", baseURL, shellQuote(signal))
 }
 
+func workerJoinCommand(baseURL string, signal string) string {
+	return fmt.Sprintf("agentmux worker join --hub %s --join %s --name \"$(hostname)\"", shellQuote(websocketBase(baseURL)), shellQuote(signal))
+}
+
 func installControlCommand(baseURL string) string {
-	return fmt.Sprintf("agentmux control login --hub %s", shellQuote(baseURL))
+	return fmt.Sprintf("agentmux-tui --hub %s", shellQuote(baseURL))
 }
 
 func websocketBase(baseURL string) string {

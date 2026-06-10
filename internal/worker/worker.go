@@ -20,6 +20,11 @@ import (
 	"private/agentmux/internal/ws"
 )
 
+const (
+	workerPingInterval = 15 * time.Second
+	workerPongWait     = 45 * time.Second
+)
+
 type AuthOptions struct {
 	HubURL     string
 	Token      string
@@ -136,6 +141,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	backoff := 2 * time.Second
 	for {
 		if err := w.runOnce(ctx, target); err != nil && ctx.Err() == nil {
 			w.Logger.Error("worker connection failed", "error", err)
@@ -143,7 +149,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
 		}
 	}
 }
@@ -163,12 +172,15 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 	if err := w.sendSnapshot(ctx, conn); err != nil {
 		w.Logger.Error("snapshot failed", "error", err)
 	}
+	_ = conn.SetReadTimeout(workerPongWait)
 
 	done := make(chan error, 1)
 	go func() { done <- w.readLoop(ctx, conn) }()
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	pingTicker := time.NewTicker(workerPingInterval)
+	defer pingTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -182,6 +194,10 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 				return err
 			}
 			_ = w.sendSnapshot(ctx, conn)
+		case <-pingTicker.C:
+			if err := conn.WritePing([]byte("agentmux")); err != nil {
+				return err
+			}
 		}
 	}
 }

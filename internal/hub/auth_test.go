@@ -244,6 +244,55 @@ func testAuthStoreDeviceLogin(t *testing.T, store AuthStore) {
 	}
 }
 
+func TestAuthStoreDeviceLoginApprovesCurrentUser(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		testAuthStoreDeviceLoginApprovesCurrentUser(t, newAuthStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		store, err := OpenSQLiteAuthStore(t.TempDir() + "/agentmux.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		testAuthStoreDeviceLoginApprovesCurrentUser(t, store)
+	})
+}
+
+func testAuthStoreDeviceLoginApprovesCurrentUser(t *testing.T, store AuthStore) {
+	t.Helper()
+	registered, err := store.Register(registerRequest{
+		Email: "current@example.com", Password: "password123", Name: "Current",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := store.StartDeviceAuth(deviceStartRequest{DeviceID: "cli", DeviceName: "CLI"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := store.ApproveDeviceAuthForUser("current@example.com", start.UserCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approved.TenantID != registered.TenantID || approved.User.Email != registered.User.Email || approved.DeviceID != "cli" {
+		t.Fatalf("unexpected approved credential: %+v", approved)
+	}
+	if _, err := store.ApproveDeviceAuthForUser("current@example.com", start.UserCode); err == nil {
+		t.Fatal("device code should not approve twice")
+	}
+	polled, err := store.PollDeviceAuth(devicePollRequest{DeviceCode: start.DeviceCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polled.Status != "approved" || polled.Credential == nil || polled.Credential.Credential != approved.Credential {
+		t.Fatalf("unexpected poll response: %+v", polled)
+	}
+}
+
 func TestAuthStoreDeviceLoginBlocksRepeatedFailures(t *testing.T) {
 	t.Run("memory", func(t *testing.T) {
 		testAuthStoreDeviceLoginBlocksRepeatedFailures(t, newAuthStore())

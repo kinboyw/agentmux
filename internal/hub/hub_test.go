@@ -150,7 +150,10 @@ func TestSignalIncludesWorkerJoinCommand(t *testing.T) {
 	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL http://agentmux.test/install.sh") || strings.Contains(got, "go run") {
 		t.Fatalf("unexpected worker command: %s", got)
 	}
-	if got := payload["control_command"].(string); got != "agentmux control login --hub 'http://agentmux.test'" {
+	if got := payload["worker_join_command"].(string); got != "agentmux worker join --hub 'ws://agentmux.test' --join "+shellQuote(signal)+" --name \"$(hostname)\"" {
+		t.Fatalf("unexpected installed worker join command: %s", got)
+	}
+	if got := payload["control_command"].(string); got != "agentmux-tui --hub 'http://agentmux.test'" {
 		t.Fatalf("unexpected control command: %s", got)
 	}
 }
@@ -434,6 +437,10 @@ func TestDeviceLoginEndpoints(t *testing.T) {
 	if registerRec.Code != http.StatusCreated {
 		t.Fatalf("unexpected register status: %d body=%s", registerRec.Code, registerRec.Body.String())
 	}
+	var registerPayload authCredentialResponse
+	if err := json.NewDecoder(registerRec.Body).Decode(&registerPayload); err != nil {
+		t.Fatal(err)
+	}
 
 	startBody := []byte(`{"device_id":"cli","device_name":"CLI"}`)
 	startReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/start", bytes.NewReader(startBody))
@@ -459,14 +466,22 @@ func TestDeviceLoginEndpoints(t *testing.T) {
 	if pageRec.Header().Get("Referrer-Policy") != "no-referrer" || pageRec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("missing device page security headers: %+v", pageRec.Header())
 	}
-	if body := pageRec.Body.String(); !strings.Contains(body, "CLI") || !strings.Contains(body, "history.replaceState") || !strings.Contains(body, "Continue with GitHub") {
+	if body := pageRec.Body.String(); !strings.Contains(body, "CLI") || !strings.Contains(body, "history.replaceState") || !strings.Contains(body, "Continue with GitHub") || !strings.Contains(body, "approve-current") {
 		t.Fatalf("device page missing context or OAuth placeholders: %s", body)
 	}
 
-	approveBody := []byte(`{"user_code":"` + start.UserCode + `","email":"device@example.com","password":"password123"}`)
-	approveReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/approve", bytes.NewReader(approveBody))
+	unauthorizedBody := []byte(`{"user_code":"` + start.UserCode + `"}`)
+	unauthorizedReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/approve-current", bytes.NewReader(unauthorizedBody))
+	unauthorizedRec := httptest.NewRecorder()
+	server.handleDeviceApproveCurrent(unauthorizedRec, unauthorizedReq)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized approve-current status, got %d body=%s", unauthorizedRec.Code, unauthorizedRec.Body.String())
+	}
+
+	approveReq := httptest.NewRequest(http.MethodPost, "/api/auth/device/approve-current", bytes.NewReader(unauthorizedBody))
+	approveReq.Header.Set("Authorization", "Bearer "+registerPayload.Credential)
 	approveRec := httptest.NewRecorder()
-	server.handleDeviceApprove(approveRec, approveReq)
+	server.handleDeviceApproveCurrent(approveRec, approveReq)
 	if approveRec.Code != http.StatusCreated {
 		t.Fatalf("unexpected approve status: %d body=%s", approveRec.Code, approveRec.Body.String())
 	}

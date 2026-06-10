@@ -10,6 +10,12 @@ import (
 
 type Config struct {
 	WorkerBackend string `json:"worker_backend,omitempty"`
+	WorkerHubURL  string `json:"worker_hub_url,omitempty"`
+	// WorkerToken is kept only for reading old config.json files. New writes
+	// store credentials in credentials.json through credentialcache.
+	WorkerToken string `json:"worker_token,omitempty"`
+	WorkerID    string `json:"worker_id,omitempty"`
+	WorkerName  string `json:"worker_name,omitempty"`
 }
 
 func Path() (string, error) {
@@ -37,6 +43,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.WorkerBackend = strings.TrimSpace(cfg.WorkerBackend)
+	cfg.WorkerHubURL = strings.TrimSpace(cfg.WorkerHubURL)
+	cfg.WorkerToken = strings.TrimSpace(cfg.WorkerToken)
+	cfg.WorkerID = strings.TrimSpace(cfg.WorkerID)
+	cfg.WorkerName = strings.TrimSpace(cfg.WorkerName)
 	return cfg, nil
 }
 
@@ -49,6 +59,10 @@ func Save(cfg Config) error {
 		return err
 	}
 	cfg.WorkerBackend = strings.TrimSpace(cfg.WorkerBackend)
+	cfg.WorkerHubURL = strings.TrimSpace(cfg.WorkerHubURL)
+	cfg.WorkerToken = ""
+	cfg.WorkerID = strings.TrimSpace(cfg.WorkerID)
+	cfg.WorkerName = strings.TrimSpace(cfg.WorkerName)
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -57,6 +71,18 @@ func Save(cfg Config) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+func SaveWorkerAuth(hubURL, _ string, id, name string) error {
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	cfg.WorkerHubURL = strings.TrimSpace(hubURL)
+	cfg.WorkerToken = ""
+	cfg.WorkerID = strings.TrimSpace(id)
+	cfg.WorkerName = strings.TrimSpace(name)
+	return Save(cfg)
 }
 
 func SaveWorkerBackend(backend string) error {

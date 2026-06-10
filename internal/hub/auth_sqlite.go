@@ -421,6 +421,49 @@ func (s *sqliteAuthStore) ApproveDeviceAuth(req deviceApproveRequest) (authCrede
 		)
 		return authCredentialResponse{}, fmt.Errorf("authorization failed")
 	}
+	return s.approveDeviceAuthForUserLocked(device, user, now)
+}
+
+func (s *sqliteAuthStore) ApproveDeviceAuthForUser(userEmail, userCode string) (authCredentialResponse, error) {
+	code := normalizeUserCode(userCode)
+	if code == "" {
+		return authCredentialResponse{}, fmt.Errorf("user code is required")
+	}
+	email := normalizeEmail(userEmail)
+	if email == "" {
+		return authCredentialResponse{}, fmt.Errorf("authenticated user is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(now); err != nil {
+		return authCredentialResponse{}, err
+	}
+	user, ok, err := s.userByEmail(email)
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	if !ok {
+		return authCredentialResponse{}, fmt.Errorf("authenticated user is missing")
+	}
+	device, ok, err := s.deviceByUserCodeHash(tokenHash(code))
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	if !ok || now.After(device.ExpiresAt) {
+		return authCredentialResponse{}, fmt.Errorf("authorization failed")
+	}
+	if device.Status != "pending" {
+		return authCredentialResponse{}, fmt.Errorf("device authorization is %s", device.Status)
+	}
+	if device.AttemptCount >= maxDeviceApproveFailures {
+		_, _ = s.db.Exec(`UPDATE device_auth_sessions SET status = ? WHERE device_code_hash = ?`, "blocked", device.DeviceCodeHash)
+		return authCredentialResponse{}, fmt.Errorf("device authorization is blocked")
+	}
+	return s.approveDeviceAuthForUserLocked(device, user, now)
+}
+
+func (s *sqliteAuthStore) approveDeviceAuthForUserLocked(device deviceAuthEntry, user userEntry, now time.Time) (authCredentialResponse, error) {
 	credential, err := s.issueControlCredentialLocked(user, device.DeviceID, device.DeviceName, now)
 	if err != nil {
 		return authCredentialResponse{}, err

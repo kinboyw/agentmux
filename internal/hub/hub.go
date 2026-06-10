@@ -21,6 +21,11 @@ import (
 	"private/agentmux/internal/ws"
 )
 
+const (
+	wsPingInterval = 15 * time.Second
+	wsPongWait     = 45 * time.Second
+)
+
 //go:embed webdist docassets
 var webDist embed.FS
 
@@ -49,6 +54,8 @@ type workerConn struct {
 	lastSeen time.Time
 	conn     *ws.Conn
 	send     chan protocol.Envelope
+	done     chan struct{}
+	close    sync.Once
 }
 
 type workerRecord struct {
@@ -65,6 +72,8 @@ type controlConn struct {
 	send     chan protocol.Envelope
 	tenantID string
 	admin    bool
+	done     chan struct{}
+	close    sync.Once
 }
 
 type authContext struct {
@@ -185,6 +194,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/auth/device/start", s.handleDeviceStart)
 	mux.HandleFunc("/api/auth/device/poll", s.handleDevicePoll)
 	mux.HandleFunc("/api/auth/device/approve", s.handleDeviceApprove)
+	mux.HandleFunc("/api/auth/device/approve-current", s.handleDeviceApproveCurrent)
 	mux.HandleFunc("/api/auth/oauth/", s.handleAuthOAuth)
 	mux.HandleFunc("/api/workers", s.requireRole("control", s.handleWorkers))
 	mux.HandleFunc("/api/sessions", s.requireRole("control", s.handleSessions))
@@ -317,17 +327,18 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := s.requestBaseURL(r)
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"token":           minted.Signal,
-		"signal":          minted.Signal,
-		"signal_id":       minted.ID,
-		"tenant_id":       minted.TenantID,
-		"expires_at":      minted.ExpiresAt,
-		"uses_remaining":  minted.UsesRemaining,
-		"reusable":        minted.UsesRemaining < 0,
-		"scopes":          minted.Scopes,
-		"worker_command":  installWorkerCommand(baseURL, minted.Signal),
-		"control_command": installControlCommand(baseURL),
-		"control_url":     baseURL + "/control",
+		"token":               minted.Signal,
+		"signal":              minted.Signal,
+		"signal_id":           minted.ID,
+		"tenant_id":           minted.TenantID,
+		"expires_at":          minted.ExpiresAt,
+		"uses_remaining":      minted.UsesRemaining,
+		"reusable":            minted.UsesRemaining < 0,
+		"scopes":              minted.Scopes,
+		"worker_command":      installWorkerCommand(baseURL, minted.Signal),
+		"worker_join_command": workerJoinCommand(baseURL, minted.Signal),
+		"control_command":     installControlCommand(baseURL),
+		"control_url":         baseURL + "/control",
 	})
 }
 
@@ -458,6 +469,40 @@ func (s *Server) handleDeviceApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	credential, err := s.auth.ApproveDeviceAuth(req)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleDeviceApproveCurrent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	auth, ok := s.authenticateRole(r, "control")
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if auth.Credential.UserEmail == "" {
+		writeError(w, http.StatusForbidden, "current credential is not associated with a user")
+		return
+	}
+	var req struct {
+		UserCode string `json:"user_code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limitKey := remoteHost(r.RemoteAddr) + "|" + normalizeUserCode(req.UserCode)
+	if !s.rateLimiter.Allow(limitKey) {
+		writeError(w, http.StatusTooManyRequests, "too many authorization attempts")
+		return
+	}
+	credential, err := s.auth.ApproveDeviceAuthForUser(auth.Credential.UserEmail, req.UserCode)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -642,11 +687,14 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		lastSeen: time.Now().UTC(),
 		conn:     conn,
 		send:     make(chan protocol.Envelope, 64),
+		done:     make(chan struct{}),
 	}
 	s.registerWorker(worker)
 	defer s.unregisterWorker(worker)
 
-	go writeLoop(conn, worker.send)
+	go writeLoop(conn, worker.send, worker.done)
+	go pingLoop(conn, worker.done, wsPingInterval)
+	_ = conn.SetReadTimeout(wsPongWait)
 	for {
 		env, err := readEnvelope(conn)
 		if err != nil {
@@ -667,9 +715,11 @@ func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("control websocket upgrade failed", "error", err)
 		return
 	}
-	control := &controlConn{conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin}
+	control := &controlConn{conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin, done: make(chan struct{})}
 	defer s.removeControl(control)
-	go writeLoop(conn, control.send)
+	go writeLoop(conn, control.send, control.done)
+	go pingLoop(conn, control.done, wsPingInterval)
+	_ = conn.SetReadTimeout(wsPongWait)
 	for {
 		env, err := readEnvelope(conn)
 		if err != nil {
@@ -680,10 +730,21 @@ func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) registerWorker(worker *workerConn) {
+	if worker.done == nil {
+		worker.done = make(chan struct{})
+	}
 	s.mu.Lock()
 	old := s.workers[worker.id]
 	if old != nil {
-		_ = old.conn.Close()
+		old.close.Do(func() {
+			if old.done != nil {
+				close(old.done)
+			}
+		})
+		if old.conn != nil {
+			_ = old.conn.Close()
+		}
+		s.logger.Warn("worker connection replaced", "worker", worker.id)
 	}
 	s.workers[worker.id] = worker
 	s.workerViews[worker.id] = workerRecord{
@@ -704,6 +765,11 @@ func (s *Server) unregisterWorker(worker *workerConn) {
 		s.mu.Unlock()
 		return
 	}
+	worker.close.Do(func() {
+		if worker.done != nil {
+			close(worker.done)
+		}
+	})
 	delete(s.workers, worker.id)
 	record := s.workerViews[worker.id]
 	if record.id == "" {
@@ -854,6 +920,11 @@ func (s *Server) addSubscriber(streamID string, control *controlConn) {
 }
 
 func (s *Server) removeControl(control *controlConn) {
+	control.close.Do(func() {
+		if control.done != nil {
+			close(control.done)
+		}
+	})
 	s.mu.Lock()
 	for id, subscribed := range s.subscribers {
 		if subscribed == control {
@@ -1076,14 +1147,34 @@ func readEnvelope(conn *ws.Conn) (protocol.Envelope, error) {
 	return env, env.Validate()
 }
 
-func writeLoop(conn *ws.Conn, send <-chan protocol.Envelope) {
-	for env := range send {
-		raw, err := json.Marshal(env)
-		if err != nil {
-			continue
-		}
-		if err := conn.WriteText(string(raw)); err != nil {
+func writeLoop(conn *ws.Conn, send <-chan protocol.Envelope, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
 			return
+		case env := <-send:
+			raw, err := json.Marshal(env)
+			if err != nil {
+				continue
+			}
+			if err := conn.WriteText(string(raw)); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func pingLoop(conn *ws.Conn, done <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := conn.WritePing([]byte("agentmux")); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -1253,6 +1344,12 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
     .row { display: flex; justify-content: space-between; gap: 14px; font-size: 12px; color: #9aa4aa; }
     .row strong { color: #eef2f3; font-weight: 650; text-align: right; overflow-wrap: anywhere; }
     .warning { margin: 0 22px; color: #d7b46a; font-size: 12px; line-height: 1.45; }
+    .auth-panel { display: grid; gap: 12px; padding: 18px 22px 22px; }
+    .account { display: grid; gap: 3px; padding: 12px; border: 1px solid rgba(53,201,143,.28); border-radius: 8px; background: rgba(53,201,143,.08); }
+    .account strong { font-size: 14px; }
+    .account span { color: #9aa4aa; font-size: 12px; overflow-wrap: anywhere; }
+    .muted-button { border-color: rgba(255,255,255,.14); background: #0b0e10; color: #eef2f3; }
+    .hidden { display: none !important; }
     #status { min-height: 18px; font-size: 12px; color: #9aa4aa; }
   </style>
 </head>
@@ -1272,6 +1369,17 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
     {{else}}
     <p class="warning">Only approve this request if you just ran <strong>agentmux control login</strong> in your own terminal.</p>
     {{end}}
+    <section id="current-auth" class="auth-panel hidden">
+      <label>Code<input id="current_user_code" autocomplete="one-time-code" value="{{.UserCode}}" required></label>
+      <div class="account">
+        <strong id="current_name">Signed in</strong>
+        <span id="current_email"></span>
+      </div>
+      <button id="approve-current" type="button">Authorize with this account</button>
+      <button class="muted-button" id="use-other" type="button">Use another account</button>
+      <button class="danger" id="deny-current" type="button">Deny request</button>
+      <div id="current_status"></div>
+    </section>
     <form id="form">
       <label>Code<input id="user_code" name="user_code" autocomplete="one-time-code" value="{{.UserCode}}" required></label>
       <div class="oauth-grid">
@@ -1290,21 +1398,126 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
     if (window.location.search) {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
+    const currentAuth = document.getElementById('current-auth');
+    const form = document.getElementById('form');
+    const currentStatus = document.getElementById('current_status');
+    const status = document.getElementById('status');
+    function readStoredUser() {
+      try {
+        return JSON.parse(localStorage.getItem('agentmux.user') || 'null');
+      } catch {
+        return null;
+      }
+    }
+    function setOptionalStorage(key, value) {
+      if (value) {
+        localStorage.setItem(key, value);
+      } else {
+        localStorage.removeItem(key);
+      }
+    }
+    function storeBrowserCredential(data) {
+      if (!data || !data.credential) return;
+      localStorage.setItem('agentmux.token', data.credential);
+      setOptionalStorage('agentmux.token_expires_at', data.expires_at);
+      setOptionalStorage('agentmux.refresh_token', data.refresh_token);
+      setOptionalStorage('agentmux.refresh_expires_at', data.refresh_expires_at);
+      if (data.user) {
+        localStorage.setItem('agentmux.user', JSON.stringify(data.user));
+      }
+    }
+    function clearBrowserCredential() {
+      localStorage.removeItem('agentmux.token');
+      localStorage.removeItem('agentmux.token_expires_at');
+      localStorage.removeItem('agentmux.refresh_token');
+      localStorage.removeItem('agentmux.refresh_expires_at');
+      localStorage.removeItem('agentmux.user');
+    }
+    async function refreshBrowserCredential() {
+      const refreshToken = localStorage.getItem('agentmux.refresh_token') || '';
+      if (!refreshToken) return '';
+      const res = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken })
+      });
+      if (!res.ok) {
+        clearBrowserCredential();
+        return '';
+      }
+      const data = await res.json();
+      storeBrowserCredential(data);
+      return data.credential || '';
+    }
+    function showPasswordLogin(message) {
+      currentAuth.classList.add('hidden');
+      form.classList.remove('hidden');
+      if (message) status.textContent = message;
+    }
+    function showCurrentUser(user) {
+      document.getElementById('current_name').textContent = user.name || user.email || 'Signed in';
+      document.getElementById('current_email').textContent = user.email || '';
+      currentAuth.classList.remove('hidden');
+      form.classList.add('hidden');
+    }
+    const storedUser = readStoredUser();
+    if (storedUser && (localStorage.getItem('agentmux.token') || localStorage.getItem('agentmux.refresh_token'))) {
+      showCurrentUser(storedUser);
+    }
     document.querySelectorAll('[data-provider]').forEach(button => {
       button.addEventListener('click', () => {
-        const status = document.getElementById('status');
         const provider = button.getAttribute('data-provider');
         status.textContent = provider + ' OAuth is reserved for the next auth milestone.';
       });
     });
+    document.getElementById('use-other').addEventListener('click', () => {
+      showPasswordLogin('Sign in with another account to authorize this device.');
+    });
+    document.getElementById('deny-current').addEventListener('click', () => {
+      document.getElementById('current_user_code').value = '';
+      currentStatus.textContent = 'Request denied locally. The terminal login will expire automatically.';
+    });
     document.getElementById('deny').addEventListener('click', () => {
-      const status = document.getElementById('status');
       document.getElementById('user_code').value = '';
       status.textContent = 'Request denied locally. The terminal login will expire automatically.';
     });
+    async function approveWithCurrentCredential(accessToken) {
+      return fetch('/api/auth/device/approve-current', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + accessToken },
+        body: JSON.stringify({ user_code: document.getElementById('current_user_code').value })
+      });
+    }
+    document.getElementById('approve-current').addEventListener('click', async () => {
+      currentStatus.textContent = 'Authorizing...';
+      let accessToken = localStorage.getItem('agentmux.token') || '';
+      if (!accessToken) {
+        accessToken = await refreshBrowserCredential();
+      }
+      if (!accessToken) {
+        showPasswordLogin('Your browser session expired. Sign in again to authorize this device.');
+        return;
+      }
+      let res = await approveWithCurrentCredential(accessToken);
+      if (res.status === 401) {
+        accessToken = await refreshBrowserCredential();
+        if (accessToken) {
+          res = await approveWithCurrentCredential(accessToken);
+        }
+      }
+      if (!res.ok) {
+        const detail = await res.text();
+        if (res.status === 401 || res.status === 403) {
+          showPasswordLogin(detail || 'Sign in again to authorize this device.');
+          return;
+        }
+        currentStatus.textContent = detail;
+        return;
+      }
+      currentStatus.textContent = 'Authorized. You can return to your terminal.';
+    });
     document.getElementById('form').addEventListener('submit', async event => {
       event.preventDefault();
-      const status = document.getElementById('status');
       status.textContent = 'Authorizing...';
       const body = {
         user_code: document.getElementById('user_code').value,
@@ -1697,7 +1910,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workerStep: 'Worker side',
         workerStepBody: 'Click Generate to create a short-lived command for the machine running tmux and agents.',
         controlStep: 'Control side',
-        controlStepBody: 'After the Worker is connected, sign in to Web Control or run agentmux control login to manage tmux-backed agent workspaces.',
+        controlStepBody: 'After the Worker is connected, sign in to Web Control or run agentmux-tui with this Hub URL to manage tmux-backed agent workspaces.',
         selfHostTitle: 'Self-host Hub',
         selfHostLead: 'Only use this when you want to run your own Hub. The Docker image already defaults to port 8081 and stores data under /var/lib/agentmux.',
         runHubBinary: 'Run Hub with binary',
@@ -1710,9 +1923,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         failed: 'Failed: ',
         signalReady: 'Signal ready · expires ',
         signal: 'Signal',
-        workerCommand: 'Worker install command',
+        workerCommand: 'Worker install + join command',
+        workerJoinCommand: 'Installed Worker join command',
         webControl: 'Web Control',
-        controlCommand: 'Control login command',
+        controlCommand: 'TUI Control command',
         copy: 'Copy',
         copied: 'Copied'
       },
@@ -1749,7 +1963,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workerStep: 'Worker 侧',
         workerStepBody: '点击生成，为运行 tmux 和 agent 的机器创建一条限时 Worker 接入命令。',
         controlStep: 'Control 侧',
-        controlStepBody: 'Worker 接入后，登录 Web Control 或运行 agentmux control login 来管理 tmux agent 工作区。',
+        controlStepBody: 'Worker 接入后，登录 Web Control，或者用当前 Hub 地址运行 agentmux-tui 来管理 tmux agent 工作区。',
         selfHostTitle: '自托管 Hub',
         selfHostLead: '只有当你想运行自己的 Hub 时才需要这里。Docker 镜像已默认使用 8081 端口，并把数据放在 /var/lib/agentmux。',
         runHubBinary: '用二进制运行 Hub',
@@ -1762,9 +1976,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         failed: '失败：',
         signalReady: '信令已就绪 · 过期时间 ',
         signal: '信令',
-        workerCommand: 'Worker 安装命令',
+        workerCommand: 'Worker 安装并接入命令',
+        workerJoinCommand: '已安装 Worker 接入命令',
         webControl: '网页控制台',
-        controlCommand: 'Control 登录命令',
+        controlCommand: 'TUI Control 命令',
         copy: '复制',
         copied: '已复制'
       }
@@ -1801,6 +2016,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       result.innerHTML =
         commandBlock(t('signal'), signal, false) +
         commandBlock(t('workerCommand'), data.worker_command, true) +
+        commandBlock(t('workerJoinCommand'), data.worker_join_command || '', true) +
         commandBlock(t('webControl'), data.control_url, false) +
         commandBlock(t('controlCommand'), data.control_command, true);
     }

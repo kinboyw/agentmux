@@ -196,6 +196,35 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	interval := fs.Duration("interval", time.Second, "terminal capture interval")
 	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
 	_ = fs.Parse(args)
+	cfg, _ := appconfig.Load()
+	if *hubURL == "" && *token == "" && *join == "" {
+		*hubURL = cfg.WorkerHubURL
+		if *id == "" {
+			*id = cfg.WorkerID
+		}
+		if cfg.WorkerName != "" && (*name == "" || *name == hostname()) {
+			*name = cfg.WorkerName
+		}
+		if entry, ok := workerCredentialFromCache(*hubURL, *id); ok {
+			*hubURL = entry.HubURL
+			*token = entry.Credential
+			if *id == "" {
+				*id = entry.DeviceID
+			}
+			if entry.DeviceName != "" && (*name == "" || *name == hostname()) {
+				*name = entry.DeviceName
+			}
+		} else {
+			*token = cfg.WorkerToken
+			if cfg.WorkerToken != "" {
+				if err := migrateLegacyWorkerCredential(cfg); err != nil {
+					slog.Default().Warn("migrate legacy worker credential failed", "error", err)
+				} else if err := appconfig.SaveWorkerAuth(cfg.WorkerHubURL, "", cfg.WorkerID, cfg.WorkerName); err != nil {
+					slog.Default().Warn("clear legacy worker token failed", "error", err)
+				}
+			}
+		}
+	}
 	if *hubURL == "" && (*token != "" || *join != "") {
 		*hubURL = "ws://127.0.0.1:8080"
 	}
@@ -238,6 +267,9 @@ func runWorkerJoin(ctx context.Context, args []string) {
 	if err != nil {
 		fatal(err)
 	}
+	if err := appconfig.SaveWorkerAuth(auth.HubURL, "", workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name)); err != nil {
+		fatal(err)
+	}
 	slog.Default().Info("worker signal exchanged", "device_id", auth.DeviceID)
 	if flagProvided(args, "--backend") {
 		saveWorkerBackendConfig(*backend)
@@ -248,7 +280,7 @@ func runWorkerJoin(ctx context.Context, args []string) {
 	if _, err := selectWorkerBackend(*backend); err != nil {
 		fatal(err)
 	}
-	result, err := workerservice.Restart(ctx, executablePath())
+	result, err := workerservice.Restart(ctx, executablePath(), workerservice.WorkerIdentity{ID: workerIDFromAuth(auth, workerID)})
 	if err != nil {
 		fatal(err)
 	}
@@ -265,10 +297,19 @@ func runWorkerStart(ctx context.Context, args ...string) {
 	if _, err := selectWorkerBackend(*backend); err != nil {
 		fatal(err)
 	}
-	if _, ok := credentialcache.LoadLatest("worker", ""); !ok {
+	cfg, _ := appconfig.Load()
+	if _, ok := workerCredentialFromCache(cfg.WorkerHubURL, cfg.WorkerID); !ok && (cfg.WorkerHubURL == "" || cfg.WorkerToken == "") {
 		fatal(fmt.Errorf("no worker credential available; run agentmux worker join first"))
 	}
-	result, err := workerservice.Start(ctx, executablePath())
+	if cfg.WorkerToken != "" {
+		if err := migrateLegacyWorkerCredential(cfg); err != nil {
+			fatal(err)
+		}
+		if err := appconfig.SaveWorkerAuth(cfg.WorkerHubURL, "", cfg.WorkerID, cfg.WorkerName); err != nil {
+			fatal(err)
+		}
+	}
+	result, err := workerservice.Start(ctx, executablePath(), workerServiceIdentity())
 	if err != nil {
 		fatal(err)
 	}
@@ -276,7 +317,7 @@ func runWorkerStart(ctx context.Context, args ...string) {
 }
 
 func runWorkerStop(ctx context.Context) {
-	result, err := workerservice.Stop(ctx)
+	result, err := workerservice.Stop(ctx, workerServiceIdentity())
 	if err != nil {
 		fatal(err)
 	}
@@ -284,7 +325,7 @@ func runWorkerStop(ctx context.Context) {
 }
 
 func runWorkerStatus(ctx context.Context) {
-	out, err := workerservice.Status(ctx)
+	out, err := workerservice.Status(ctx, workerServiceIdentity())
 	if err != nil {
 		fatal(err)
 	}
@@ -314,11 +355,17 @@ func runWorkerConfig(args []string) {
 		fatal(err)
 	}
 	path, _ := appconfig.Path()
+	credentialsPath, _ := credentialcache.Path()
 	resolved, source := resolveWorkerBackendPreference("")
-	fmt.Fprintf(os.Stdout, "config=%s\nworker_backend=%s\nresolved_backend=%s\nsource=%s\n", path, cfg.WorkerBackend, resolved, source)
+	fmt.Fprintf(os.Stdout, "config=%s\ncredentials=%s\nworker_backend=%s\nworker_hub_url=%s\nworker_id=%s\nworker_name=%s\nresolved_backend=%s\nsource=%s\n", path, credentialsPath, cfg.WorkerBackend, cfg.WorkerHubURL, cfg.WorkerID, cfg.WorkerName, resolved, source)
 }
 
 func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string, interval time.Duration, source string, backendPreference string) {
+	lockFile, unlock, err := acquireWorkerLock(workerID)
+	if err != nil {
+		fatal(err)
+	}
+	defer unlock()
 	backend, err := selectWorkerBackend(backendPreference)
 	if err != nil {
 		fatal(err)
@@ -329,6 +376,7 @@ func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string
 	case "cache":
 		slog.Default().Info("worker credential loaded", "device_id", workerID)
 	}
+	slog.Default().Info("worker runtime lock acquired", "lock", lockFile)
 	w := worker.New(hubURL, token, workerID, name, backend, slog.Default())
 	w.Interval = interval
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
@@ -381,6 +429,15 @@ func saveWorkerBackendConfig(value string) {
 	}
 	if value == "builtin" || value == "builtin-pty" {
 		value = "pty"
+	}
+	cfg, err := appconfig.Load()
+	if err != nil {
+		fatal(err)
+	}
+	if cfg.WorkerToken != "" {
+		if err := migrateLegacyWorkerCredential(cfg); err != nil {
+			fatal(err)
+		}
 	}
 	if err := appconfig.SaveWorkerBackend(value); err != nil {
 		fatal(err)
@@ -622,6 +679,63 @@ func compactError(err error) string {
 		return value[:index]
 	}
 	return value
+}
+
+func workerServiceIdentity() workerservice.WorkerIdentity {
+	cfg, _ := appconfig.Load()
+	id := cfg.WorkerID
+	if id == "" {
+		if entry, ok := credentialcache.LoadLatest("worker", ""); ok {
+			id = entry.DeviceID
+		}
+	}
+	return workerservice.WorkerIdentity{ID: id}
+}
+
+func workerCredentialFromCache(hubURL, workerID string) (credentialcache.Entry, bool) {
+	hubURL = strings.TrimSpace(hubURL)
+	workerID = strings.TrimSpace(workerID)
+	if hubURL != "" {
+		if entry, ok := credentialcache.Load(hubURL, "worker", workerID); ok {
+			return entry, true
+		}
+		return credentialcache.Entry{}, false
+	}
+	return credentialcache.LoadLatest("worker", workerID)
+}
+
+func migrateLegacyWorkerCredential(cfg appconfig.Config) error {
+	if strings.TrimSpace(cfg.WorkerHubURL) == "" || strings.TrimSpace(cfg.WorkerToken) == "" {
+		return nil
+	}
+	entry := credentialcache.Entry{
+		HubURL: cfg.WorkerHubURL, Credential: cfg.WorkerToken,
+		Role: "worker", DeviceID: cfg.WorkerID, DeviceName: cfg.WorkerName,
+		UpdatedAt: time.Now().UTC(),
+	}
+	return credentialcache.Save(entry)
+}
+
+func acquireWorkerLock(workerID string) (string, func(), error) {
+	path, err := workerservice.WorkerLockPath(workerID)
+	if err != nil {
+		return "", nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		return "", nil, fmt.Errorf("worker %q is already running locally; stop the existing worker service or use a different --id", workerID)
+	}
+	workerservice.WriteLockOwner(file, os.Getpid())
+	unlock := func() {
+		workerservice.ClearLockOwner(file)
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}
+	return path, unlock, nil
 }
 
 func executablePath() string {

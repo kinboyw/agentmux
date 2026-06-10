@@ -8,6 +8,7 @@ import {
   Globe,
   LayoutGrid,
   LogIn,
+  LogOut,
   Plus,
   Power,
   RefreshCw,
@@ -106,6 +107,7 @@ type SignalPayload = {
   tenant_id: string;
   expires_at: string;
   worker_command: string;
+  worker_join_command?: string;
   control_command: string;
   control_url: string;
 };
@@ -362,6 +364,26 @@ function App() {
     localStorage.removeItem("agentmux.user");
     setAuthOpen(false);
     await refreshAll(nextToken);
+  }
+
+  function signOut() {
+    setToken("");
+    setTokenDraft("");
+    setTokenExpiresAt("");
+    setRefreshToken("");
+    setRefreshExpiresAt("");
+    setCurrentUser(null);
+    setJoinSignal(null);
+    setWorkers([]);
+    setSessions([]);
+    authRef.current = { token: "", tokenExpiresAt: "", refreshToken: "", refreshExpiresAt: "" };
+    localStorage.removeItem("agentmux.token");
+    localStorage.removeItem("agentmux.token_expires_at");
+    localStorage.removeItem("agentmux.refresh_token");
+    localStorage.removeItem("agentmux.refresh_expires_at");
+    localStorage.removeItem("agentmux.user");
+    setAuthOpen(false);
+    setStatus({ tone: "idle", title: "Signed out", detail: "Sign in or apply a token to control sessions." });
   }
 
   function storeCredential(data: AuthCredentialPayload) {
@@ -690,6 +712,7 @@ function App() {
         onSubmit={submitAuth}
         onApplyDirectToken={() => void applyDirectToken()}
         onOAuth={(provider) => void startOAuth(provider)}
+        onLogout={signOut}
       />
       <CreateSessionModal
         open={createOpen}
@@ -726,6 +749,7 @@ function AuthModal({
   onSubmit,
   onApplyDirectToken,
   onOAuth,
+  onLogout,
 }: {
   open: boolean;
   authMode: AuthMode;
@@ -739,6 +763,7 @@ function AuthModal({
   onSubmit: (event: React.FormEvent) => void;
   onApplyDirectToken: () => void;
   onOAuth: (provider: "github" | "google") => void;
+  onLogout: () => void;
 }) {
   if (!open) return null;
 
@@ -757,45 +782,68 @@ function AuthModal({
           </Button>
         </div>
         <div className="space-y-4 p-4">
-          <div className="grid grid-cols-2 rounded-md bg-secondary p-1">
-            <Button variant={authMode === "login" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("login")} type="button">
-              <LogIn className="h-4 w-4" />
-              Sign in
-            </Button>
-            <Button variant={authMode === "register" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("register")} type="button">
-              <UserPlus className="h-4 w-4" />
-              Register
-            </Button>
-          </div>
-          <form className="space-y-2" onSubmit={onSubmit}>
-            <Input type="email" value={authForm.email} onChange={(event) => onFormChange({ ...authForm, email: event.target.value })} placeholder="email" autoComplete="email" />
-            {authMode === "register" ? (
-              <Input value={authForm.name} onChange={(event) => onFormChange({ ...authForm, name: event.target.value })} placeholder="display name" autoComplete="name" />
-            ) : null}
-            <Input type="password" value={authForm.password} onChange={(event) => onFormChange({ ...authForm, password: event.target.value })} placeholder="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} />
-            <Button variant="secondary" className="w-full" type="submit">
-              {authMode === "register" ? <UserPlus className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
-              {authMode === "register" ? "Create account" : "Sign in"}
-            </Button>
-          </form>
-          <div className="grid grid-cols-2 gap-2">
-            <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")}>
-              <Github className="h-4 w-4" />
-              GitHub
-            </Button>
-            <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")}>
-              <Globe className="h-4 w-4" />
-              Google
-            </Button>
-          </div>
-          <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
-            <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
-            <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
-            <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken}>
-              <RefreshCw className="h-4 w-4" />
-              Use token
-            </Button>
-          </div>
+          {currentUser ? (
+            <div className="space-y-4">
+              <div className="rounded-md border border-border bg-background/80 p-3">
+                <div className="mb-2 flex items-center gap-2">
+                  <div className="grid h-9 w-9 place-items-center rounded-md bg-primary/10 text-primary">
+                    <UserRound className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">{currentUser.name || currentUser.email}</div>
+                    <div className="truncate text-xs text-muted-foreground">{currentUser.email}</div>
+                  </div>
+                </div>
+                <div className="truncate text-xs text-muted-foreground">Browser access is active on this Hub.</div>
+              </div>
+              <Button variant="secondary" className="w-full" type="button" onClick={onLogout}>
+                <LogOut className="h-4 w-4" />
+                Sign out
+              </Button>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 rounded-md bg-secondary p-1">
+                <Button variant={authMode === "login" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("login")} type="button">
+                  <LogIn className="h-4 w-4" />
+                  Sign in
+                </Button>
+                <Button variant={authMode === "register" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("register")} type="button">
+                  <UserPlus className="h-4 w-4" />
+                  Register
+                </Button>
+              </div>
+              <form className="space-y-2" onSubmit={onSubmit}>
+                <Input type="email" value={authForm.email} onChange={(event) => onFormChange({ ...authForm, email: event.target.value })} placeholder="email" autoComplete="email" />
+                {authMode === "register" ? (
+                  <Input value={authForm.name} onChange={(event) => onFormChange({ ...authForm, name: event.target.value })} placeholder="display name" autoComplete="name" />
+                ) : null}
+                <Input type="password" value={authForm.password} onChange={(event) => onFormChange({ ...authForm, password: event.target.value })} placeholder="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} />
+                <Button variant="secondary" className="w-full" type="submit">
+                  {authMode === "register" ? <UserPlus className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
+                  {authMode === "register" ? "Create account" : "Sign in"}
+                </Button>
+              </form>
+              <div className="grid grid-cols-2 gap-2">
+                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")}>
+                  <Github className="h-4 w-4" />
+                  GitHub
+                </Button>
+                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")}>
+                  <Globe className="h-4 w-4" />
+                  Google
+                </Button>
+              </div>
+              <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
+                <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
+                <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
+                <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken}>
+                  <RefreshCw className="h-4 w-4" />
+                  Use token
+                </Button>
+              </div>
+            </>
+          )}
         </div>
       </Card>
     </div>
@@ -835,8 +883,8 @@ function JoinSignalModal({
       <Card className="w-full max-w-2xl bg-card/95 shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
-            <div className="text-sm font-semibold">Join devices</div>
-            <div className="text-xs text-muted-foreground">Generate a tenant-scoped signal and copy commands for Worker and Control endpoints.</div>
+            <div className="text-sm font-semibold">Join Worker</div>
+            <div className="text-xs text-muted-foreground">Generate a tenant-scoped signal and copy Worker commands for this Hub.</div>
           </div>
           <Button variant="ghost" size="icon-sm" onClick={onClose} title="Close">
             <X className="h-4 w-4" />
@@ -845,7 +893,7 @@ function JoinSignalModal({
         <div className="space-y-4 p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="text-xs text-muted-foreground">
-              {tokenReady ? "Signal is used only to add Worker devices. Control devices should sign in with an account." : "Sign in or apply a control token before generating worker join commands."}
+              {tokenReady ? "Use the install command on a fresh machine, or the direct join command when agentmux is already installed. Control devices sign in separately." : "Sign in or apply a control token before generating worker join commands."}
             </div>
             <Button variant="secondary" size="sm" type="button" onClick={onGenerate} disabled={!tokenReady || loading}>
               <UserPlus className="h-4 w-4" />
@@ -855,9 +903,10 @@ function JoinSignalModal({
           {joinSignal ? (
             <div className="grid gap-3 md:grid-cols-2">
               <SignalCommand title="Signal" value={joinSignal.signal} mono={false} />
-              <SignalCommand title="Worker join" value={joinSignal.worker_command} />
+              <SignalCommand title="Install and join Worker" value={joinSignal.worker_command} />
+              <SignalCommand title="Installed Worker join" value={joinSignal.worker_join_command || `agentmux worker join --hub ${wsBaseFromLocation()} --join ${joinSignal.signal} --name "$(hostname)"`} />
               <SignalCommand title="Web Control login" value={joinSignal.control_url} mono={false} />
-              <SignalCommand title="CLI Control login" value={joinSignal.control_command || `agentmux control login --hub ${window.location.origin}`} />
+              <SignalCommand title="TUI Control" value={joinSignal.control_command || `agentmux-tui --hub ${window.location.origin}`} />
               <div className="md:col-span-2 text-[11px] text-muted-foreground">
                 Tenant {joinSignal.tenant_id} · expires {new Date(joinSignal.expires_at).toLocaleString()}
               </div>

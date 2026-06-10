@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -28,10 +29,11 @@ const (
 var ErrClosed = errors.New("websocket closed")
 
 type Conn struct {
-	conn       net.Conn
-	br         *bufio.Reader
-	writeMask  bool
-	writeMutex sync.Mutex
+	conn        net.Conn
+	br          *bufio.Reader
+	writeMask   bool
+	readTimeout time.Duration
+	writeMutex  sync.Mutex
 }
 
 func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
@@ -159,6 +161,28 @@ func (c *Conn) WriteText(text string) error {
 	return c.writeFrame(opText, []byte(text))
 }
 
+func (c *Conn) WritePing(payload []byte) error {
+	return c.writeFrame(opPing, payload)
+}
+
+func (c *Conn) SetReadDeadline(deadline time.Time) error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.SetReadDeadline(deadline)
+}
+
+func (c *Conn) SetReadTimeout(timeout time.Duration) error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	c.readTimeout = timeout
+	if timeout <= 0 {
+		return c.conn.SetReadDeadline(time.Time{})
+	}
+	return c.conn.SetReadDeadline(time.Now().Add(timeout))
+}
+
 func (c *Conn) Close() error {
 	_ = c.writeFrame(opClose, nil)
 	return c.conn.Close()
@@ -202,6 +226,9 @@ func (c *Conn) readFrame() (byte, []byte, error) {
 		for i := range payload {
 			payload[i] ^= mask[i%4]
 		}
+	}
+	if c.readTimeout > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 	}
 	return opcode, payload, nil
 }

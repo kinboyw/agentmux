@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,27 +25,39 @@ type Result struct {
 	Detail  string
 }
 
-func Start(ctx context.Context, binary string) (Result, error) {
+type WorkerIdentity struct {
+	ID string
+}
+
+func Start(ctx context.Context, binary string, identity WorkerIdentity) (Result, error) {
 	binary, err := normalizeBinary(binary)
+	if err != nil {
+		return Result{}, err
+	}
+	binary, err = prepareWorkerBinary(binary)
 	if err != nil {
 		return Result{}, err
 	}
 	var skipped []string
 	if runtime.GOOS == "linux" {
-		result, err := startSystemd(ctx, binary)
-		if err == nil {
-			return result, nil
+		if err := systemdUserCheck(ctx); err == nil {
+			result, err := startSystemd(ctx, binary)
+			if err == nil {
+				return result, nil
+			}
+			skipped = append(skipped, serviceFallbackNote("systemd --user start", err))
+		} else {
+			skipped = append(skipped, serviceUnavailableNote("systemd --user", err))
 		}
-		skipped = append(skipped, "systemd --user unavailable: "+err.Error())
 	}
 	if runtime.GOOS == "darwin" {
 		result, err := startLaunchd(ctx, binary)
 		if err == nil {
 			return result, nil
 		}
-		skipped = append(skipped, "launchd unavailable: "+err.Error())
+		skipped = append(skipped, serviceUnavailableNote("launchd", err))
 	}
-	result, err := startFallback(binary)
+	result, err := startFallback(binary, identity)
 	if err != nil {
 		return Result{}, err
 	}
@@ -54,25 +67,35 @@ func Start(ctx context.Context, binary string) (Result, error) {
 	return result, nil
 }
 
-func Restart(ctx context.Context, binary string) (Result, error) {
+func Restart(ctx context.Context, binary string, identity WorkerIdentity) (Result, error) {
 	binary, err := normalizeBinary(binary)
+	if err != nil {
+		return Result{}, err
+	}
+	binary, err = prepareWorkerBinary(binary)
 	if err != nil {
 		return Result{}, err
 	}
 	var skipped []string
 	if runtime.GOOS == "linux" {
-		if systemdServiceExists() {
-			if out, err := run(ctx, "systemctl", "--user", "restart", ServiceName+".service"); err == nil {
+		if err := systemdUserCheck(ctx); err != nil {
+			skipped = append(skipped, serviceUnavailableNote("systemd --user", err))
+		} else if systemdServiceExists() {
+			if err := writeSystemdUnit(binary); err != nil {
+				skipped = append(skipped, serviceFallbackNote("systemd --user unit update", err))
+			} else if _, err := run(ctx, "systemctl", "--user", "daemon-reload"); err != nil {
+				skipped = append(skipped, serviceFallbackNote("systemd --user daemon-reload", err))
+			} else if out, err := run(ctx, "systemctl", "--user", "restart", ServiceName+".service"); err == nil {
 				return Result{Backend: "systemd", Detail: strings.TrimSpace(out)}, nil
 			} else {
-				skipped = append(skipped, "systemd --user restart unavailable: "+err.Error())
+				skipped = append(skipped, serviceFallbackNote("systemd --user restart", err))
 			}
 		} else {
 			result, err := startSystemd(ctx, binary)
 			if err == nil {
 				return result, nil
 			}
-			skipped = append(skipped, "systemd --user unavailable: "+err.Error())
+			skipped = append(skipped, serviceFallbackNote("systemd --user start", err))
 		}
 	}
 	if runtime.GOOS == "darwin" {
@@ -81,17 +104,17 @@ func Restart(ctx context.Context, binary string) (Result, error) {
 			if result, err := startLaunchd(ctx, binary); err == nil {
 				return result, nil
 			} else {
-				skipped = append(skipped, "launchd restart unavailable: "+err.Error())
+				skipped = append(skipped, serviceFallbackNote("launchd restart", err))
 			}
 		} else {
 			result, err := startLaunchd(ctx, binary)
 			if err == nil {
 				return result, nil
 			}
-			skipped = append(skipped, "launchd unavailable: "+err.Error())
+			skipped = append(skipped, serviceUnavailableNote("launchd", err))
 		}
 	}
-	result, err := restartFallback(binary)
+	result, err := restartFallback(binary, identity)
 	if err != nil {
 		return Result{}, err
 	}
@@ -101,7 +124,7 @@ func Restart(ctx context.Context, binary string) (Result, error) {
 	return result, nil
 }
 
-func Stop(ctx context.Context) (Result, error) {
+func Stop(ctx context.Context, identity WorkerIdentity) (Result, error) {
 	if runtime.GOOS == "linux" && systemdServiceExists() {
 		if out, err := run(ctx, "systemctl", "--user", "stop", ServiceName+".service"); err == nil {
 			return Result{Backend: "systemd", Detail: strings.TrimSpace(out)}, nil
@@ -112,12 +135,12 @@ func Stop(ctx context.Context) (Result, error) {
 			return Result{Backend: "launchd", Detail: strings.TrimSpace(out)}, nil
 		}
 	}
-	return stopFallback()
+	return stopFallback(identity)
 }
 
-func Status(ctx context.Context) (string, error) {
+func Status(ctx context.Context, identity WorkerIdentity) (string, error) {
 	var skipped []string
-	if runtime.GOOS == "linux" && systemdServiceExists() {
+	if runtime.GOOS == "linux" && systemdServiceExists() && systemdUserAvailable(ctx) {
 		out, err := run(ctx, "systemctl", "--user", "status", ServiceName+".service", "--no-pager", "-l")
 		if err == nil && out != "" {
 			return out, nil
@@ -135,7 +158,7 @@ func Status(ctx context.Context) (string, error) {
 			skipped = append(skipped, "launchd unavailable: "+err.Error())
 		}
 	}
-	out, err := fallbackStatus()
+	out, err := fallbackStatus(identity)
 	if len(skipped) > 0 {
 		out += strings.Join(skipped, "\n") + "\n"
 	}
@@ -147,9 +170,9 @@ func Logs(ctx context.Context, lines int) (string, error) {
 		lines = 80
 	}
 	var skipped []string
-	if runtime.GOOS == "linux" && systemdServiceExists() {
+	if runtime.GOOS == "linux" && systemdServiceExists() && systemdUserAvailable(ctx) {
 		out, err := run(ctx, "journalctl", "--user", "-u", ServiceName+".service", "-n", strconv.Itoa(lines), "--no-pager")
-		if err == nil && out != "" {
+		if err == nil && strings.TrimSpace(out) != "" && !strings.Contains(out, "-- No entries --") {
 			return out, nil
 		}
 		if err != nil {
@@ -221,6 +244,55 @@ func PIDReadPath() (string, error) {
 	return filepath.Join(dir, "worker.pid"), nil
 }
 
+func WorkerLockPath(workerID string) (string, error) {
+	dir, err := StateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "worker-"+SanitizeWorkerID(workerID)+".lock"), nil
+}
+
+func SanitizeWorkerID(workerID string) string {
+	name := strings.TrimSpace(workerID)
+	if name == "" {
+		name = "default"
+	}
+	return strings.NewReplacer("/", "_", "\\", "_", ":", "_", " ", "_").Replace(name)
+}
+
+func WriteLockOwner(lockFile *os.File, pid int) {
+	if lockFile == nil || pid <= 0 {
+		return
+	}
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.Seek(0, 0)
+	_, _ = fmt.Fprintf(lockFile, "%d\n", pid)
+	_ = lockFile.Sync()
+}
+
+func ClearLockOwner(lockFile *os.File) {
+	if lockFile == nil {
+		return
+	}
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.Seek(0, 0)
+	_ = lockFile.Sync()
+}
+
+func LockOwnerPID(workerID string) (int, string, bool) {
+	path, err := WorkerLockPath(workerID)
+	if err != nil {
+		return 0, "", false
+	}
+	if pid, ok := readPID(path); ok && processRunning(pid) {
+		return pid, path, true
+	}
+	if pid, ok := procLockOwnerPID(path); ok && processRunning(pid) {
+		return pid, path, true
+	}
+	return 0, path, false
+}
+
 func normalizeBinary(binary string) (string, error) {
 	if binary == "" {
 		exe, err := os.Executable()
@@ -238,31 +310,61 @@ func normalizeBinary(binary string) (string, error) {
 	return binary, nil
 }
 
+func prepareWorkerBinary(binary string) (string, error) {
+	dir, err := StateDir()
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(filepath.Base(binary), "agentmux-worker-bin.") && filepath.Dir(binary) == dir {
+		return binary, nil
+	}
+	target := filepath.Join(dir, fmt.Sprintf("agentmux-worker-bin.%d.%d", time.Now().UnixNano(), os.Getpid()))
+	in, err := os.Open(binary)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(target)
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(target)
+		return "", err
+	}
+	if err := os.Chmod(target, 0o700); err != nil {
+		_ = os.Remove(target)
+		return "", err
+	}
+	return target, nil
+}
+
+func workerRunArgs() []string {
+	return []string{"worker", "run"}
+}
+
+func commandLine(binary string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, systemdQuote(binary))
+	for _, arg := range args {
+		parts = append(parts, systemdQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
 func startSystemd(ctx context.Context, binary string) (Result, error) {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return Result{}, err
 	}
-	path, err := systemdServicePath()
-	if err != nil {
+	if err := systemdUserCheck(ctx); err != nil {
 		return Result{}, err
 	}
-	content := `[Unit]
-Description=AgentMux Worker
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=` + systemdQuote(binary) + ` worker run
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-`
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return Result{}, err
-	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := writeSystemdUnit(binary); err != nil {
 		return Result{}, err
 	}
 	if _, err := run(ctx, "systemctl", "--user", "daemon-reload"); err != nil {
@@ -273,6 +375,35 @@ WantedBy=default.target
 	} else {
 		return Result{Backend: "systemd", Detail: strings.TrimSpace(out)}, nil
 	}
+}
+
+func writeSystemdUnit(binary string) error {
+	path, err := systemdServicePath()
+	if err != nil {
+		return err
+	}
+	home, _ := os.UserHomeDir()
+	content := `[Unit]
+Description=AgentMux Worker
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=` + systemdQuote("HOME="+home) + `
+ExecStart=` + commandLine(binary, workerRunArgs()) + `
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+`
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return err
+	}
+	return nil
 }
 
 func startLaunchd(ctx context.Context, binary string) (Result, error) {
@@ -316,13 +447,18 @@ func startLaunchd(ctx context.Context, binary string) (Result, error) {
 	}
 }
 
-func startFallback(binary string) (Result, error) {
+func startFallback(binary string, identity WorkerIdentity) (Result, error) {
 	pidPath, err := PIDPath()
 	if err != nil {
 		return Result{}, err
 	}
 	if pid, ok := readPID(pidPath); ok && processRunning(pid) {
 		return Result{Backend: "process", Detail: fmt.Sprintf("already running pid=%d", pid)}, nil
+	}
+	if identity.ID != "" {
+		if pid, path, ok := LockOwnerPID(identity.ID); ok && processRunning(pid) {
+			return Result{Backend: "process", Detail: fmt.Sprintf("already running pid=%d lock=%s", pid, path)}, nil
+		}
 	}
 	logPath, err := LogPath()
 	if err != nil {
@@ -333,7 +469,8 @@ func startFallback(binary string) (Result, error) {
 		return Result{}, err
 	}
 	defer logFile.Close()
-	cmd := exec.Command(binary, "worker", "run")
+	args := workerRunArgs()
+	cmd := exec.Command(binary, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = os.Environ()
@@ -354,64 +491,96 @@ func startFallback(binary string) (Result, error) {
 	return Result{Backend: "process", Detail: fmt.Sprintf("pid=%d log=%s", cmd.Process.Pid, logPath)}, nil
 }
 
-func restartFallback(binary string) (Result, error) {
+func restartFallback(binary string, identity WorkerIdentity) (Result, error) {
 	pidPath, err := PIDPath()
 	if err != nil {
 		return Result{}, err
 	}
-	var stopped string
+	stopped := make([]string, 0, 2)
+	stoppedPIDs := map[int]bool{}
 	if pid, ok := readPID(pidPath); ok {
 		if processRunning(pid) {
-			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+			result, err := stopFallbackPID(pidPath, pid)
+			if err != nil {
 				return Result{}, err
 			}
-			if waitForExit(pid, 2*time.Second) {
-				stopped = fmt.Sprintf("stopped pid=%d", pid)
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-				_ = waitForExit(pid, time.Second)
-				stopped = fmt.Sprintf("killed pid=%d", pid)
-			}
+			stopped = append(stopped, result.Detail)
+			stoppedPIDs[pid] = true
 		}
 		_ = os.Remove(pidPath)
 	}
-	result, err := startFallback(binary)
+	if identity.ID != "" {
+		if pid, _, ok := LockOwnerPID(identity.ID); ok && processRunning(pid) && !stoppedPIDs[pid] {
+			result, err := stopFallbackPID(pidPath, pid)
+			if err != nil {
+				return Result{}, err
+			}
+			stopped = append(stopped, result.Detail)
+		}
+	}
+	result, err := startFallback(binary, identity)
 	if err != nil {
 		return Result{}, err
 	}
-	if stopped != "" {
-		result.Detail = stopped + "\n" + result.Detail
+	if len(stopped) > 0 {
+		result.Detail = strings.Join(stopped, "\n") + "\n" + result.Detail
 	}
 	return result, nil
 }
 
-func stopFallback() (Result, error) {
+func stopFallback(identity WorkerIdentity) (Result, error) {
 	pidPath, err := PIDPath()
 	if err != nil {
 		return Result{}, err
 	}
 	pid, ok := readPID(pidPath)
 	if !ok {
+		if identity.ID != "" {
+			if lockPID, _, lockOK := LockOwnerPID(identity.ID); lockOK && processRunning(lockPID) {
+				return stopFallbackPID(pidPath, lockPID)
+			}
+		}
 		return Result{Backend: "process", Detail: "not running"}, nil
 	}
 	if !processRunning(pid) {
 		_ = os.Remove(pidPath)
+		if identity.ID != "" {
+			if lockPID, _, lockOK := LockOwnerPID(identity.ID); lockOK && processRunning(lockPID) {
+				return stopFallbackPID(pidPath, lockPID)
+			}
+		}
 		return Result{Backend: "process", Detail: "not running"}, nil
 	}
+	return stopFallbackPID(pidPath, pid)
+}
+
+func stopFallbackPID(pidPath string, pid int) (Result, error) {
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		return Result{}, err
 	}
+	detail := fmt.Sprintf("stopped pid=%d", pid)
+	if !waitForExit(pid, 2*time.Second) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		_ = waitForExit(pid, time.Second)
+		detail = fmt.Sprintf("killed pid=%d", pid)
+	}
 	_ = os.Remove(pidPath)
-	return Result{Backend: "process", Detail: fmt.Sprintf("stopped pid=%d", pid)}, nil
+	return Result{Backend: "process", Detail: detail}, nil
 }
 
-func fallbackStatus() (string, error) {
+func fallbackStatus(identity WorkerIdentity) (string, error) {
 	pidPath, err := PIDReadPath()
 	if err != nil {
 		return "", err
 	}
 	pid, ok := readPID(pidPath)
 	if !ok || !processRunning(pid) {
+		if identity.ID != "" {
+			if lockPID, lockPath, lockOK := LockOwnerPID(identity.ID); lockOK && processRunning(lockPID) {
+				logPath, _ := LogPath()
+				return fmt.Sprintf("agentmux worker fallback process is running\npid=%d\nlock=%s\nlog=%s\n", lockPID, lockPath, logPath), nil
+			}
+		}
 		return "agentmux worker fallback process is not running\n", nil
 	}
 	logPath, _ := LogPath()
@@ -454,6 +623,18 @@ func systemdServiceExists() bool {
 	return err == nil
 }
 
+func systemdUserAvailable(ctx context.Context) bool {
+	return systemdUserCheck(ctx) == nil
+}
+
+func systemdUserCheck(ctx context.Context) error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return err
+	}
+	_, err := run(ctx, "systemctl", "--user", "show", "--property=Version", "--value")
+	return err
+}
+
 func launchdPlistPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
@@ -468,6 +649,39 @@ func systemdQuote(value string) string {
 	value = strings.ReplaceAll(value, `\`, `\\`)
 	value = strings.ReplaceAll(value, `"`, `\"`)
 	return `"` + value + `"`
+}
+
+func serviceUnavailableNote(name string, err error) string {
+	reason := conciseServiceReason(err)
+	if reason == "" {
+		return fmt.Sprintf("note: %s unavailable; using fallback process", name)
+	}
+	return fmt.Sprintf("note: %s unavailable; using fallback process (%s)", name, reason)
+}
+
+func serviceFallbackNote(action string, err error) string {
+	reason := conciseServiceReason(err)
+	if reason == "" {
+		return fmt.Sprintf("note: %s did not complete; using fallback process", action)
+	}
+	return fmt.Sprintf("note: %s did not complete; using fallback process (%s)", action, reason)
+}
+
+func conciseServiceReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	switch {
+	case strings.Contains(msg, "Failed to connect to bus"):
+		return "systemd user bus is not available"
+	case strings.Contains(msg, "executable file not found"):
+		return "command not found"
+	case msg == "":
+		return ""
+	default:
+		return msg
+	}
 }
 
 func run(ctx context.Context, name string, args ...string) (string, error) {
@@ -489,6 +703,58 @@ func readPID(path string) (int, bool) {
 		return 0, false
 	}
 	return pid, true
+}
+
+func procLockOwnerPID(path string) (int, bool) {
+	if runtime.GOOS != "linux" {
+		return 0, false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	data, err := os.ReadFile("/proc/locks")
+	if err != nil {
+		return 0, false
+	}
+	device := fmt.Sprintf("%02x:%02x", major(uint64(stat.Dev)), minor(uint64(stat.Dev)))
+	inode := strconv.FormatUint(stat.Ino, 10)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		if fields[3] != "WRITE" {
+			continue
+		}
+		if fields[5] == "" {
+			continue
+		}
+		lockParts := strings.Split(fields[5], ":")
+		if len(lockParts) < 3 {
+			continue
+		}
+		if lockParts[0]+":"+lockParts[1] != device || lockParts[2] != inode {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[4])
+		if err == nil && pid > 0 {
+			return pid, true
+		}
+	}
+	return 0, false
+}
+
+func major(dev uint64) uint64 {
+	return (dev >> 8) & 0xfff
+}
+
+func minor(dev uint64) uint64 {
+	return (dev & 0xff) | ((dev >> 12) & 0xfff00)
 }
 
 func processRunning(pid int) bool {
