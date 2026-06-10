@@ -53,6 +53,35 @@ func TestViewWriteDoesNotBlockOnTerminalReports(t *testing.T) {
 	}
 }
 
+func TestMouseInputRequiresRemoteMouseMode(t *testing.T) {
+	view := New(20, 3)
+	if got := view.MouseInput(MouseEvent{X: 1, Y: 1, Button: MouseLeft}); got != "" {
+		t.Fatalf("mouse input should be empty without remote mouse mode, got %q", got)
+	}
+	view.Write([]byte("\x1b[?1000h\x1b[?1006h"))
+	got := view.MouseInput(MouseEvent{X: 1, Y: 1, Button: MouseLeft})
+	if got != "\x1b[<0;2;2M" {
+		t.Fatalf("unexpected SGR mouse input: %q", got)
+	}
+	view.Write([]byte("\x1b[?1000l"))
+	if got := view.MouseInput(MouseEvent{X: 1, Y: 1, Button: MouseLeft}); got != "" {
+		t.Fatalf("mouse input should stop after remote mouse mode reset, got %q", got)
+	}
+}
+
+func TestMouseInputHonorsMotionMode(t *testing.T) {
+	view := New(20, 3)
+	view.Write([]byte("\x1b[?1000h\x1b[?1006h"))
+	if got := view.MouseInput(MouseEvent{X: 1, Y: 1, Button: MouseLeft, Motion: true}); got != "" {
+		t.Fatalf("normal mouse mode should not forward motion, got %q", got)
+	}
+	view.Write([]byte("\x1b[?1002h"))
+	got := view.MouseInput(MouseEvent{X: 1, Y: 1, Button: MouseLeft, Motion: true})
+	if got == "" {
+		t.Fatalf("button motion mode should forward drag motion")
+	}
+}
+
 func stripANSI(value string) string {
 	var out strings.Builder
 	for i := 0; i < len(value); i++ {

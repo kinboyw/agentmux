@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -36,6 +37,8 @@ type App struct {
 	active     string
 	fullscreen bool
 	events     chan appStreamEvent
+	splitWidth int
+	dragSplit  bool
 
 	rawRestore func()
 	keys       appKeyReader
@@ -90,6 +93,30 @@ type appStreamWrite struct {
 	resize bool
 }
 
+type appInputEvent struct {
+	key   string
+	mouse *appMouseEvent
+}
+
+type appMouseKind int
+
+const (
+	appMouseClick appMouseKind = iota + 1
+	appMouseRelease
+	appMouseMotion
+	appMouseWheel
+)
+
+type appMouseEvent struct {
+	kind   appMouseKind
+	x      int
+	y      int
+	button terminalview.MouseButton
+	shift  bool
+	alt    bool
+	ctrl   bool
+}
+
 func NewApp(client Client, auth AppAuthResult, in *os.File, out io.Writer) *App {
 	return &App{
 		Client:   client,
@@ -127,6 +154,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	defer a.disableRaw()
 	term.EnterAlternateScreen(a.Out)
+	term.EnableMouseCellMotion(a.Out)
 	clear(a.Out)
 	defer func() {
 		term.ResetModes(a.Out)
@@ -143,18 +171,22 @@ func (a *App) Run(ctx context.Context) error {
 	lastRender := time.Now()
 	pendingRender := false
 	for {
-		key, ok, err := a.keys.ReadAvailable(a.In)
+		input, ok, err := a.keys.ReadEventAvailable(a.In)
 		if err != nil {
 			return err
 		}
 		changed := false
 		if ok {
-			a.recordDebugKey(key, a.active != "")
-			quit := a.handleKey(ctx, key)
-			a.clampSelection()
-			changed = true
-			if quit {
-				return nil
+			if input.mouse != nil {
+				changed = a.handleMouse(ctx, *input.mouse)
+			} else {
+				a.recordDebugKey(input.key, a.active != "")
+				quit := a.handleKey(ctx, input.key)
+				a.clampSelection()
+				changed = true
+				if quit {
+					return nil
+				}
 			}
 		}
 		changed = a.drainStreamEvents(16) || changed
@@ -255,6 +287,102 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 	return false
 }
 
+func (a *App) handleMouse(ctx context.Context, event appMouseEvent) bool {
+	if event.x < 1 || event.y < 1 {
+		return false
+	}
+	if a.fullscreen && a.active != "" {
+		return a.forwardActiveMouse(event, 1, 1)
+	}
+	cols, rows := 120, 36
+	if a.In != nil {
+		if c, r, err := term.Size(a.In); err == nil {
+			cols, rows = c, r
+		}
+	}
+	listWidth, previewWidth, limit := a.layoutForSize(cols, rows)
+	bodyStart := 4
+	bodyEnd := bodyStart + limit - 1
+	if event.kind == appMouseClick && event.button == terminalview.MouseLeft && previewWidth > 0 && event.x >= listWidth+1 && event.x <= listWidth+3 && event.y >= bodyStart && event.y <= bodyEnd {
+		a.dragSplit = true
+		return false
+	}
+	if event.kind == appMouseMotion && a.dragSplit {
+		a.setSplitWidth(event.x-1, cols)
+		if stream := a.streams[a.active]; stream != nil {
+			a.resizeStreamView(stream)
+		}
+		a.loadSelectedPreview()
+		return true
+	}
+	if event.kind == appMouseRelease && a.dragSplit {
+		a.dragSplit = false
+		return true
+	}
+	if event.kind == appMouseClick && event.button == terminalview.MouseLeft && event.y >= bodyStart && event.y <= bodyEnd && event.x <= listWidth {
+		start := scrollStart(a.selected, limit, len(a.sessions))
+		index := start + event.y - bodyStart
+		if index >= 0 && index < len(a.sessions) {
+			a.selected = index
+			a.loadSelectedPreview()
+			return true
+		}
+	}
+	if event.x >= listWidth+4 && event.y >= bodyStart && event.y <= bodyEnd {
+		if a.active != "" {
+			return a.forwardActiveMouse(event, listWidth+4, bodyStart)
+		}
+		if event.kind == appMouseClick && event.button == terminalview.MouseLeft {
+			if err := a.attach(ctx); err != nil {
+				a.err = err
+				a.status = "attach failed"
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) forwardActiveMouse(event appMouseEvent, originX, originY int) bool {
+	if a.active == "" {
+		return false
+	}
+	stream := a.streams[a.active]
+	if stream == nil || stream.view == nil {
+		return false
+	}
+	data := stream.view.MouseInput(terminalview.MouseEvent{
+		X:       event.x - originX,
+		Y:       event.y - originY,
+		Button:  event.button,
+		Motion:  event.kind == appMouseMotion,
+		Release: event.kind == appMouseRelease,
+		Shift:   event.shift,
+		Alt:     event.alt,
+		Ctrl:    event.ctrl,
+	})
+	if data == "" {
+		return false
+	}
+	if stream.writes != nil {
+		select {
+		case stream.writes <- appStreamWrite{data: data}:
+			return false
+		default:
+			a.status = "input queue full " + a.active
+			return true
+		}
+	}
+	if stream.stream != nil {
+		if err := stream.stream.Input(data); err != nil {
+			a.err = err
+			a.status = "mouse input failed"
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) writeDebugSnapshotStatus(reason string) {
 	path, err := a.writeDebugSnapshot(reason)
 	if err != nil {
@@ -344,7 +472,7 @@ func (a *App) previewCaptureLines() int {
 			cols, rows = c, r
 		}
 	}
-	_, _, limit := appLayout(cols, rows)
+	_, _, limit := a.layoutForSize(cols, rows)
 	return max(4, limit)
 }
 
@@ -1047,7 +1175,7 @@ func (a *App) streamSizeFor(sessionID string) protocol.TerminalSize {
 	if a.fullscreen && a.active != "" && (sessionID == "" || sessionID == a.active) {
 		return appActiveStreamSize(cols, rows)
 	}
-	_, previewWidth, limit := appLayout(cols, rows)
+	_, previewWidth, limit := a.layoutForSize(cols, rows)
 	if previewWidth <= 0 {
 		previewWidth = cols
 	}
@@ -1171,7 +1299,7 @@ func (a *App) renderWithSize(cols, rows int) {
 		workerSummary += strings.Join(parts, ", ")
 	}
 	writeLine(a.Out, cols, workerSummary)
-	listWidth, previewWidth, limit := appLayout(cols, rows)
+	listWidth, previewWidth, limit := a.layoutForSize(cols, rows)
 	writeLine(a.Out, cols, styleHeader("Sessions")+previewTitle(listWidth, previewWidth, a.active))
 	start := scrollStart(a.selected, limit, len(a.sessions))
 	previewLines := splitPreviewLines(a.preview, limit)
@@ -1203,14 +1331,14 @@ func (a *App) renderWithSize(cols, rows int) {
 	writeLine(a.Out, cols, footer)
 	if a.active != "" {
 		if a.debugEnabled() {
-			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  Ctrl-G debug  input is sent to right pane"))
+			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  Ctrl-G debug  mouse select/drag split"))
 		} else {
-			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  input is sent to right pane"))
+			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  mouse select/drag split"))
 		}
 	} else if a.debugEnabled() {
-		writeLine(a.Out, cols, styleMuted("Enter/a attach  Ctrl-F fullscreen  / commands  c create  s send  x stop  r refresh  D debug  ? help  q quit"))
+		writeLine(a.Out, cols, styleMuted("Enter/a attach  mouse select/drag split  / commands  c create  s send  x stop  r refresh  D debug  ? help  q quit"))
 	} else {
-		writeLine(a.Out, cols, styleMuted("Enter/a attach  Ctrl-F fullscreen  / commands  c create  s send  x stop  r refresh  ? help  q quit"))
+		writeLine(a.Out, cols, styleMuted("Enter/a attach  mouse select/drag split  / commands  c create  s send  x stop  r refresh  ? help  q quit"))
 	}
 	clearToEnd(a.Out)
 }
@@ -1461,6 +1589,7 @@ func (a *App) leaveRawForPrompt() {
 
 func (a *App) enterRawAfterPrompt() {
 	term.EnterAlternateScreen(a.Out)
+	term.EnableMouseCellMotion(a.Out)
 	_ = a.enableRaw()
 }
 
@@ -1516,64 +1645,83 @@ type appKeyReader struct {
 
 func (r *appKeyReader) Read(in io.Reader) (string, error) {
 	for {
-		key, ok, err := r.ReadAvailable(in)
+		input, ok, err := r.ReadEventAvailable(in)
 		if err != nil || ok {
-			return key, err
+			return input.key, err
 		}
 	}
 }
 
 func (r *appKeyReader) ReadAvailable(in io.Reader) (string, bool, error) {
+	input, ok, err := r.ReadEventAvailable(in)
+	if !ok || err != nil {
+		return "", ok, err
+	}
+	if input.mouse != nil {
+		return "mouse", true, nil
+	}
+	return input.key, true, nil
+}
+
+func (r *appKeyReader) ReadEventAvailable(in io.Reader) (appInputEvent, bool, error) {
 	if len(r.pending) > 0 {
 		b := r.pending[0]
 		r.pending = r.pending[1:]
-		return r.keyFromInputByte(b)
+		key, ok, err := r.keyFromInputByte(b)
+		return appInputEvent{key: key}, ok, err
 	}
 	var b [1]byte
 	n, err := in.Read(b[:])
 	if n == 0 {
 		if err != nil && !errors.Is(err, io.EOF) {
-			return "", false, err
+			return appInputEvent{}, false, err
 		}
-		return "", false, nil
+		return appInputEvent{}, false, nil
 	}
 	switch b[0] {
 	case 0x1b:
 		r.utf8Buf = nil
-		seq := make([]byte, 0, 3)
+		seq := make([]byte, 0, 32)
 		var next [1]byte
-		for len(seq) < 3 {
+		for len(seq) < 32 {
 			n, err := in.Read(next[:])
 			if n > 0 {
 				seq = append(seq, next[0])
+				if appEscapeComplete(seq) {
+					break
+				}
 				continue
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
-				return "", false, err
+				return appInputEvent{}, false, err
 			}
 			break
+		}
+		if mouse, ok := parseAppMouseSequence(seq); ok {
+			return appInputEvent{mouse: &mouse}, true, nil
 		}
 		if len(seq) >= 2 && (seq[0] == '[' || seq[0] == 'O') {
 			switch seq[1] {
 			case 'A':
-				return "up", true, nil
+				return appInputEvent{key: "up"}, true, nil
 			case 'B':
-				return "down", true, nil
+				return appInputEvent{key: "down"}, true, nil
 			case 'C':
-				return "right", true, nil
+				return appInputEvent{key: "right"}, true, nil
 			case 'D':
-				return "left", true, nil
+				return appInputEvent{key: "left"}, true, nil
 			}
 		}
 		if len(seq) == 3 && seq[0] == '[' && seq[1] == '3' && seq[2] == '~' {
-			return "delete", true, nil
+			return appInputEvent{key: "delete"}, true, nil
 		}
 		if len(seq) > 0 {
 			r.pending = append(r.pending, seq...)
 		}
-		return "unknown", true, nil
+		return appInputEvent{key: "unknown"}, true, nil
 	default:
-		return r.keyFromInputByte(b[0])
+		key, ok, err := r.keyFromInputByte(b[0])
+		return appInputEvent{key: key}, ok, err
 	}
 }
 
@@ -1596,6 +1744,92 @@ func (r *appKeyReader) keyFromInputByte(b byte) (string, bool, error) {
 	key := string(r.utf8Buf)
 	r.utf8Buf = nil
 	return key, true, nil
+}
+
+func appEscapeComplete(seq []byte) bool {
+	if len(seq) == 0 {
+		return false
+	}
+	switch seq[0] {
+	case '[':
+		if len(seq) < 2 {
+			return false
+		}
+		last := seq[len(seq)-1]
+		return last >= 0x40 && last <= 0x7e
+	case 'O':
+		return len(seq) >= 2
+	default:
+		return true
+	}
+}
+
+func parseAppMouseSequence(seq []byte) (appMouseEvent, bool) {
+	if len(seq) < 6 || seq[0] != '[' || seq[1] != '<' {
+		return appMouseEvent{}, false
+	}
+	final := seq[len(seq)-1]
+	if final != 'M' && final != 'm' {
+		return appMouseEvent{}, false
+	}
+	parts := strings.Split(string(seq[2:len(seq)-1]), ";")
+	if len(parts) != 3 {
+		return appMouseEvent{}, false
+	}
+	code, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return appMouseEvent{}, false
+	}
+	x, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return appMouseEvent{}, false
+	}
+	y, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return appMouseEvent{}, false
+	}
+	event := appMouseEvent{
+		x:      x,
+		y:      y,
+		shift:  code&4 != 0,
+		alt:    code&8 != 0,
+		ctrl:   code&16 != 0,
+		button: terminalview.MouseNone,
+	}
+	release := final == 'm'
+	buttonCode := code & 3
+	switch {
+	case code&64 != 0:
+		event.kind = appMouseWheel
+		if buttonCode == 0 {
+			event.button = terminalview.MouseWheelUp
+		} else if buttonCode == 1 {
+			event.button = terminalview.MouseWheelDown
+		} else if buttonCode == 2 {
+			event.button = terminalview.MouseWheelLeft
+		} else {
+			event.button = terminalview.MouseWheelRight
+		}
+	case release:
+		event.kind = appMouseRelease
+	case code&32 != 0:
+		event.kind = appMouseMotion
+	default:
+		event.kind = appMouseClick
+	}
+	if event.kind == appMouseClick || event.kind == appMouseMotion {
+		switch buttonCode {
+		case 0:
+			event.button = terminalview.MouseLeft
+		case 1:
+			event.button = terminalview.MouseMiddle
+		case 2:
+			event.button = terminalview.MouseRight
+		default:
+			event.button = terminalview.MouseNone
+		}
+	}
+	return event, true
 }
 
 func (r *appKeyReader) Reset() {
@@ -1698,6 +1932,43 @@ func appLayout(cols, rows int) (listWidth, previewWidth, limit int) {
 		limit = 4
 	}
 	return listWidth, previewWidth, limit
+}
+
+func (a *App) layoutForSize(cols, rows int) (listWidth, previewWidth, limit int) {
+	listWidth, previewWidth, limit = appLayout(cols, rows)
+	if previewWidth > 0 && a != nil && a.splitWidth > 0 {
+		minList := 18
+		maxList := cols - 32 - 3
+		if maxList < minList {
+			maxList = minList
+		}
+		listWidth = clampInt(a.splitWidth, minList, maxList)
+		previewWidth = cols - listWidth - 3
+	}
+	return listWidth, previewWidth, limit
+}
+
+func (a *App) setSplitWidth(width, cols int) {
+	if cols < 72 {
+		a.splitWidth = 0
+		return
+	}
+	minList := 18
+	maxList := cols - 32 - 3
+	if maxList < minList {
+		maxList = minList
+	}
+	a.splitWidth = clampInt(width, minList, maxList)
+}
+
+func clampInt(value, low, high int) int {
+	if value < low {
+		return low
+	}
+	if value > high {
+		return high
+	}
+	return value
 }
 
 func previewTitle(listWidth, previewWidth int, active string) string {

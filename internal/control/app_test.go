@@ -144,6 +144,35 @@ func TestAppKeyReaderPreservesUTF8InputBytes(t *testing.T) {
 	}
 }
 
+func TestAppKeyReaderParsesSGRMouseClick(t *testing.T) {
+	var keys appKeyReader
+	input, ok, err := keys.ReadEventAvailable(strings.NewReader("\x1b[<0;12;5M"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || input.mouse == nil {
+		t.Fatalf("expected mouse event, got ok=%t input=%+v", ok, input)
+	}
+	mouse := *input.mouse
+	if mouse.kind != appMouseClick || mouse.x != 12 || mouse.y != 5 || mouse.button != terminalview.MouseLeft {
+		t.Fatalf("unexpected mouse event: %+v", mouse)
+	}
+}
+
+func TestAppKeyReaderParsesSGRMouseRelease(t *testing.T) {
+	var keys appKeyReader
+	input, ok, err := keys.ReadEventAvailable(strings.NewReader("\x1b[<0;12;5m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || input.mouse == nil {
+		t.Fatalf("expected mouse event, got ok=%t input=%+v", ok, input)
+	}
+	if input.mouse.kind != appMouseRelease || input.mouse.x != 12 || input.mouse.y != 5 {
+		t.Fatalf("unexpected mouse release: %+v", *input.mouse)
+	}
+}
+
 func TestAppKeyInputDataAcceptsUTF8Rune(t *testing.T) {
 	input := "中"
 	if got := appKeyInputData(input); got != input {
@@ -279,6 +308,18 @@ func TestAppLayoutShowsPreviewAtStandardTerminalWidth(t *testing.T) {
 	}
 	if limit != 17 {
 		t.Fatalf("unexpected body limit: %d", limit)
+	}
+}
+
+func TestAppLayoutUsesCustomSplitWidth(t *testing.T) {
+	app := NewApp(Client{}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.setSplitWidth(40, 120)
+	listWidth, previewWidth, _ := app.layoutForSize(120, 24)
+	if listWidth != 40 {
+		t.Fatalf("expected custom split width, got %d", listWidth)
+	}
+	if previewWidth != 77 {
+		t.Fatalf("unexpected preview width: %d", previewWidth)
 	}
 }
 
@@ -649,6 +690,68 @@ func TestForwardActiveKeyPreservesUTF8InputBytes(t *testing.T) {
 	}
 	if got.String() != input {
 		t.Fatalf("forwarded utf-8 changed: got %q bytes=% x want %q bytes=% x", got.String(), []byte(got.String()), input, []byte(input))
+	}
+}
+
+func TestHandleMouseSelectsSessionListRow(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "local/a"}, {ID: "local/b"}}
+	app.selected = 0
+	if !app.handleMouse(t.Context(), appMouseEvent{kind: appMouseClick, x: 2, y: 5, button: terminalview.MouseLeft}) {
+		t.Fatalf("expected mouse click to change selection")
+	}
+	if app.selected != 1 {
+		t.Fatalf("expected second session selected, got %d", app.selected)
+	}
+}
+
+func TestHandleMouseDragUpdatesSplitWidth(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	if app.handleMouse(t.Context(), appMouseEvent{kind: appMouseClick, x: 31, y: 4, button: terminalview.MouseLeft}) {
+		t.Fatalf("split drag start should not force render by itself")
+	}
+	if !app.dragSplit {
+		t.Fatalf("expected split dragging to start")
+	}
+	if !app.handleMouse(t.Context(), appMouseEvent{kind: appMouseMotion, x: 44, y: 4, button: terminalview.MouseLeft}) {
+		t.Fatalf("expected split drag motion to update layout")
+	}
+	if app.splitWidth != 43 {
+		t.Fatalf("unexpected split width: %d", app.splitWidth)
+	}
+	if !app.handleMouse(t.Context(), appMouseEvent{kind: appMouseRelease, x: 44, y: 4, button: terminalview.MouseNone}) {
+		t.Fatalf("expected split release to update UI")
+	}
+	if app.dragSplit {
+		t.Fatalf("expected split dragging to stop")
+	}
+}
+
+func TestHandleMouseForwardsTerminalMouseInput(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	writes := make(chan appStreamWrite, 1)
+	view := terminalview.New(80, 17)
+	view.Write([]byte("\x1b[?1000h\x1b[?1006h"))
+	app.active = "local/a"
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	app.streams["local/a"] = &appSessionStream{
+		sessionID:  "local/a",
+		view:       view,
+		size:       protocol.TerminalSize{Cols: 80, Rows: 17},
+		writes:     writes,
+		seenOutput: true,
+	}
+	if app.handleMouse(t.Context(), appMouseEvent{kind: appMouseClick, x: 40, y: 6, button: terminalview.MouseLeft}) {
+		t.Fatalf("terminal mouse forwarding should not require local repaint")
+	}
+	select {
+	case write := <-writes:
+		if write.data != "\x1b[<0;7;3M" {
+			t.Fatalf("unexpected mouse input sequence: %q", write.data)
+		}
+	default:
+		t.Fatalf("expected mouse input to be forwarded")
 	}
 }
 
