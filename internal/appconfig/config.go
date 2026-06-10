@@ -1,6 +1,8 @@
 package appconfig
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,8 +11,9 @@ import (
 )
 
 type Config struct {
-	WorkerBackend string `json:"worker_backend,omitempty"`
-	WorkerHubURL  string `json:"worker_hub_url,omitempty"`
+	WorkerBackend    string `json:"worker_backend,omitempty"`
+	WorkerHubURL     string `json:"worker_hub_url,omitempty"`
+	WorkerInstanceID string `json:"worker_instance_id,omitempty"`
 	// WorkerToken is kept only for reading old config.json files. New writes
 	// store credentials in credentials.json through credentialcache.
 	WorkerToken string `json:"worker_token,omitempty"`
@@ -44,6 +47,7 @@ func Load() (Config, error) {
 	}
 	cfg.WorkerBackend = strings.TrimSpace(cfg.WorkerBackend)
 	cfg.WorkerHubURL = strings.TrimSpace(cfg.WorkerHubURL)
+	cfg.WorkerInstanceID = strings.TrimSpace(cfg.WorkerInstanceID)
 	cfg.WorkerToken = strings.TrimSpace(cfg.WorkerToken)
 	cfg.WorkerID = strings.TrimSpace(cfg.WorkerID)
 	cfg.WorkerName = strings.TrimSpace(cfg.WorkerName)
@@ -60,6 +64,7 @@ func Save(cfg Config) error {
 	}
 	cfg.WorkerBackend = strings.TrimSpace(cfg.WorkerBackend)
 	cfg.WorkerHubURL = strings.TrimSpace(cfg.WorkerHubURL)
+	cfg.WorkerInstanceID = strings.TrimSpace(cfg.WorkerInstanceID)
 	cfg.WorkerToken = ""
 	cfg.WorkerID = strings.TrimSpace(cfg.WorkerID)
 	cfg.WorkerName = strings.TrimSpace(cfg.WorkerName)
@@ -71,6 +76,21 @@ func Save(cfg Config) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+func EnsureWorkerInstanceID() (string, error) {
+	cfg, err := Load()
+	if err != nil {
+		return "", err
+	}
+	if cfg.WorkerInstanceID != "" {
+		return cfg.WorkerInstanceID, nil
+	}
+	cfg.WorkerInstanceID = "wins_" + randomHex(16)
+	if err := Save(cfg); err != nil {
+		return "", err
+	}
+	return cfg.WorkerInstanceID, nil
 }
 
 func SaveWorkerAuth(hubURL, _ string, id, name string) error {
@@ -85,6 +105,18 @@ func SaveWorkerAuth(hubURL, _ string, id, name string) error {
 	return Save(cfg)
 }
 
+func ClearWorkerAuth() error {
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	cfg.WorkerHubURL = ""
+	cfg.WorkerToken = ""
+	cfg.WorkerID = ""
+	cfg.WorkerName = ""
+	return Save(cfg)
+}
+
 func SaveWorkerBackend(backend string) error {
 	cfg, err := Load()
 	if err != nil {
@@ -92,4 +124,12 @@ func SaveWorkerBackend(backend string) error {
 	}
 	cfg.WorkerBackend = strings.TrimSpace(backend)
 	return Save(cfg)
+}
+
+func randomHex(bytes int) string {
+	buf := make([]byte, bytes)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", os.Getpid())
+	}
+	return hex.EncodeToString(buf)
 }

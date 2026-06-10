@@ -6,16 +6,17 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-AgentMux is a tmux-first control plane for long-lived coding-agent sessions.
+AgentMux is a terminal-backend control plane for long-lived coding-agent sessions.
 It is designed as one Go binary with three roles:
 
 - `hub`: public HTTPS/WSS entrypoint and routing layer.
-- `worker`: outbound connector that manages local tmux sessions.
+- `worker`: outbound connector that manages local tmux or built-in PTY sessions.
 - `control`: CLI client for listing, creating, attaching, and sending input.
   The product control surface is the hub-hosted browser page at `/control`.
 
 The agent is intentionally unaware of AgentMux. Codex, Claude, Gemini, OpenCode,
-or a shell simply run inside tmux. Worker observes and controls tmux.
+or a shell simply run inside a local terminal backend. Worker observes and
+controls that terminal layer.
 
 ![AgentMux system architecture](docs/assets/visuals/agentmux-1-system-architecture-v1.png)
 
@@ -24,8 +25,9 @@ or a shell simply run inside tmux. Worker observes and controls tmux.
 If you are already viewing an AgentMux Hub landing page, use that Hub directly:
 
 1. Click `Generate join signal`.
-2. Run the generated Worker command on the machine that owns your tmux sessions.
-3. Open the generated Web Control URL from your browser.
+2. Run the generated Worker command on the machine that owns your sessions.
+3. Open the generated Web Control share URL from your browser, or copy the
+   Direct Token into Web Control / TUI.
 
 To self-host a Hub, run the published container image:
 
@@ -57,16 +59,44 @@ mise install
 mise exec -- go test ./...
 ```
 
+Installed binaries expose build metadata and a conservative updater:
+
+```bash
+agentmux version
+agentmux update check --role control
+agentmux update apply --role control
+agentmux run control@latest --hub https://hub.example.com
+```
+
+`update apply` verifies the release checksum, stages the new binary, and keeps a
+rollback pointer. Docker Hub deployments should update by replacing the
+container image instead of mutating binaries inside the container.
+
+Web Control checks Hub build metadata and prompts for a refresh when new browser
+assets are available. Worker cards can queue a remote Worker update when the
+Worker is online and advertises the `worker.update.apply` capability; tmux
+sessions remain alive across the Worker restart.
+
 The browser UI uses xterm.js for the terminal area and keeps session identity,
 connection state, and detach controls outside the remote terminal buffer.
 The modern Web control source lives in `web/control` and is embedded into the
 Hub from `internal/hub/webdist`.
 
-The Web control also includes a registered-user flow. Register or sign in from
-the sidebar to receive a scoped `amx_cred_...` control credential. When Hub runs
-with `--data`, users, signals, and credentials are persisted in SQLite. Without
-`--data`, Hub uses the development in-memory store. GitHub and Google buttons
-are wired to OAuth provider endpoints, but providers are not configured yet.
+The Web control supports two access modes:
+
+- Registered account mode for full Hub management: create/join sessions, manage
+  Workers, update Workers, use previews, and keep a refreshable browser
+  credential.
+- Direct Token mode for anonymous sharing: connect to the shared tenant, view
+  the session list, and switch between session terminals. Direct Token mode
+  intentionally cannot create sessions, generate new join signals, manage
+  Workers, use previews, or trigger updates.
+
+Register or sign in from the sidebar to receive a scoped `amx_cred_...` control
+credential. When Hub runs with `--data`, users, signals, credentials, and device
+auth state are persisted in SQLite. Without `--data`, Hub uses the development
+in-memory store. GitHub and Google buttons are wired to OAuth provider
+endpoints, but providers are not configured yet.
 
 ![AgentMux Web Control workspace](docs/assets/visuals/agentmux-4-web-control-workspace-v1.png)
 
@@ -109,15 +139,18 @@ Docker images are published to GitHub Container Registry on release tags:
 docker pull ghcr.io/kinboyw/agentmux:latest
 ```
 
-Signal-based onboarding:
+Signal and Direct Token onboarding:
 
 1. Open `http://127.0.0.1:8081/`.
 2. Generate a signal.
-3. Run the generated worker command.
-4. Open the generated Web Control URL.
+3. Run the generated Worker command.
+4. Open the generated Web Control share URL, or copy the Direct Token into Web
+   Control / `agentmux-tui --token`.
 
 Signals look like `amx_sig_...` and are exchanged for scoped `amx_cred_...`
 credentials before normal API or WebSocket access.
+The generated Direct Token is already a scoped Control credential and is limited
+to simple shared-session access.
 
 ![AgentMux signal onboarding](docs/assets/visuals/agentmux-2-zero-tier-style-onboarding-v1.png)
 
@@ -147,10 +180,22 @@ In `control attach`, press `Ctrl-]` to detach from the local control session.
 This only closes the local control connection; the worker-side session remains
 alive. `Ctrl-C` is forwarded to the remote agent.
 
+Windows Hub-only convenience startup:
+
+```bat
+scripts\run.bat
+```
+
+The script starts a local Hub on `127.0.0.1:8081` with
+`--public-url https://agentmux.kinboy.wang`. Edit the script for a different
+domain or port.
+
 ## Build And Release
 
-CI runs Go tests, builds the Web Control, and builds the CLI binary through
-GitHub Actions. Tag pushes like `v0.1.0` trigger cross-platform release assets.
+CI runs Go tests, builds the Web Control, and builds role-specific binaries
+through GitHub Actions. Tag pushes like `v0.1.0` trigger Linux/macOS Worker and
+Control assets, plus cross-platform Hub assets including Windows hub-only
+builds.
 
 Local release-style build:
 
@@ -170,6 +215,7 @@ mise exec -- go build -o dist/agentmux ./cmd/agentmux
 - [Design](docs/DESIGN.md)
 - [Usage](docs/USAGE.md)
 - [Product Architecture](docs/PRODUCT_ARCHITECTURE.md)
+- [In-Place Update Strategy](docs/UPDATE_STRATEGY.md)
 - [API](docs/API.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Roadmap](docs/ROADMAP.md)

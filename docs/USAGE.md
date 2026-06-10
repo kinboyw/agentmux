@@ -2,17 +2,19 @@
 
 This guide covers the normal operating path for AgentMux: run Hub with a stable
 public URL, join Workers with a short-lived signal, and control long-running
-tmux sessions from the browser.
+terminal sessions from the browser or TUI.
 
 ## Concepts
 
 AgentMux has three roles in one binary:
 
 - `hub`: the HTTPS/WSS entrypoint, API server, Web Control host, and session router.
-- `worker`: an outbound connector that manages local sessions on a machine where agents run.
+- `worker`: an outbound connector that manages local tmux or built-in PTY sessions on a machine where agents run.
 - `control`: CLI commands for listing, creating, and attaching to sessions. The browser control surface is served by Hub at `/control`.
 
-The agent itself remains unaware. Codex, Claude, Gemini, OpenCode, or a shell runs inside a local terminal backend; Worker attaches below it at the terminal layer.
+The agent itself remains unaware. Codex, Claude, Gemini, OpenCode, or a shell
+runs inside a local terminal backend; Worker attaches below it at the terminal
+layer.
 
 ## Quick Start
 
@@ -20,8 +22,9 @@ If you already have an AgentMux Hub URL, open that landing page and use the
 generated commands:
 
 1. Click `Generate join signal`.
-2. Run the generated Worker command on the machine that owns your tmux sessions.
-3. Open the generated Web Control URL.
+2. Run the generated Worker command on the machine that owns your sessions.
+3. Open the generated Web Control share URL, or copy the Direct Token into Web
+   Control / TUI.
 
 That is the normal user path. Hub deployment is only needed when you want to run
 your own private Hub.
@@ -59,6 +62,10 @@ Important flags:
 - `--data`: SQLite database path for users, signals, and credentials.
 - `--public-url`: external HTTPS URL used to generate worker/control commands.
 - `--release-repo`: GitHub `owner/repo` for `/install.sh` downloads. Defaults to `kinboyw/agentmux`.
+
+On Windows, the release currently supports the Hub role. A convenience starter
+is available in the repository under `scripts\run.bat`; edit `PUBLIC_URL`,
+`ADDR`, or `DATA` in that file before starting a production Hub.
 
 ## Run Hub From Docker Image
 
@@ -161,6 +168,38 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_
 ```
 
 The script uses an existing `agentmux` in `PATH`, builds from source when run inside a checkout, or downloads the matching GitHub release archive.
+Worker join is best-effort for recoverable failures: network errors, Hub 5xx,
+HTTP 408, and HTTP 429 are logged and retried with backoff until the signal
+exchange succeeds or the process is interrupted. Configuration and permission
+errors such as an invalid Hub URL, wrong tenant, or unauthorized signal fail
+fast.
+
+A Worker keeps a stable local instance id. Reusing the same signal from the same
+Worker instance is rejected, which prevents accidental duplicate joins caused by
+changing only `--name`. A Worker also refuses to join a different Hub while an
+existing Worker credential is configured. Leave the current Hub first:
+
+```bash
+agentmux worker leave
+agentmux worker join --hub https://hub.example.com --join 'amx_sig_...' --name "$(hostname)"
+```
+
+`worker leave` stops the local background Worker by default and clears the saved
+Worker credential for the configured Hub/id.
+
+Useful local service commands:
+
+```bash
+agentmux worker status
+agentmux worker restart
+agentmux worker logs -n 80
+agentmux worker logs -f
+```
+
+`worker status` prints local configuration, credential presence, backend
+resolution, log path, pid/lock metadata, and service-manager state. `logs -f`
+follows `journalctl --user` when available and falls back to the local worker
+log file.
 
 ### Worker session backend
 
@@ -187,20 +226,28 @@ when tmux is missing; `auto` falls back to built-in PTY.
 
 ## Open Web Control
 
-Use the generated Web Control URL:
+Use the generated Web Control share URL:
 
 ```text
-https://hub.example.com/control?signal=amx_sig_...
+https://hub.example.com/control?token=amx_cred_...
 ```
 
-The browser exchanges the signal for a scoped `amx_cred_...` control credential, then stores it locally.
+The share URL carries a Direct Token. Direct Token mode is intentionally narrow:
+it lists sessions for the shared tenant, connects to a selected session, and
+lets you switch between sessions. It does not allow session creation, Worker
+join signal generation, Worker management, previews, workspaces, version/update
+prompts, or registered-account features.
+
+Registered users should sign in from Web Control for the full management
+surface: create/stop sessions, join Workers, manage Workers, use previews,
+operate workspaces, and queue Worker updates.
 
 ## CLI Control
 
 Install or bootstrap the control client:
 
 ```bash
-curl -fsSL https://hub.example.com/install.sh | sh -s -- control --join 'amx_sig_...'
+curl -fsSL https://hub.example.com/install.sh | sh -s -- control
 ```
 
 Useful source-development commands:
@@ -221,6 +268,59 @@ go run ./cmd/agentmux control app --hub http://127.0.0.1:8081 --token dev-token 
 
 Inside the TUI, press `D` from the session list to append a JSON state snapshot to the debug log. Attached sessions run in the right-side terminal area by default; use `Ctrl-F` to toggle full-screen, `Ctrl-]` to detach, `Ctrl-Q` to quit the TUI, or `Ctrl-G` to write a debug snapshot. Normal keys are sent to the remote terminal. The snapshot records render counters, stream queue sizes, selected session metadata, and terminal view sizes, but not credentials or terminal output.
 
+## Version And Updates
+
+Check the current binary:
+
+```bash
+agentmux version
+agentmux version --json
+```
+
+Check for an available release and update an installed binary:
+
+```bash
+agentmux update check --role control
+agentmux update apply --role control
+agentmux update rollback
+```
+
+Worker can restart its local background service after the new binary is staged:
+
+```bash
+agentmux update apply --role worker --restart
+```
+
+From Web Control, use the `Update` action on a Worker card to queue the same
+operation remotely. The action is enabled only for online Workers that advertise
+the `worker.update.apply` capability. tmux-backed Workers can restart without
+terminating tmux sessions. Built-in PTY Workers require an explicit disruptive
+restart confirmation because in-process sessions may be lost.
+When Hub has a concrete release version and a Worker reports an older version,
+Web Control shows an update notice on the Worker card. After an update is
+queued, the card tracks the in-memory job status such as `sent`, `started`,
+`restarting`, `succeeded`, or `failed`.
+
+Web Control also checks `/api/version` in the background. When Hub serves a new
+Web Control build, the browser shows a refresh notification instead of silently
+reloading an active terminal workspace.
+
+For `npx`-style temporary Control usage, run from the verified cache instead of
+mutating the installed binary:
+
+```bash
+agentmux run control@latest --hub https://hub.example.com
+curl -fsSL https://hub.example.com/run.sh | sh -s -- control@latest
+agentmux cache prune
+```
+
+TUI Direct Token access is supported with the same boundary as Web Control
+Direct Token mode:
+
+```bash
+agentmux-tui --hub https://hub.example.com --token 'amx_cred_...'
+```
+
 ## Data And Backups
 
 SQLite persists:
@@ -228,6 +328,7 @@ SQLite persists:
 - anonymous join signals
 - scoped credentials
 - registered users
+- browser/TUI device auth sessions
 
 Runtime state is rebuilt as workers reconnect:
 

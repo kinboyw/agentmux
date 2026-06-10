@@ -30,6 +30,41 @@ func TestAuthStoreSignalExchange(t *testing.T) {
 	}
 }
 
+func TestAuthStoreRejectsRepeatedSignalUseByInstance(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		testAuthStoreRejectsRepeatedSignalUseByInstance(t, newAuthStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		store, err := OpenSQLiteAuthStore(t.TempDir() + "/agentmux.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		testAuthStoreRejectsRepeatedSignalUseByInstance(t, store)
+	})
+}
+
+func testAuthStoreRejectsRepeatedSignalUseByInstance(t *testing.T, store AuthStore) {
+	t.Helper()
+	minted, err := store.MintSignal(time.Minute, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Exchange(exchangeRequest{Signal: minted.Signal, Role: "worker", DeviceID: "one", DeviceName: "one", InstanceID: "instance-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Exchange(exchangeRequest{Signal: minted.Signal, Role: "worker", DeviceID: "renamed", DeviceName: "renamed", InstanceID: "instance-1"}); err == nil {
+		t.Fatal("expected same worker instance to be rejected on repeated signal use")
+	}
+	if _, err := store.Exchange(exchangeRequest{Signal: minted.Signal, Role: "worker", DeviceID: "two", DeviceName: "two", InstanceID: "instance-2"}); err != nil {
+		t.Fatalf("different worker instance should still be allowed: %v", err)
+	}
+}
+
 func TestAuthStoreRegisterLogin(t *testing.T) {
 	store := newAuthStore()
 	registered, err := store.Register(registerRequest{

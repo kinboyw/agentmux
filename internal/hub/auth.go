@@ -50,13 +50,14 @@ type AuthStore interface {
 }
 
 type signalEntry struct {
-	Hash          string
-	ID            string
-	TenantID      string
-	ExpiresAt     time.Time
-	UsesRemaining int
-	Scopes        []string
-	CreatedAt     time.Time
+	Hash            string
+	ID              string
+	TenantID        string
+	ExpiresAt       time.Time
+	UsesRemaining   int
+	Scopes          []string
+	CreatedAt       time.Time
+	UsedByInstances []string
 }
 
 type mintedSignal struct {
@@ -159,6 +160,7 @@ type exchangeRequest struct {
 	Role       string `json:"role"`
 	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
 type registerRequest struct {
@@ -294,10 +296,17 @@ func (s *authStore) Exchange(req exchangeRequest) (exchangedCredential, error) {
 	if !slices.Contains(signal.Scopes, scope) {
 		return exchangedCredential{}, fmt.Errorf("signal scope does not allow %s", role)
 	}
+	instanceID := strings.TrimSpace(req.InstanceID)
+	if instanceID != "" && slices.Contains(signal.UsedByInstances, instanceID) {
+		return exchangedCredential{}, fmt.Errorf("signal has already been used by this worker instance")
+	}
 	if signal.UsesRemaining > 0 {
 		signal.UsesRemaining--
-		s.signals[hash] = signal
 	}
+	if instanceID != "" {
+		signal.UsedByInstances = append(signal.UsedByInstances, instanceID)
+	}
+	s.signals[hash] = signal
 	credential, err := randomToken("amx_cred_")
 	if err != nil {
 		return exchangedCredential{}, err
@@ -735,6 +744,10 @@ func workerJoinCommand(baseURL string, signal string) string {
 
 func installControlCommand(baseURL string) string {
 	return fmt.Sprintf("agentmux-tui --hub %s", shellQuote(baseURL))
+}
+
+func installControlDirectCommand(baseURL string, token string) string {
+	return fmt.Sprintf("agentmux-tui --hub %s --token %s", shellQuote(baseURL), shellQuote(token))
 }
 
 func websocketBase(baseURL string) string {

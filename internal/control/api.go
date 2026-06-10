@@ -60,6 +60,15 @@ func (c *Client) CreateSession(ctx context.Context, req protocol.CreateSession) 
 	return c.doJSON(ctx, http.MethodPost, "/api/sessions", req, &payload)
 }
 
+func (c *Client) EvictWorker(ctx context.Context, workerID string) error {
+	if strings.TrimSpace(workerID) == "" {
+		return fmt.Errorf("worker id is required")
+	}
+	path := fmt.Sprintf("/api/workers/%s", url.PathEscape(workerID))
+	var payload map[string]any
+	return c.doJSON(ctx, http.MethodDelete, path, nil, &payload)
+}
+
 func (c *Client) SendInput(ctx context.Context, sessionID, data string) error {
 	workerID, name, ok := protocol.SplitSessionID(sessionID)
 	if !ok {
@@ -94,6 +103,19 @@ func (c *Client) SessionPreview(ctx context.Context, sessionID string, lines int
 		return "", err
 	}
 	return payload.Data, nil
+}
+
+func (c *Client) SessionTargets(ctx context.Context, sessionID string) ([]protocol.TerminalTarget, error) {
+	workerID, name, ok := protocol.SplitSessionID(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("invalid session id %q; expected worker/name", sessionID)
+	}
+	path := fmt.Sprintf("/api/sessions/%s/%s/targets", url.PathEscape(workerID), url.PathEscape(name))
+	var payload protocol.SessionTargets
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &payload); err != nil {
+		return nil, err
+	}
+	return payload.Targets, nil
 }
 
 func (c *Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, deviceName string) (string, error) {

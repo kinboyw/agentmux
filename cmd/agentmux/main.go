@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,8 @@ import (
 	"private/agentmux/internal/sessionbackend"
 	"private/agentmux/internal/term"
 	"private/agentmux/internal/tmux"
+	"private/agentmux/internal/updater"
+	buildversion "private/agentmux/internal/version"
 	"private/agentmux/internal/worker"
 	"private/agentmux/internal/workerservice"
 )
@@ -28,6 +31,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if isTUIInvocation() {
+		if len(os.Args) > 1 {
+			switch os.Args[1] {
+			case "version":
+				runVersion(os.Args[2:], "control")
+				return
+			case "update":
+				runUpdate(ctx, os.Args[2:], "control")
+				return
+			}
+		}
 		runTUI(ctx, os.Args[1:])
 		return
 	}
@@ -43,6 +56,14 @@ func main() {
 		runWorker(ctx, os.Args[2:])
 	case "control":
 		runControl(ctx, os.Args[2:])
+	case "version":
+		runVersion(os.Args[2:], inferRuntimeRole())
+	case "update":
+		runUpdate(ctx, os.Args[2:], inferRuntimeRole())
+	case "run":
+		runCached(ctx, os.Args[2:])
+	case "cache":
+		runCache(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -155,17 +176,157 @@ func runHub(ctx context.Context, args []string) {
 	}
 }
 
+func runVersion(args []string, role string) {
+	fs := flag.NewFlagSet("version", flag.ExitOnError)
+	jsonOut := fs.Bool("json", false, "print version metadata as JSON")
+	roleFlag := fs.String("role", role, "runtime role")
+	_ = fs.Parse(args)
+	if *jsonOut {
+		data, err := buildversion.JSON(*roleFlag)
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Fprintln(os.Stdout, string(data))
+		return
+	}
+	fmt.Fprintln(os.Stdout, buildversion.String(*roleFlag))
+}
+
+func runUpdate(ctx context.Context, args []string, defaultRole string) {
+	if len(args) < 1 {
+		updateUsage()
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "check":
+		fs := flag.NewFlagSet("update check", flag.ExitOnError)
+		repo := fs.String("repo", getenv("AGENTMUX_REPO", getenv("AGENTMUX_RELEASE_REPO", "kinboyw/agentmux")), "GitHub owner/repo")
+		targetVersion := fs.String("version", "latest", "target release version or latest")
+		role := fs.String("role", defaultRole, "role to update: worker, control, or hub")
+		jsonOut := fs.Bool("json", false, "print result as JSON")
+		_ = fs.Parse(args[1:])
+		result, err := updater.Check(ctx, buildversion.Version, updater.Options{Repo: *repo, Version: *targetVersion, Role: *role})
+		if err != nil {
+			fatal(err)
+		}
+		if *jsonOut {
+			writeJSONStdout(result)
+			return
+		}
+		fmt.Fprintf(os.Stdout, "current=%s\nlatest=%s\nupdate_available=%t\nrole=%s\nasset=%s\n", result.Current, result.Latest, result.UpdateAvailable, result.Role, result.AssetName)
+	case "apply":
+		fs := flag.NewFlagSet("update apply", flag.ExitOnError)
+		repo := fs.String("repo", getenv("AGENTMUX_REPO", getenv("AGENTMUX_RELEASE_REPO", "kinboyw/agentmux")), "GitHub owner/repo")
+		targetVersion := fs.String("version", "latest", "target release version or latest")
+		role := fs.String("role", defaultRole, "role to update: worker, control, or hub")
+		path := fs.String("path", executablePath(), "installed binary path to replace")
+		restart := fs.Bool("restart", false, "restart worker service after installing a worker update")
+		jsonOut := fs.Bool("json", false, "print result as JSON")
+		_ = fs.Parse(args[1:])
+		result, err := updater.Install(ctx, *path, updater.Options{Repo: *repo, Version: *targetVersion, Role: *role})
+		if err != nil {
+			fatal(err)
+		}
+		if *role == "worker" && *restart {
+			serviceResult, err := workerservice.Restart(ctx, result.Path, workerServiceIdentity())
+			if err != nil {
+				fatal(err)
+			}
+			if !*jsonOut {
+				fmt.Fprintf(os.Stderr, "worker service restarted (%s)\n%s\n", serviceResult.Backend, serviceResult.Detail)
+			}
+		}
+		if *jsonOut {
+			writeJSONStdout(result)
+			return
+		}
+		fmt.Fprintf(os.Stdout, "installed %s %s at %s\n", result.Role, result.Version, result.Path)
+		if result.PreviousPath != "" {
+			fmt.Fprintf(os.Stdout, "previous=%s\n", result.PreviousPath)
+		}
+	case "rollback":
+		fs := flag.NewFlagSet("update rollback", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "print result as JSON")
+		_ = fs.Parse(args[1:])
+		result, err := updater.Rollback()
+		if err != nil {
+			fatal(err)
+		}
+		if *jsonOut {
+			writeJSONStdout(result)
+			return
+		}
+		fmt.Fprintf(os.Stdout, "rolled back %s at %s\n", result.Role, result.Path)
+	default:
+		updateUsage()
+		os.Exit(2)
+	}
+}
+
+func runCached(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		runUsage()
+		os.Exit(2)
+	}
+	role, targetVersion, err := parseRunTarget(args[0])
+	if err != nil {
+		fatal(err)
+	}
+	result, err := updater.DownloadToCache(ctx, updater.Options{
+		Repo:    getenv("AGENTMUX_REPO", getenv("AGENTMUX_RELEASE_REPO", "kinboyw/agentmux")),
+		Version: targetVersion, Role: role,
+	})
+	if err != nil {
+		fatal(err)
+	}
+	execArgs := roleExecArgs(role, args[1:])
+	if err := updater.Exec(ctx, result.Path, execArgs); err != nil && err != context.Canceled {
+		fatal(err)
+	}
+}
+
+func runCache(args []string) {
+	if len(args) < 1 {
+		cacheUsage()
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "prune":
+		fs := flag.NewFlagSet("cache prune", flag.ExitOnError)
+		jsonOut := fs.Bool("json", false, "print result as JSON")
+		_ = fs.Parse(args[1:])
+		result, err := updater.PruneCache()
+		if err != nil {
+			fatal(err)
+		}
+		if *jsonOut {
+			writeJSONStdout(result)
+			return
+		}
+		fmt.Fprintf(os.Stdout, "removed cache: %s (%d bytes)\n", result.Path, result.BytesRemoved)
+	default:
+		cacheUsage()
+		os.Exit(2)
+	}
+}
+
 func runWorker(ctx context.Context, args []string) {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
 		case "join":
 			runWorkerJoin(ctx, args[1:])
 			return
+		case "leave":
+			runWorkerLeave(ctx, args[1:])
+			return
 		case "run":
 			runWorkerForeground(ctx, args[1:])
 			return
 		case "start":
 			runWorkerStart(ctx, args[1:]...)
+			return
+		case "restart":
+			runWorkerRestart(ctx, args[1:]...)
 			return
 		case "stop":
 			runWorkerStop(ctx)
@@ -240,9 +401,17 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	if workerID == "" && (*token != "" || *join != "") {
 		workerID = *name
 	}
-	auth, err := worker.ResolveAuth(ctx, worker.AuthOptions{
+	instanceID := ""
+	if *join != "" {
+		var err error
+		instanceID, err = appconfig.EnsureWorkerInstanceID()
+		if err != nil {
+			fatal(err)
+		}
+	}
+	auth, err := resolveWorkerAuthBestEffort(ctx, worker.AuthOptions{
 		HubURL: *hubURL, Token: *token, Join: *join,
-		DeviceID: workerID, DeviceName: *name,
+		DeviceID: workerID, DeviceName: *name, InstanceID: instanceID,
 	})
 	if err != nil {
 		fatal(err)
@@ -269,8 +438,12 @@ func runWorkerJoin(ctx context.Context, args []string) {
 	if workerID == "" {
 		workerID = *name
 	}
-	auth, err := worker.ResolveAuth(ctx, worker.AuthOptions{
-		HubURL: *hubURL, Join: *join, DeviceID: workerID, DeviceName: *name,
+	instanceID, err := appconfig.EnsureWorkerInstanceID()
+	if err != nil {
+		fatal(err)
+	}
+	auth, err := resolveWorkerAuthBestEffort(ctx, worker.AuthOptions{
+		HubURL: *hubURL, Join: *join, DeviceID: workerID, DeviceName: *name, InstanceID: instanceID,
 	})
 	if err != nil {
 		fatal(err)
@@ -293,6 +466,43 @@ func runWorkerJoin(ctx context.Context, args []string) {
 		fatal(err)
 	}
 	slog.Default().Info("worker service restarted", "backend", result.Backend, "detail", result.Detail)
+}
+
+func runWorkerLeave(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("leave", flag.ExitOnError)
+	hubURL := fs.String("hub", "", "hub URL to clear; defaults to configured worker hub")
+	id := fs.String("id", "", "worker id to clear; defaults to configured worker id")
+	stop := fs.Bool("stop", true, "stop local background worker service before clearing credentials")
+	_ = fs.Parse(args)
+	cfg, _ := appconfig.Load()
+	if *hubURL == "" {
+		*hubURL = cfg.WorkerHubURL
+	}
+	if *id == "" {
+		*id = cfg.WorkerID
+	}
+	if *id == "" {
+		if entry, ok := credentialcache.LoadLatest("worker", ""); ok {
+			*id = entry.DeviceID
+			if *hubURL == "" {
+				*hubURL = entry.HubURL
+			}
+		}
+	}
+	if *stop {
+		if result, err := workerservice.Stop(ctx, workerservice.WorkerIdentity{ID: *id}); err == nil {
+			fmt.Fprintf(os.Stderr, "worker service stopped (%s)\n%s\n", result.Backend, result.Detail)
+		} else {
+			slog.Default().Warn("worker service stop failed", "error", err)
+		}
+	}
+	if err := credentialcache.Delete(*hubURL, "worker", *id); err != nil {
+		fatal(err)
+	}
+	if err := appconfig.ClearWorkerAuth(); err != nil {
+		fatal(err)
+	}
+	fmt.Fprintln(os.Stderr, "worker local join state cleared")
 }
 
 func runWorkerStart(ctx context.Context, args ...string) {
@@ -324,6 +534,35 @@ func runWorkerStart(ctx context.Context, args ...string) {
 	fmt.Fprintf(os.Stderr, "worker service started (%s)\n%s\n", result.Backend, result.Detail)
 }
 
+func runWorkerRestart(ctx context.Context, args ...string) {
+	fs := flag.NewFlagSet("restart", flag.ExitOnError)
+	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
+	_ = fs.Parse(args)
+	if flagProvided(args, "--backend") {
+		saveWorkerBackendConfig(*backend)
+	}
+	if _, err := selectWorkerBackend(*backend); err != nil {
+		fatal(err)
+	}
+	cfg, _ := appconfig.Load()
+	if _, ok := workerCredentialFromCache(cfg.WorkerHubURL, cfg.WorkerID); !ok && (cfg.WorkerHubURL == "" || cfg.WorkerToken == "") {
+		fatal(fmt.Errorf("no worker credential available; run agentmux worker join first"))
+	}
+	if cfg.WorkerToken != "" {
+		if err := migrateLegacyWorkerCredential(cfg); err != nil {
+			fatal(err)
+		}
+		if err := appconfig.SaveWorkerAuth(cfg.WorkerHubURL, "", cfg.WorkerID, cfg.WorkerName); err != nil {
+			fatal(err)
+		}
+	}
+	result, err := workerservice.Restart(ctx, executablePath(), workerServiceIdentity())
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "worker service restarted (%s)\n%s\n", result.Backend, result.Detail)
+}
+
 func runWorkerStop(ctx context.Context) {
 	result, err := workerservice.Stop(ctx, workerServiceIdentity())
 	if err != nil {
@@ -333,17 +572,26 @@ func runWorkerStop(ctx context.Context) {
 }
 
 func runWorkerStatus(ctx context.Context) {
+	printWorkerStatusSummary(os.Stdout)
 	out, err := workerservice.Status(ctx, workerServiceIdentity())
 	if err != nil {
 		fatal(err)
 	}
+	fmt.Fprintln(os.Stdout, "\nservice_status:")
 	fmt.Fprint(os.Stdout, out)
 }
 
 func runWorkerLogs(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("logs", flag.ExitOnError)
 	lines := fs.Int("n", 80, "number of log lines")
+	follow := fs.Bool("f", false, "follow worker logs")
 	_ = fs.Parse(args)
+	if *follow {
+		if err := workerservice.FollowLogs(ctx, *lines, os.Stdout); err != nil && err != context.Canceled {
+			fatal(err)
+		}
+		return
+	}
 	out, err := workerservice.Logs(ctx, *lines)
 	if err != nil {
 		fatal(err)
@@ -386,9 +634,87 @@ func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string
 	}
 	slog.Default().Info("worker runtime lock acquired", "lock", lockFile)
 	w := worker.New(hubURL, token, workerID, name, backend, slog.Default())
+	w.Version = buildversion.Version
+	w.Software.Version = buildversion.Version
+	w.Software.Commit = buildversion.Commit
+	w.Software.BuildTime = buildversion.BuildTime
 	w.Interval = interval
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
+	}
+}
+
+func resolveWorkerAuthBestEffort(ctx context.Context, opts worker.AuthOptions) (worker.AuthResult, error) {
+	if strings.TrimSpace(opts.Join) == "" {
+		return worker.ResolveAuth(ctx, opts)
+	}
+	backoff := 2 * time.Second
+	attempt := 1
+	for {
+		auth, err := worker.ResolveAuth(ctx, opts)
+		if err == nil {
+			return auth, nil
+		}
+		if !worker.IsRetryableAuthError(err) {
+			return worker.AuthResult{}, err
+		}
+		slog.Default().Warn("worker signal exchange failed; retrying", "attempt", attempt, "retry_in", backoff.String(), "error", err)
+		select {
+		case <-ctx.Done():
+			return worker.AuthResult{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+		attempt++
+	}
+}
+
+func printWorkerStatusSummary(out *os.File) {
+	cfg, _ := appconfig.Load()
+	configPath, _ := appconfig.Path()
+	credentialsPath, _ := credentialcache.Path()
+	logPath, _ := workerservice.LogPath()
+	pidPath, _ := workerservice.PIDPath()
+	lockPath := ""
+	lockPID := 0
+	if cfg.WorkerID != "" {
+		if pid, path, ok := workerservice.LockOwnerPID(cfg.WorkerID); ok {
+			lockPID = pid
+			lockPath = path
+		} else {
+			lockPath = path
+		}
+	}
+	resolvedBackend, backendSource := resolveWorkerBackendPreference("")
+	credentialStatus := "missing"
+	if entry, ok := workerCredentialFromCache(cfg.WorkerHubURL, cfg.WorkerID); ok {
+		credentialStatus = "present"
+		if !entry.ExpiresAt.IsZero() {
+			credentialStatus = "present, expires " + entry.ExpiresAt.Format(time.RFC3339)
+		}
+	}
+	fmt.Fprintln(out, "worker_status:")
+	fmt.Fprintf(out, "  config=%s\n", configPath)
+	fmt.Fprintf(out, "  credentials=%s\n", credentialsPath)
+	fmt.Fprintf(out, "  hub=%s\n", cfg.WorkerHubURL)
+	fmt.Fprintf(out, "  id=%s\n", cfg.WorkerID)
+	fmt.Fprintf(out, "  name=%s\n", cfg.WorkerName)
+	fmt.Fprintf(out, "  backend=%s\n", resolvedBackend)
+	fmt.Fprintf(out, "  backend_source=%s\n", backendSource)
+	fmt.Fprintf(out, "  credential=%s\n", credentialStatus)
+	fmt.Fprintf(out, "  log=%s\n", logPath)
+	fmt.Fprintf(out, "  pid_file=%s\n", pidPath)
+	if lockPath != "" {
+		if lockPID > 0 {
+			fmt.Fprintf(out, "  lock=%s pid=%d\n", lockPath, lockPID)
+		} else {
+			fmt.Fprintf(out, "  lock=%s\n", lockPath)
+		}
 	}
 }
 
@@ -506,6 +832,19 @@ func runControl(ctx context.Context, args []string) {
 		if err := client.ListWorkers(ctx, os.Stdout); err != nil {
 			fatal(err)
 		}
+	case "evict":
+		fs := flag.NewFlagSet("evict", flag.ExitOnError)
+		common := addControlCommon(fs)
+		workerID := fs.String("worker", "", "worker id to evict")
+		_ = fs.Parse(args[1:])
+		if strings.TrimSpace(*workerID) == "" {
+			fatal(fmt.Errorf("--worker is required"))
+		}
+		client := newControlClient(ctx, *common)
+		if err := client.EvictWorker(ctx, *workerID); err != nil {
+			fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "worker evicted: %s\n", *workerID)
 	case "list":
 		fs := controlFlags("list", args[1:])
 		client := newControlClient(ctx, fs)
@@ -871,6 +1210,63 @@ func executablePath() string {
 	return exe
 }
 
+func inferRuntimeRole() string {
+	base := filepathBase(os.Args[0])
+	switch {
+	case strings.Contains(base, "agentmux-hub"):
+		return "hub"
+	case strings.Contains(base, "agentmux-tui"):
+		return "control"
+	default:
+		return "control"
+	}
+}
+
+func parseRunTarget(target string) (string, string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", "", fmt.Errorf("run target is required")
+	}
+	role := target
+	targetVersion := "latest"
+	if before, after, ok := strings.Cut(target, "@"); ok {
+		role = before
+		if strings.TrimSpace(after) != "" {
+			targetVersion = after
+		}
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch role {
+	case "worker", "control", "hub":
+		return role, targetVersion, nil
+	default:
+		return "", "", fmt.Errorf("invalid run target %q; expected worker@version, control@version, or hub@version", target)
+	}
+}
+
+func roleExecArgs(role string, args []string) []string {
+	out := make([]string, 0, len(args)+2)
+	switch role {
+	case "control":
+		out = append(out, "control", "app")
+	case "worker":
+		out = append(out, "worker")
+	case "hub":
+	default:
+		return args
+	}
+	out = append(out, args...)
+	return out
+}
+
+func writeJSONStdout(value any) {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprintln(os.Stdout, string(data))
+}
+
 func filepathBase(path string) string {
 	for i := len(path) - 1; i >= 0; i-- {
 		if path[i] == '/' || path[i] == '\\' {
@@ -881,16 +1277,28 @@ func filepathBase(path string) string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentmux <hub|worker|control> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentmux <hub|worker|control|version|update|run|cache> [options]")
 	fmt.Fprintln(os.Stderr, "       agentmux-tui [join|options]")
 }
 
 func controlUsage() {
-	fmt.Fprintln(os.Stderr, "usage: agentmux control <login|app|workers|list|create|send|stop|attach> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentmux control <login|app|workers|evict|list|create|send|stop|attach> [options]")
 }
 
 func workerUsage() {
-	fmt.Fprintln(os.Stderr, "usage: agentmux worker <join|run|start|stop|status|logs|config> [options]")
+	fmt.Fprintln(os.Stderr, "usage: agentmux worker <join|leave|run|start|restart|stop|status|logs|config> [options]")
+}
+
+func updateUsage() {
+	fmt.Fprintln(os.Stderr, "usage: agentmux update <check|apply|rollback> [options]")
+}
+
+func runUsage() {
+	fmt.Fprintln(os.Stderr, "usage: agentmux run <worker|control|hub>[@version] [role options]")
+}
+
+func cacheUsage() {
+	fmt.Fprintln(os.Stderr, "usage: agentmux cache <prune> [options]")
 }
 
 func fatal(err error) {

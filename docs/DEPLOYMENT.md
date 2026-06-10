@@ -123,7 +123,7 @@ The landing page uses it for one-line worker/control commands:
 
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_...' --name "$(hostname)"
-curl -fsSL https://hub.example.com/install.sh | sh -s -- control --join 'amx_sig_...'
+curl -fsSL https://hub.example.com/install.sh | sh -s -- control
 ```
 
 By default the script downloads release assets from:
@@ -131,6 +131,26 @@ By default the script downloads release assets from:
 ```text
 https://github.com/kinboyw/agentmux/releases
 ```
+
+The installer is role-aware: Worker uses `agentmux-worker-${os}-${arch}`,
+Control uses `agentmux-control-${os}-${arch}`, and Hub uses
+`agentmux-hub-${os}-${arch}`. Worker and Control keep a fallback to older
+`agentmux-${os}-${arch}` assets. Windows is currently supported for the
+hub-only artifact, for example `agentmux-hub-windows-amd64.tar.gz`.
+Downloaded release archives are verified against the matching
+`.tar.gz.sha256` asset before installation.
+
+For a Windows Hub-only deployment from an unpacked release or checkout, use the
+helper script:
+
+```bat
+scripts\run.bat
+```
+
+The script looks for `agentmux-hub.exe`, `agentmux-hub-windows-amd64.exe`, or
+`agentmux.exe` in the release/check-out root, starts Hub on `127.0.0.1:8081`,
+and sets `--public-url https://agentmux.kinboy.wang`. Edit the script before
+using a different domain, port, or database path.
 
 Override this at Hub startup if your repo path differs:
 
@@ -144,6 +164,48 @@ Or override from the client side:
 AGENTMUX_REPO=your-org/agentmux curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_...'
 ```
 
+## Local Updates
+
+Installed binaries can check and apply release updates from the configured
+GitHub repository:
+
+```bash
+agentmux version
+agentmux update check --role control
+agentmux update apply --role control
+agentmux update rollback
+```
+
+Worker updates can optionally restart the local Worker service after the binary
+is staged:
+
+```bash
+agentmux update apply --role worker --restart
+```
+
+For Hub, Docker deployments should update by replacing the container image.
+Binary/systemd deployments can use `agentmux-hub update apply`, then restart the
+service manager that owns Hub.
+
+For temporary Control use without changing the installed binary, run from the
+verified cache:
+
+```bash
+agentmux run control@latest --hub https://hub.example.com
+```
+
+If AgentMux is not installed locally yet, use the Hub-served cached runner:
+
+```bash
+curl -fsSL https://hub.example.com/run.sh | sh -s -- control@latest
+```
+
+Remove cached runner binaries:
+
+```bash
+agentmux cache prune
+```
+
 ## Data Boundary
 
 SQLite persists:
@@ -151,6 +213,7 @@ SQLite persists:
 - anonymous signals
 - scoped credentials
 - registered users
+- browser/TUI device auth sessions
 
 Runtime state is rebuilt as workers reconnect:
 

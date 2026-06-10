@@ -57,6 +57,12 @@ func (s *sqliteAuthStore) migrate() error {
 			scopes_json TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS signal_uses (
+			signal_hash TEXT NOT NULL,
+			instance_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY(signal_hash, instance_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS credentials (
 			hash TEXT PRIMARY KEY,
 			id TEXT NOT NULL,
@@ -211,8 +217,24 @@ func (s *sqliteAuthStore) Exchange(req exchangeRequest) (exchangedCredential, er
 	if !slices.Contains(signal.Scopes, scope) {
 		return exchangedCredential{}, fmt.Errorf("signal scope does not allow %s", role)
 	}
+	instanceID := strings.TrimSpace(req.InstanceID)
+	if instanceID != "" {
+		var existing string
+		err := s.db.QueryRow(`SELECT instance_id FROM signal_uses WHERE signal_hash = ? AND instance_id = ?`, signal.Hash, instanceID).Scan(&existing)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return exchangedCredential{}, err
+		}
+		if existing != "" {
+			return exchangedCredential{}, fmt.Errorf("signal has already been used by this worker instance")
+		}
+	}
 	if signal.UsesRemaining > 0 {
 		if _, err := s.db.Exec(`UPDATE signals SET uses_remaining = ? WHERE hash = ?`, signal.UsesRemaining-1, signal.Hash); err != nil {
+			return exchangedCredential{}, err
+		}
+	}
+	if instanceID != "" {
+		if _, err := s.db.Exec(`INSERT INTO signal_uses(signal_hash, instance_id, created_at) VALUES (?, ?, ?)`, signal.Hash, instanceID, formatTime(now)); err != nil {
 			return exchangedCredential{}, err
 		}
 	}
@@ -631,6 +653,10 @@ func (s *sqliteAuthStore) insertRefresh(entry refreshTokenEntry) error {
 
 func (s *sqliteAuthStore) cleanupLocked(now time.Time) error {
 	_, err := s.db.Exec(`DELETE FROM signals WHERE expires_at < ? OR uses_remaining = 0`, formatTime(now))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`DELETE FROM signal_uses WHERE signal_hash NOT IN (SELECT hash FROM signals)`)
 	if err != nil {
 		return err
 	}

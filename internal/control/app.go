@@ -36,11 +36,16 @@ type App struct {
 	loggedIn   bool
 	streams    map[string]*appSessionStream
 	buffers    map[string]string
+	targets    map[string][]protocol.TerminalTarget
 	active     string
 	fullscreen bool
 	events     chan appStreamEvent
 	splitWidth int
 	dragSplit  bool
+	mobileView appMobileView
+	targetFor  string
+	targetSel  int
+	direct     bool
 
 	rawRestore func()
 	keys       appKeyReader
@@ -64,6 +69,8 @@ const (
 
 type appSessionStream struct {
 	sessionID           string
+	baseSessionID       string
+	target              *protocol.TerminalTarget
 	stream              *Stream
 	view                *terminalview.View
 	viewDirty           bool
@@ -131,6 +138,14 @@ type appMouseEvent struct {
 	ctrl   bool
 }
 
+type appMobileView int
+
+const (
+	appMobileSessions appMobileView = iota
+	appMobileTargets
+	appMobileTerminal
+)
+
 func NewApp(client Client, auth AppAuthResult, in *os.File, out io.Writer) *App {
 	return &App{
 		Client:   client,
@@ -140,6 +155,7 @@ func NewApp(client Client, auth AppAuthResult, in *os.File, out io.Writer) *App 
 		loggedIn: client.HubURL != "" && client.Token != "",
 		previews: map[string]string{},
 		buffers:  map[string]string{},
+		targets:  map[string][]protocol.TerminalTarget{},
 		streams:  map[string]*appSessionStream{},
 		events:   make(chan appStreamEvent, 128),
 	}
@@ -229,7 +245,7 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 		a.closeAllStreams()
 		return true
 	}
-	if a.debugEnabled() && (key == "ctrl-g" || (a.active == "" && key == "D")) {
+	if !a.direct && a.debugEnabled() && (key == "ctrl-g" || (a.active == "" && key == "D")) {
 		a.writeDebugSnapshotStatus("manual")
 		return false
 	}
@@ -258,6 +274,9 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 		}
 		return false
 	}
+	if a.mobileMode() && a.mobileView == appMobileTargets {
+		return a.handleMobileTargetsKey(ctx, key)
+	}
 	switch key {
 	case "q":
 		a.closeAllStreams()
@@ -277,13 +296,30 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 	case "r":
 		a.refresh(ctx)
 	case "c":
+		if a.direct {
+			a.status = "direct token cannot create sessions"
+			return false
+		}
 		a.promptCreate(ctx)
 	case "s":
+		if a.direct {
+			a.status = "direct token cannot send REST input"
+			return false
+		}
 		a.promptSend(ctx)
 	case "x":
+		if a.direct {
+			a.status = "direct token cannot stop sessions"
+			return false
+		}
 		a.promptStop(ctx)
 	case "enter", "a":
-		if err := a.attach(ctx); err != nil {
+		if a.mobileMode() && !a.direct {
+			if err := a.openMobileTargets(ctx); err != nil {
+				a.err = err
+				a.status = "targets failed"
+			}
+		} else if err := a.attach(ctx); err != nil {
 			a.err = err
 			a.status = "attach failed"
 		}
@@ -295,6 +331,10 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 		}
 		a.enterFullscreen()
 	case "?":
+		if a.direct {
+			a.status = "keys: up/down select, enter attach, Ctrl-] detach, r refresh, q quit"
+			return false
+		}
 		a.status = "keys: up/down select, enter attach, Ctrl-F fullscreen, Ctrl-] detach, / commands, c create, s send, x stop, r refresh, q quit"
 		if a.debugEnabled() {
 			a.status = "keys: up/down select, enter attach, Ctrl-F fullscreen, Ctrl-] detach, / commands, c create, s send, x stop, r refresh, D debug, Ctrl-G debug attached, q quit"
@@ -303,18 +343,54 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 	return false
 }
 
+func (a *App) handleMobileTargetsKey(ctx context.Context, key string) bool {
+	targets := a.targets[a.targetFor]
+	switch key {
+	case "q":
+		a.closeAllStreams()
+		return true
+	case "up", "k":
+		if a.targetSel > 0 {
+			a.targetSel--
+		}
+	case "down", "j":
+		if a.targetSel < len(targets)-1 {
+			a.targetSel++
+		}
+	case "left", "h", "b", "unknown":
+		a.mobileView = appMobileSessions
+		a.status = "sessions"
+	case "r":
+		if err := a.openMobileTargets(ctx); err != nil {
+			a.err = err
+			a.status = "targets failed"
+		}
+	case "enter", "a":
+		if err := a.attachMobileTarget(ctx); err != nil {
+			a.err = err
+			a.status = "attach failed"
+		}
+	case "?":
+		a.status = "keys: up/down select pane, enter attach, left/Esc back, r refresh, q quit"
+	}
+	return false
+}
+
 func (a *App) handleMouse(ctx context.Context, event appMouseEvent) bool {
 	if event.x < 1 || event.y < 1 {
 		return false
-	}
-	if a.fullscreen && a.active != "" {
-		return a.forwardActiveMouse(event, 1, 1)
 	}
 	cols, rows := 120, 36
 	if a.In != nil {
 		if c, r, err := term.Size(a.In); err == nil {
 			cols, rows = c, r
 		}
+	}
+	if appIsNarrow(cols) {
+		return a.handleMobileMouse(ctx, event, cols, rows)
+	}
+	if a.fullscreen && a.active != "" {
+		return a.forwardActiveMouse(event, 1, 1)
 	}
 	listWidth, previewWidth, limit := a.layoutForSize(cols, rows)
 	bodyStart := 4
@@ -356,6 +432,46 @@ func (a *App) handleMouse(ctx context.Context, event appMouseEvent) bool {
 				a.err = err
 				a.status = "attach failed"
 			}
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) handleMobileMouse(ctx context.Context, event appMouseEvent, cols, rows int) bool {
+	if event.kind != appMouseClick || event.button != terminalview.MouseLeft {
+		if a.active != "" && event.y >= 2 {
+			return a.forwardActiveMouse(event, 1, 2)
+		}
+		return false
+	}
+	if a.active != "" {
+		if event.y == 1 {
+			a.detachActive()
+			return true
+		}
+		return a.forwardActiveMouse(event, 1, 2)
+	}
+	limit := max(1, rows-5)
+	if event.y < 3 || event.y >= 3+limit {
+		return false
+	}
+	index := event.y - 3
+	switch a.mobileView {
+	case appMobileTargets:
+		targets := a.targets[a.targetFor]
+		start := scrollStart(a.targetSel, limit, len(targets))
+		targetIndex := start + index
+		if targetIndex >= 0 && targetIndex < len(targets) {
+			a.targetSel = targetIndex
+			return true
+		}
+	default:
+		start := scrollStart(a.selected, limit, len(a.sessions))
+		sessionIndex := start + index
+		if sessionIndex >= 0 && sessionIndex < len(a.sessions) {
+			a.selected = sessionIndex
+			a.loadSelectedPreview()
 			return true
 		}
 	}
@@ -421,10 +537,16 @@ func (a *App) refresh(ctx context.Context) {
 	a.ensureAppState()
 	workers, err := a.Client.Workers(ctx)
 	if err != nil {
-		a.err = err
-		a.status = "refresh workers failed"
-		a.debugf("refresh workers failed error=%q", err.Error())
-		return
+		if !isForbiddenError(err) {
+			a.err = err
+			a.status = "refresh workers failed"
+			a.debugf("refresh workers failed error=%q", err.Error())
+			return
+		}
+		a.direct = true
+		workers = nil
+	} else {
+		a.direct = false
 	}
 	sessions, err := a.Client.Sessions(ctx)
 	if err != nil {
@@ -439,8 +561,13 @@ func (a *App) refresh(ctx context.Context) {
 	a.status = fmt.Sprintf("refreshed %s", time.Now().Format("15:04:05"))
 	a.clampSelection()
 	a.closeMissingSessionStreams()
-	a.refreshPreviewCache(ctx)
-	a.loadSelectedPreview()
+	if a.direct {
+		a.preview = ""
+		a.previews = map[string]string{}
+	} else {
+		a.refreshPreviewCache(ctx)
+		a.loadSelectedPreview()
+	}
 	a.debugf("refresh complete workers=%d sessions=%d selected=%d", len(a.workers), len(a.sessions), a.selected)
 }
 
@@ -519,6 +646,9 @@ func (a *App) ensureAppState() {
 	if a.buffers == nil {
 		a.buffers = map[string]string{}
 	}
+	if a.targets == nil {
+		a.targets = map[string][]protocol.TerminalTarget{}
+	}
 	if a.streams == nil {
 		a.streams = map[string]*appSessionStream{}
 	}
@@ -533,8 +663,12 @@ func (a *App) closeMissingSessionStreams() {
 	for _, session := range a.sessions {
 		current[session.ID] = true
 	}
-	for sessionID := range a.streams {
-		if current[sessionID] {
+	for sessionID, stream := range a.streams {
+		baseSessionID := appBaseSessionID(sessionID)
+		if stream != nil && stream.baseSessionID != "" {
+			baseSessionID = stream.baseSessionID
+		}
+		if current[baseSessionID] {
 			continue
 		}
 		a.closeSessionStream(sessionID)
@@ -547,6 +681,10 @@ func (a *App) closeMissingSessionStreams() {
 
 func (a *App) promptCreate(ctx context.Context) {
 	if !a.ensureLoggedIn() {
+		return
+	}
+	if a.direct {
+		a.status = "direct token cannot create sessions"
 		return
 	}
 	a.leaveRawForPrompt()
@@ -575,6 +713,10 @@ func (a *App) promptSend(ctx context.Context) {
 	if !a.ensureLoggedIn() {
 		return
 	}
+	if a.direct {
+		a.status = "direct token cannot send REST input"
+		return
+	}
 	session := a.selectedSession()
 	if session.ID == "" {
 		a.status = "no session selected"
@@ -598,6 +740,10 @@ func (a *App) promptSend(ctx context.Context) {
 
 func (a *App) promptStop(ctx context.Context) {
 	if !a.ensureLoggedIn() {
+		return
+	}
+	if a.direct {
+		a.status = "direct token cannot stop sessions"
 		return
 	}
 	session := a.selectedSession()
@@ -652,6 +798,95 @@ func (a *App) attach(ctx context.Context) error {
 	return nil
 }
 
+func (a *App) openMobileTargets(ctx context.Context) error {
+	if !a.ensureLoggedIn() {
+		return nil
+	}
+	if a.direct {
+		return a.attach(ctx)
+	}
+	session := a.selectedSession()
+	if session.ID == "" {
+		a.status = "no session selected"
+		return nil
+	}
+	targets, err := a.Client.SessionTargets(ctx, session.ID)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return a.attach(ctx)
+	}
+	a.ensureAppState()
+	a.targets[session.ID] = targets
+	if a.targetFor != session.ID {
+		a.targetSel = 0
+	}
+	a.targetFor = session.ID
+	if a.targetSel >= len(targets) {
+		a.targetSel = len(targets) - 1
+	}
+	if a.targetSel < 0 {
+		a.targetSel = 0
+	}
+	if len(targets) == 1 && targets[0].PaneID == "" {
+		return a.attachTarget(ctx, session.ID, nil)
+	}
+	a.mobileView = appMobileTargets
+	a.status = fmt.Sprintf("%d panes in %s", len(targets), session.ID)
+	return nil
+}
+
+func (a *App) attachMobileTarget(ctx context.Context) error {
+	sessionID := a.targetFor
+	if sessionID == "" {
+		session := a.selectedSession()
+		sessionID = session.ID
+	}
+	if sessionID == "" {
+		a.status = "no session selected"
+		return nil
+	}
+	targets := a.targets[sessionID]
+	if len(targets) == 0 {
+		return a.attachTarget(ctx, sessionID, nil)
+	}
+	if a.targetSel < 0 {
+		a.targetSel = 0
+	}
+	if a.targetSel >= len(targets) {
+		a.targetSel = len(targets) - 1
+	}
+	target := targets[a.targetSel]
+	return a.attachTarget(ctx, sessionID, &target)
+}
+
+func (a *App) attachTarget(ctx context.Context, sessionID string, target *protocol.TerminalTarget) error {
+	if !a.ensureLoggedIn() {
+		return nil
+	}
+	a.ensureAppState()
+	key := appStreamKey(sessionID, target)
+	previousActive := a.active
+	previousFullscreen := a.fullscreen
+	a.active = key
+	a.fullscreen = false
+	a.mobileView = appMobileTerminal
+	if err := a.ensureTargetStream(ctx, sessionID, target); err != nil {
+		a.active = previousActive
+		a.fullscreen = previousFullscreen
+		return err
+	}
+	if stream := a.streams[key]; stream != nil {
+		stream.keepUntil = time.Time{}
+		a.resizeStreamView(stream)
+	}
+	a.status = attachedPreviewStatus(key)
+	a.loadSelectedPreview()
+	a.debugf("attach target key=%q session=%q pane=%q", key, sessionID, appTargetPane(target))
+	return nil
+}
+
 func (a *App) enterFullscreen() {
 	if a.active == "" {
 		return
@@ -696,6 +931,12 @@ func (a *App) detachActive() {
 	if stream := a.streams[sessionID]; stream != nil {
 		stream.keepUntil = time.Now().Add(appStreamDetachTTL)
 		a.resizeStreamView(stream)
+	}
+	if base := appBaseSessionID(sessionID); base != sessionID {
+		a.targetFor = base
+		a.mobileView = appMobileTargets
+	} else {
+		a.mobileView = appMobileSessions
 	}
 	a.status = "detached " + sessionID + "  stream kept " + appStreamDetachTTL.String()
 	a.loadSelectedPreview()
@@ -773,64 +1014,76 @@ func appKeyIsSingleRune(key string) bool {
 }
 
 func (a *App) ensureStream(ctx context.Context, sessionID string) error {
+	return a.ensureTargetStream(ctx, sessionID, nil)
+}
+
+func (a *App) ensureTargetStream(ctx context.Context, sessionID string, target *protocol.TerminalTarget) error {
 	if !a.ensureLoggedIn() {
 		return nil
 	}
 	a.ensureAppState()
-	if existing := a.streams[sessionID]; existing != nil {
+	key := appStreamKey(sessionID, target)
+	if existing := a.streams[key]; existing != nil {
 		return nil
 	}
-	a.debugf("stream ensure session=%q", sessionID)
+	a.debugf("stream ensure key=%q session=%q pane=%q", key, sessionID, appTargetPane(target))
 	streamCtx, cancel := context.WithCancel(ctx)
 	now := time.Now()
 	state := &appSessionStream{
-		sessionID: sessionID, cancel: cancel, connecting: true, warming: true,
+		sessionID: key, baseSessionID: sessionID, target: cloneTerminalTarget(target), cancel: cancel, connecting: true, warming: true,
 		writes:    make(chan appStreamWrite, appStreamWriteQueueLimit),
 		warmUntil: now.Add(appStreamWarmupMin), quietUntil: now.Add(appStreamWarmupQuiet), maxWarm: now.Add(appStreamWarmupMax),
 	}
-	a.streams[sessionID] = state
-	size := a.streamSizeFor(sessionID)
+	a.streams[key] = state
+	size := a.streamSizeFor(key)
 	state.view = terminalview.New(size.Cols, size.Rows)
 	state.size = size
-	if capture := a.previews[sessionID]; capture != "" && a.active != sessionID {
+	if target == nil {
+		if capture := a.previews[sessionID]; capture != "" && a.active != key {
+			state.view.Write([]byte(capture))
+			state.viewDirty = true
+			state.prefilled = true
+			a.updateStreamBuffer(state)
+		}
+	} else if capture := a.buffers[key]; capture != "" && a.active != key {
 		state.view.Write([]byte(capture))
 		state.viewDirty = true
 		state.prefilled = true
 		a.updateStreamBuffer(state)
 	}
-	go a.openStream(streamCtx, sessionID, size, state.writes)
+	go a.openStream(streamCtx, key, sessionID, cloneTerminalTarget(target), size, state.writes)
 	return nil
 }
 
-func (a *App) openStream(ctx context.Context, sessionID string, size protocol.TerminalSize, writes <-chan appStreamWrite) {
-	a.debugf("stream open start session=%q cols=%d rows=%d", sessionID, size.Cols, size.Rows)
-	stream, err := a.Client.OpenStream(ctx, sessionID, size)
+func (a *App) openStream(ctx context.Context, key, sessionID string, target *protocol.TerminalTarget, size protocol.TerminalSize, writes <-chan appStreamWrite) {
+	a.debugf("stream open start key=%q session=%q pane=%q cols=%d rows=%d", key, sessionID, appTargetPane(target), size.Cols, size.Rows)
+	stream, err := a.Client.OpenTargetStream(ctx, sessionID, size, target)
 	if err != nil {
-		a.debugf("stream open failed session=%q error=%q", sessionID, err.Error())
-		a.sendStreamEvent(appStreamEvent{sessionID: sessionID, err: err, closed: true})
+		a.debugf("stream open failed key=%q error=%q", key, err.Error())
+		a.sendStreamEvent(appStreamEvent{sessionID: key, err: err, closed: true})
 		return
 	}
-	a.debugf("stream open complete session=%q stream_id=%q", sessionID, stream.StreamID)
+	a.debugf("stream open complete key=%q stream_id=%q", key, stream.StreamID)
 	done := make(chan struct{})
 	defer close(done)
-	go a.writeStreamLoop(ctx, sessionID, stream, writes, done)
-	a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, connected: true})
+	go a.writeStreamLoop(ctx, key, stream, writes, done)
+	a.sendStreamEvent(appStreamEvent{sessionID: key, stream: stream, connected: true})
 	for {
 		event, err := stream.ReadEvent()
 		if len(event.Data) > 0 {
-			a.debugf("stream read output session=%q stream_id=%q bytes=%d", sessionID, stream.StreamID, len(event.Data))
-			a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, data: event.Data})
+			a.debugf("stream read output key=%q stream_id=%q bytes=%d", key, stream.StreamID, len(event.Data))
+			a.sendStreamEvent(appStreamEvent{sessionID: key, stream: stream, data: event.Data})
 		}
 		if event.Err != nil {
-			a.debugf("stream read event error session=%q stream_id=%q error=%q", sessionID, stream.StreamID, event.Err.Error())
-			a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, err: event.Err})
+			a.debugf("stream read event error key=%q stream_id=%q error=%q", key, stream.StreamID, event.Err.Error())
+			a.sendStreamEvent(appStreamEvent{sessionID: key, stream: stream, err: event.Err})
 		}
 		if err != nil {
-			a.debugf("stream read ended session=%q stream_id=%q error=%q", sessionID, stream.StreamID, err.Error())
+			a.debugf("stream read ended key=%q stream_id=%q error=%q", key, stream.StreamID, err.Error())
 			if !errors.Is(err, context.Canceled) {
-				a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, err: err, closed: true})
+				a.sendStreamEvent(appStreamEvent{sessionID: key, stream: stream, err: err, closed: true})
 			} else {
-				a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, closed: true})
+				a.sendStreamEvent(appStreamEvent{sessionID: key, stream: stream, closed: true})
 			}
 			return
 		}
@@ -1325,6 +1578,9 @@ func (a *App) streamSizeFor(sessionID string) protocol.TerminalSize {
 			cols, rows = c, r
 		}
 	}
+	if appIsNarrow(cols) && a.active != "" && (sessionID == "" || sessionID == a.active) {
+		return appMobileStreamSize(cols, rows)
+	}
 	if a.fullscreen && a.active != "" && (sessionID == "" || sessionID == a.active) {
 		return appActiveStreamSize(cols, rows)
 	}
@@ -1336,6 +1592,29 @@ func (a *App) streamSizeFor(sessionID string) protocol.TerminalSize {
 		limit = rows
 	}
 	return protocol.TerminalSize{Cols: previewWidth, Rows: limit}
+}
+
+func appIsNarrow(cols int) bool {
+	return cols < 72
+}
+
+func (a *App) mobileMode() bool {
+	cols, _, err := term.Size(a.In)
+	if err != nil {
+		return false
+	}
+	return appIsNarrow(cols)
+}
+
+func appMobileStreamSize(cols, rows int) protocol.TerminalSize {
+	if cols < 1 {
+		cols = 40
+	}
+	streamRows := rows - 3
+	if streamRows < 4 {
+		streamRows = max(1, rows)
+	}
+	return protocol.TerminalSize{Cols: cols, Rows: streamRows}
 }
 
 func appActiveStreamSize(cols, rows int) protocol.TerminalSize {
@@ -1424,6 +1703,10 @@ func (a *App) renderWithSize(cols, rows int) {
 	moveCursor(a.Out, 1, 1)
 	hideCursor(a.Out)
 	defer showCursor(a.Out)
+	if appIsNarrow(cols) {
+		a.renderMobileWithSize(cols, rows)
+		return
+	}
 	if a.fullscreen && a.active != "" {
 		a.renderFullscreenWithSize(cols, rows)
 		return
@@ -1493,6 +1776,135 @@ func (a *App) renderWithSize(cols, rows int) {
 	} else {
 		writeLine(a.Out, cols, styleMuted("Enter/a attach  mouse select/drag split  / commands  c create  s send  x stop  r refresh  ? help  q quit"))
 	}
+	clearToEnd(a.Out)
+}
+
+func (a *App) renderMobileWithSize(cols, rows int) {
+	if rows < 4 {
+		rows = 4
+	}
+	if a.active != "" {
+		a.renderMobileTerminalWithSize(cols, rows)
+		return
+	}
+	switch a.mobileView {
+	case appMobileTargets:
+		a.renderMobileTargetsWithSize(cols, rows)
+	default:
+		a.mobileView = appMobileSessions
+		a.renderMobileSessionsWithSize(cols, rows)
+	}
+}
+
+func (a *App) renderMobileSessionsWithSize(cols, rows int) {
+	source := a.Auth.Source
+	if source == "" {
+		if a.loggedIn {
+			source = "unknown"
+		} else {
+			source = "none"
+		}
+	}
+	writeLine(a.Out, cols, styleTitle("AgentMux")+styleMuted(" / sessions"))
+	writeLine(a.Out, cols, truncateVisible(styleMuted("hub ")+a.Client.HubURL+styleMuted("  auth ")+source, cols))
+	limit := max(1, rows-5)
+	start := scrollStart(a.selected, limit, len(a.sessions))
+	for row := 0; row < limit; row++ {
+		index := start + row
+		line := ""
+		if len(a.sessions) == 0 && row == 0 {
+			line = "  no sessions"
+		} else if index < len(a.sessions) {
+			prefix := "  "
+			if index == a.selected {
+				prefix = "> "
+			}
+			line = mobileSessionLine(prefix, a.sessions[index])
+		}
+		writeLine(a.Out, cols, line)
+	}
+	a.renderMobileFooter(cols, "Enter panes  r refresh  / commands  q quit")
+}
+
+func (a *App) renderMobileTargetsWithSize(cols, rows int) {
+	sessionID := a.targetFor
+	if sessionID == "" {
+		sessionID = a.selectedSession().ID
+	}
+	writeLine(a.Out, cols, styleTitle("AgentMux")+styleMuted(" / panes"))
+	writeLine(a.Out, cols, truncateVisible(styleHeader(sessionID), cols))
+	targets := a.targets[sessionID]
+	limit := max(1, rows-5)
+	start := scrollStart(a.targetSel, limit, len(targets))
+	for row := 0; row < limit; row++ {
+		index := start + row
+		line := ""
+		if len(targets) == 0 && row == 0 {
+			line = "  no panes"
+		} else if index < len(targets) {
+			prefix := "  "
+			if index == a.targetSel {
+				prefix = "> "
+			}
+			line = mobileTargetLine(prefix, targets[index])
+		}
+		writeLine(a.Out, cols, line)
+	}
+	a.renderMobileFooter(cols, "Enter attach pane  Left/Esc back  r refresh  q quit")
+}
+
+func (a *App) renderMobileTerminalWithSize(cols, rows int) {
+	size := appMobileStreamSize(cols, rows)
+	stream := a.streams[a.active]
+	if stream != nil {
+		a.resizeStreamViewTo(stream, size)
+	}
+	title := styleTitle("AgentMux") + styleMuted(" / ") + styleHeader(a.active)
+	writeLine(a.Out, cols, title)
+	lines := []string(nil)
+	cursorX, cursorY, cursorOK := 0, 0, false
+	if stream != nil && stream.view != nil {
+		lines = terminalScreenLines(stream.view.Screen())
+		cursorX, cursorY, cursorOK = stream.view.Cursor()
+	}
+	if stream == nil || !stream.seenOutput {
+		if fallback := a.activeFallbackLines(stream, size); len(fallback) > 0 {
+			lines = fallback
+			cursorOK = false
+		}
+	}
+	for row := 0; row < size.Rows; row++ {
+		line := ""
+		if row < len(lines) {
+			line = lines[row]
+		}
+		writeCanvasLine(a.Out, row+2, cols, line)
+	}
+	a.renderMobileFooter(cols, "Ctrl-] detach  Ctrl-Q quit  tap top/back if mouse works")
+	if cursorOK {
+		if cursorX < 0 {
+			cursorX = 0
+		}
+		if cursorY < 0 {
+			cursorY = 0
+		}
+		if cursorX >= cols {
+			cursorX = cols - 1
+		}
+		if cursorY >= size.Rows {
+			cursorY = size.Rows - 1
+		}
+		moveCursor(a.Out, cursorY+2, cursorX+1)
+	}
+}
+
+func (a *App) renderMobileFooter(cols int, help string) {
+	footer := styleMuted("Status: ") + a.status
+	if a.err != nil {
+		footer += styleMuted(" | ") + styleError(a.err.Error())
+	}
+	writeLine(a.Out, cols, footer)
+	writeLine(a.Out, cols, styleMuted(help))
 	clearToEnd(a.Out)
 }
 
@@ -1771,6 +2183,36 @@ func (a *App) selectedSession() protocol.SessionView {
 		return protocol.SessionView{}
 	}
 	return a.sessions[a.selected]
+}
+
+func appStreamKey(sessionID string, target *protocol.TerminalTarget) string {
+	if target == nil || target.PaneID == "" {
+		return sessionID
+	}
+	return sessionID + "#" + target.PaneID
+}
+
+func appBaseSessionID(key string) string {
+	sessionID, _, ok := strings.Cut(key, "#")
+	if !ok {
+		return key
+	}
+	return sessionID
+}
+
+func appTargetPane(target *protocol.TerminalTarget) string {
+	if target == nil {
+		return ""
+	}
+	return target.PaneID
+}
+
+func cloneTerminalTarget(target *protocol.TerminalTarget) *protocol.TerminalTarget {
+	if target == nil {
+		return nil
+	}
+	item := *target
+	return &item
 }
 
 func (a *App) clampSelection() {
@@ -2187,6 +2629,38 @@ func fullSessionLine(prefix string, session protocol.SessionView, status string)
 		styleMuted(session.CWD)
 }
 
+func mobileSessionLine(prefix string, session protocol.SessionView) string {
+	command := session.Command
+	if command == "" {
+		command = "shell"
+	}
+	return prefix + styleHeader(session.ID) + " " + styleStatus(session.Status) + " " + styleMuted(command)
+}
+
+func mobileTargetLine(prefix string, target protocol.TerminalTarget) string {
+	window := target.WindowName
+	if window == "" {
+		window = fmt.Sprintf("window %d", target.WindowIndex)
+	}
+	pane := target.PaneID
+	if pane == "" {
+		pane = "session"
+	}
+	active := ""
+	if target.PaneActive {
+		active = styleOK("*")
+	}
+	command := target.Command
+	if command == "" {
+		command = "shell"
+	}
+	size := ""
+	if target.Width > 0 && target.Height > 0 {
+		size = fmt.Sprintf(" %dx%d", target.Width, target.Height)
+	}
+	return prefix + styleHeader(window) + " " + active + " " + pane + " " + styleMuted(command+size)
+}
+
 func splitPreviewLines(preview string, limit int) []string {
 	raw := strings.Split(strings.TrimRight(preview, "\n"), "\n")
 	if len(raw) == 1 && raw[0] == "" {
@@ -2497,6 +2971,10 @@ func skipEscape(value string, start int) int {
 
 func isSGR(value string, start, end int) bool {
 	return start+2 <= end && end < len(value) && value[start+1] == '[' && value[end] == 'm'
+}
+
+func isForbiddenError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "403 Forbidden")
 }
 
 func min(a, b int) int {

@@ -50,9 +50,9 @@ gh repo edit kinboyw/agentmux \
 Use this short copy in GitHub releases, social cards, and directory listings:
 
 ```text
-AgentMux is a tmux-first control plane for long-lived coding-agent sessions.
-Hub provides the public HTTPS/WSS entrypoint, Worker keeps outbound-only access
-to local tmux sessions, and Control gives operators a browser and CLI surface
+AgentMux is a terminal control plane for long-lived coding-agent sessions. Hub
+provides the public HTTPS/WSS entrypoint, Worker keeps outbound-only access to
+local tmux or PTY sessions, and Control gives operators browser/TUI access
 without requiring agent-specific remote features.
 ```
 
@@ -62,8 +62,8 @@ For README and landing-page copy, lead with an existing Hub:
 
 ```text
 Open an AgentMux Hub landing page, generate a join signal, run the generated
-Worker command on the machine that owns your tmux sessions, then open Web
-Control from the browser.
+Worker command on the machine that owns your sessions, then open the generated
+Web Control share URL or use the Direct Token from TUI.
 ```
 
 Keep Hub deployment as a self-hosting path, not the default user path:

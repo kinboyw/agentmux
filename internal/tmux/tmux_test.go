@@ -209,3 +209,31 @@ func TestCaptureFallsBackToPaneScrollbackWhenGeometryFails(t *testing.T) {
 		t.Fatalf("expected geometry then fallback calls, got %d: %v", len(calls), calls)
 	}
 }
+
+func TestTargetsParsesSessionWindowsAndPanes(t *testing.T) {
+	runner := fakeRunnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
+		got := strings.Join(args, " ")
+		if got != "list-panes -s -t demo -F "+tmuxTargetFormat {
+			return "", fmt.Errorf("unexpected call: %s %s", name, got)
+		}
+		return strings.Join([]string{
+			"demo\t@2\t1\tapi\t0\t%4\t0\t1\t/repo\tbash\t0\t0\t80\t24",
+			"demo\t@1\t0\tmain\t1\t%2\t1\t0\t/repo\tvim\t40\t0\t40\t24",
+			"demo\t@1\t0\tmain\t1\t%1\t0\t1\t/repo\tcodex\t0\t0\t40\t24",
+		}, "\n"), nil
+	})
+	adapter := New(runner)
+	targets, err := adapter.Targets(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 3 {
+		t.Fatalf("expected 3 targets, got %d", len(targets))
+	}
+	if targets[0].PaneID != "%1" || targets[1].PaneID != "%2" || targets[2].PaneID != "%4" {
+		t.Fatalf("targets not sorted by window/pane: %+v", targets)
+	}
+	if !targets[0].WindowActive || !targets[0].PaneActive || targets[0].Command != "codex" || targets[2].WindowName != "api" {
+		t.Fatalf("target metadata not parsed: %+v", targets)
+	}
+}

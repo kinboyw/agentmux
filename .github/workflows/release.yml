@@ -16,14 +16,72 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
+          - role: worker
+            cmd: ./cmd/agentmux
+            asset: agentmux-worker
+            goos: linux
             goarch: amd64
-          - goos: linux
+          - role: worker
+            cmd: ./cmd/agentmux
+            asset: agentmux-worker
+            goos: linux
             goarch: arm64
-          - goos: darwin
+          - role: worker
+            cmd: ./cmd/agentmux
+            asset: agentmux-worker
+            goos: darwin
             goarch: amd64
-          - goos: darwin
+          - role: worker
+            cmd: ./cmd/agentmux
+            asset: agentmux-worker
+            goos: darwin
             goarch: arm64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-control
+            goos: linux
+            goarch: amd64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-control
+            goos: linux
+            goarch: arm64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-control
+            goos: darwin
+            goarch: amd64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-control
+            goos: darwin
+            goarch: arm64
+          - role: hub
+            cmd: ./cmd/agentmux-hub
+            asset: agentmux-hub
+            goos: linux
+            goarch: amd64
+          - role: hub
+            cmd: ./cmd/agentmux-hub
+            asset: agentmux-hub
+            goos: linux
+            goarch: arm64
+          - role: hub
+            cmd: ./cmd/agentmux-hub
+            asset: agentmux-hub
+            goos: darwin
+            goarch: amd64
+          - role: hub
+            cmd: ./cmd/agentmux-hub
+            asset: agentmux-hub
+            goos: darwin
+            goarch: arm64
+          - role: hub
+            cmd: ./cmd/agentmux-hub
+            asset: agentmux-hub
+            goos: windows
+            goarch: amd64
+            ext: .exe
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -46,15 +104,20 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          name="agentmux-${{ matrix.goos }}-${{ matrix.goarch }}"
+          name="${{ matrix.asset }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          binary="${name}${{ matrix.ext }}"
+          version="${GITHUB_REF_NAME}"
+          commit="${GITHUB_SHA::12}"
+          build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X private/agentmux/internal/version.Version=${version} -X private/agentmux/internal/version.Commit=${commit} -X private/agentmux/internal/version.BuildTime=${build_time}"
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/${name}${{ matrix.ext }}" ./cmd/agentmux
+          go build -trimpath -ldflags="${ldflags}" -o "dist/${binary}" "${{ matrix.cmd }}"
           cd dist
-          tar -czf "${name}.tar.gz" "${name}${{ matrix.ext }}"
+          tar -czf "${name}.tar.gz" "${binary}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: agentmux-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ${{ matrix.asset }}-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

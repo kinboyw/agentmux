@@ -51,7 +51,8 @@ Implementation order:
 4. Update worker `--join` to exchange before opening `/ws/worker`.
 5. Update control CLI `--join` to exchange before API/WS calls.
 6. Update Web `/control?signal=...` to exchange in-browser and store the credential.
-7. Add tests that raw signals cannot access normal API/WS routes.
+7. Generate scoped Direct Token share URLs for anonymous Web/TUI Control.
+8. Add tests that raw signals cannot access normal API/WS routes.
 
 ## Phase 4: Persistence And Policy
 

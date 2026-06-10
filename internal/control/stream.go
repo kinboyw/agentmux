@@ -27,6 +27,10 @@ type StreamEvent struct {
 }
 
 func (c *Client) OpenStream(ctx context.Context, sessionID string, size protocol.TerminalSize) (*Stream, error) {
+	return c.OpenTargetStream(ctx, sessionID, size, nil)
+}
+
+func (c *Client) OpenTargetStream(ctx context.Context, sessionID string, size protocol.TerminalSize, terminalTarget *protocol.TerminalTarget) (*Stream, error) {
 	if c == nil {
 		return nil, fmt.Errorf("control client is nil")
 	}
@@ -42,7 +46,7 @@ func (c *Client) OpenStream(ctx context.Context, sessionID string, size protocol
 		return nil, err
 	}
 	stream := &Stream{conn: conn, SessionID: sessionID, StreamID: newStreamID(sessionID)}
-	open, err := protocol.NewEnvelope(protocol.TypeControlOpen, size)
+	open, err := protocol.NewEnvelope(protocol.TypeControlOpen, protocol.NewTerminalOpen(size, terminalTarget))
 	if err != nil {
 		_ = conn.Close()
 		return nil, err

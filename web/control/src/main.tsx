@@ -4,9 +4,12 @@ import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
   Activity,
   Bug,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Eye,
+  ExternalLink,
   Github,
   Globe,
   Keyboard,
@@ -44,12 +47,28 @@ type WorkerView = {
   name: string;
   addr: string;
   backend?: string;
+  software?: WorkerSoftware;
   last_seen: string;
   status?: string;
   online?: boolean;
   enabled?: boolean;
   trace_enabled?: boolean;
   debug_enabled?: boolean;
+};
+
+type WorkerSoftware = {
+  version?: string;
+  commit?: string;
+  build_time?: string;
+  go_version?: string;
+  os?: string;
+  arch?: string;
+  protocol_version?: string;
+  capabilities?: string[];
+  install_kind?: string;
+  service_backend?: string;
+  update_channel?: string;
+  update_policy?: string;
 };
 
 type SessionView = {
@@ -126,7 +145,20 @@ type Status = {
   detail: string;
 };
 
+type Toast = Status & {
+  id: string;
+  actionLabel?: string;
+  onAction?: () => void;
+  sticky?: boolean;
+};
+
+type RefreshOptions = {
+	silent?: boolean;
+	notifyWorkerEvents?: boolean;
+};
+
 type AuthMode = "login" | "register";
+type AccessMode = "none" | "admin" | "account" | "direct";
 
 type AuthCredentialPayload = {
   credential: string;
@@ -144,8 +176,37 @@ type AuthCredentialPayload = {
 };
 
 type AuthUser = {
-  email: string;
-  name: string;
+	email: string;
+	name: string;
+};
+
+type AuthMePayload = {
+	access_mode?: AccessMode;
+	role?: string;
+	tenant_id?: string;
+	device_id?: string;
+	credential_id?: string;
+	expires_at?: string;
+	user?: AuthUser;
+};
+
+type HubVersionPayload = {
+  version?: string;
+  commit?: string;
+  build_time?: string;
+  protocol_version?: string;
+};
+
+type WorkerUpdateJob = {
+  id: string;
+  worker_id: string;
+  target_version: string;
+  repo?: string;
+  status: string;
+  message?: string;
+  created_at?: string;
+  updated_at?: string;
+  finished_at?: string;
 };
 
 type WorkerSessionGroup = {
@@ -159,9 +220,13 @@ type SignalPayload = {
   signal_id: string;
   tenant_id: string;
   expires_at: string;
+  direct_token?: string;
+  direct_token_expires_at?: string;
+  control_share_url?: string;
   worker_command: string;
   worker_join_command?: string;
   control_command: string;
+  control_direct_command?: string;
   control_url: string;
 };
 
@@ -207,7 +272,9 @@ function App() {
   const [authMode, setAuthMode] = React.useState<AuthMode>("login");
   const [authForm, setAuthForm] = React.useState({ email: "", password: "", name: "" });
   const [currentUser, setCurrentUser] = React.useState<AuthUser | null>(initialUser);
+  const [accessMode, setAccessMode] = React.useState<AccessMode>(initialUser ? "account" : initialToken ? "direct" : "none");
   const [workerFilter, setWorkerFilter] = React.useState("all");
+  const [directSessionId, setDirectSessionId] = React.useState("");
   const [tokenDraft, setTokenDraft] = React.useState(initialToken);
   const [joinSignal, setJoinSignal] = React.useState<SignalPayload | null>(null);
   const [createOpen, setCreateOpen] = React.useState(false);
@@ -221,8 +288,11 @@ function App() {
   const [activeTabId, setActiveTabId] = React.useState(initialWorkspaceState.activeTabId);
   const [recentCWDs, setRecentCWDs] = React.useState<RecentCWDState>(initialRecentCWDs);
   const [previewStates, setPreviewStates] = React.useState<Record<string, PreviewState>>({});
+  const [hubVersion, setHubVersion] = React.useState<HubVersionPayload | null>(null);
+  const [workerUpdateJobs, setWorkerUpdateJobs] = React.useState<Record<string, WorkerUpdateJob>>({});
   const [pendingFocusSessionId, setPendingFocusSessionId] = React.useState<string | null>(null);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
+  const [toasts, setToasts] = React.useState<Toast[]>([]);
   const sessionButtonRefs = React.useRef<Record<string, HTMLButtonElement | null>>({});
   const authRef = React.useRef({
     token: initialToken,
@@ -232,6 +302,11 @@ function App() {
   });
   const refreshInFlight = React.useRef<Promise<string> | null>(null);
   const lastActivityAt = React.useRef(Date.now());
+  const workersRef = React.useRef<WorkerView[]>([]);
+  const workerEventsReady = React.useRef(false);
+  const toastTimers = React.useRef<number[]>([]);
+  const hubVersionSignature = React.useRef("");
+  const webUpdateToastShown = React.useRef(false);
   const [status, setStatus] = React.useState<Status>({
     tone: "idle",
     title: "No session attached",
@@ -273,6 +348,8 @@ function App() {
   const workerByID = React.useMemo(() => new Map(workerOptions.map((worker) => [worker.id, worker])), [workerOptions]);
   const activeTab = React.useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0], [tabs, activeTabId]);
   const activePane = activeTab.activePane;
+  const canManageHub = accessMode === "account" || accessMode === "admin";
+  const canGenerateJoinSignal = accessMode !== "direct";
 
   React.useEffect(() => {
     authRef.current = { token, tokenExpiresAt, refreshToken, refreshExpiresAt };
@@ -281,6 +358,13 @@ function App() {
   React.useEffect(() => {
     localStorage.setItem("agentmux.workspace_state", JSON.stringify({ tabs, activeTabId }));
   }, [tabs, activeTabId]);
+
+  React.useEffect(() => {
+    return () => {
+      toastTimers.current.forEach((timer) => window.clearTimeout(timer));
+      toastTimers.current = [];
+    };
+  }, []);
 
   React.useEffect(() => {
     const markActivity = () => {
@@ -300,6 +384,20 @@ function App() {
   }, []);
 
   React.useEffect(() => {
+    if (!token.trim()) return;
+    const poll = () => {
+      if (!authRef.current.token.trim()) return;
+      void refreshAll(authRef.current.token, { silent: true, notifyWorkerEvents: true });
+    };
+    const timer = window.setInterval(poll, 10_000);
+    window.addEventListener("focus", poll);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", poll);
+    };
+  }, [token]);
+
+  React.useEffect(() => {
     if (initialSignal) {
       void exchangeSignal(initialSignal);
     } else if (initialToken) {
@@ -308,11 +406,75 @@ function App() {
   }, []);
 
   React.useEffect(() => {
+    if (!token.trim() || accessMode === "direct") return;
+    let stopped = false;
+    const pollVersion = async () => {
+      try {
+        const res = await fetch("/api/version", { cache: "no-store" });
+        if (!res.ok || stopped) return;
+        const data = (await res.json()) as HubVersionPayload;
+        setHubVersion(data);
+        const signature = webVersionSignature(data);
+        if (!signature) return;
+        if (!hubVersionSignature.current) {
+          hubVersionSignature.current = signature;
+          return;
+        }
+        if (hubVersionSignature.current === signature || webUpdateToastShown.current) return;
+        webUpdateToastShown.current = true;
+        setStatus({ tone: "warn", title: "Web Control update available", detail: "Refresh to load the latest Hub assets." });
+        pushToast({
+          tone: "warn",
+          title: "Web Control update available",
+          detail: versionLabel(data),
+          actionLabel: "Refresh",
+          onAction: () => window.location.reload(),
+          sticky: true,
+        });
+      } catch {
+        // Version checks are best-effort; normal control traffic reports hub failures.
+      }
+    };
+    void pollVersion();
+    const timer = window.setInterval(pollVersion, 60_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [token, accessMode]);
+
+  React.useEffect(() => {
+    if (!token.trim() || accessMode === "direct") return;
+    const hasActiveJobs = Object.values(workerUpdateJobs).some((job) => workerUpdateJobActive(job.status));
+    if (!hasActiveJobs) return;
+    const timer = window.setInterval(() => {
+      for (const workerID of Object.keys(workerUpdateJobs)) {
+        void refreshWorkerUpdateJobs(workerID);
+      }
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [token, accessMode, workerUpdateJobs]);
+
+  React.useEffect(() => {
+    if (!token.trim() || accessMode === "direct" || workers.length === 0) return;
+    for (const worker of workers) {
+      if (!workerHasCapability(worker, "worker.update.apply")) continue;
+      void refreshWorkerUpdateJobs(worker.id);
+    }
+  }, [token, accessMode, workers]);
+
+  React.useEffect(() => {
     if (!createForm.worker_id && workers[0]) {
       const preferred = workers.find(workerCanStartSession) || workers.find(workerIsOnline) || workers[0];
       setCreateForm((form) => ({ ...form, worker_id: preferred.id }));
     }
   }, [workers, createForm.worker_id]);
+
+  React.useEffect(() => {
+    if (accessMode !== "direct") return;
+    if (directSessionId && sessions.some((session) => session.id === directSessionId)) return;
+    setDirectSessionId(sessions[0]?.id || "");
+  }, [accessMode, directSessionId, sessions]);
 
   React.useEffect(() => {
     if (!pendingFocusSessionId) return;
@@ -351,19 +513,96 @@ function App() {
     return fetch(path, { ...init, headers });
   }
 
-  async function refreshAll(authToken = authRef.current.token) {
+  async function refreshAll(authToken = authRef.current.token, options: RefreshOptions = {}) {
     const nextToken = await ensureFreshAccessToken(authToken);
     if (nextToken) localStorage.setItem("agentmux.token", nextToken);
-    const [workersRes, sessionsRes] = await Promise.all([apiFetch("/api/workers", {}, nextToken), apiFetch("/api/sessions", {}, nextToken)]);
-    if (!workersRes.ok || !sessionsRes.ok) {
-      setStatus({ tone: "err", title: "Unauthorized or hub unavailable", detail: `${workersRes.status} ${sessionsRes.status}` });
+    const meRes = await apiFetch("/api/auth/me", {}, nextToken);
+    if (!meRes.ok) {
+      if (!options.silent) {
+        setStatus({ tone: "err", title: "Unauthorized or hub unavailable", detail: `${meRes.status}` });
+      }
       return;
     }
-    const workersPayload = await workersRes.json();
+    const me = (await meRes.json()) as AuthMePayload;
+    const nextAccessMode = me.access_mode || "direct";
+    setAccessMode(nextAccessMode);
+    if (me.user?.email) {
+      setCurrentUser(me.user);
+      localStorage.setItem("agentmux.user", JSON.stringify(me.user));
+    } else {
+      setCurrentUser(null);
+      localStorage.removeItem("agentmux.user");
+    }
+    const sessionsRes = await apiFetch("/api/sessions", {}, nextToken);
+    if (!sessionsRes.ok) {
+      if (!options.silent) {
+        setStatus({ tone: "err", title: "Sessions unavailable", detail: `${sessionsRes.status}` });
+      }
+      return;
+    }
     const sessionsPayload = await sessionsRes.json();
-    setWorkers(workersPayload.workers || []);
-    setSessions(sessionsPayload.sessions || []);
-    setStatus({ tone: "ok", title: "Hub synced", detail: `${workersPayload.workers?.length || 0} workers · ${sessionsPayload.sessions?.length || 0} sessions` });
+    const nextSessions = sessionsPayload.sessions || [];
+    let nextWorkers: WorkerView[] = [];
+    if (nextAccessMode !== "direct") {
+      const workersRes = await apiFetch("/api/workers", {}, nextToken);
+      if (!workersRes.ok) {
+        if (!options.silent) {
+          setStatus({ tone: "err", title: "Workers unavailable", detail: `${workersRes.status}` });
+        }
+        return;
+      }
+      const workersPayload = await workersRes.json();
+      nextWorkers = workersPayload.workers || [];
+      if (options.notifyWorkerEvents && workerEventsReady.current) {
+        notifyWorkerEvents(workersRef.current, nextWorkers);
+      }
+      workersRef.current = nextWorkers;
+      workerEventsReady.current = true;
+    } else {
+      workersRef.current = [];
+      workerEventsReady.current = false;
+    }
+    setWorkers(nextWorkers);
+    setSessions(nextSessions);
+    if (!options.silent) {
+      setStatus({ tone: "ok", title: nextAccessMode === "direct" ? "Direct token connected" : "Hub synced", detail: nextAccessMode === "direct" ? `${nextSessions.length} sessions` : `${nextWorkers.length} workers · ${nextSessions.length} sessions` });
+    }
+  }
+
+  function notifyWorkerEvents(previous: WorkerView[], next: WorkerView[]) {
+    const previousByID = new Map(previous.map((worker) => [worker.id, worker]));
+    const nextByID = new Map(next.map((worker) => [worker.id, worker]));
+    for (const worker of next) {
+      const old = previousByID.get(worker.id);
+      if (!old) {
+        pushToast({ tone: "ok", title: "Worker joined", detail: `${workerDisplayLabel(worker)} · ${workerStatusLabel(worker)}` });
+        continue;
+      }
+      const wasOnline = workerIsOnline(old);
+      const nowOnline = workerIsOnline(worker);
+      if (!wasOnline && nowOnline) {
+        pushToast({ tone: "ok", title: "Worker online", detail: workerDisplayLabel(worker) });
+      } else if (wasOnline && !nowOnline) {
+        pushToast({ tone: "warn", title: "Worker offline", detail: workerDisplayLabel(worker) });
+      }
+    }
+    for (const worker of previous) {
+      if (!nextByID.has(worker.id)) {
+        pushToast({ tone: "warn", title: "Worker removed", detail: workerDisplayLabel(worker) });
+      }
+    }
+  }
+
+  function pushToast(toast: Omit<Toast, "id">) {
+    const id = crypto.randomUUID();
+    setToasts((items) => [...items.slice(-3), { ...toast, id }]);
+    if (toast.sticky) return;
+    const timer = window.setTimeout(() => dismissToast(id), 6_000);
+    toastTimers.current.push(timer);
+  }
+
+  function dismissToast(id: string) {
+    setToasts((items) => items.filter((toast) => toast.id !== id));
   }
 
   async function createSession(event: React.FormEvent) {
@@ -434,7 +673,7 @@ function App() {
       }),
     });
     if (!res.ok) {
-      setStatus({ tone: "err", title: authMode === "register" ? "Registration failed" : "Login failed", detail: await res.text() });
+      setStatus({ tone: "err", title: authMode === "register" ? "Registration failed" : "Login failed", detail: errorDetailFromResponseText(res.status, await res.text()) });
       return;
     }
     await acceptCredential(await res.json(), authMode === "register" ? "Account created" : "Signed in");
@@ -442,6 +681,7 @@ function App() {
 
   async function acceptCredential(data: AuthCredentialPayload, title: string) {
     storeCredential(data);
+    setAccessMode(data.user?.email ? "account" : "direct");
     localStorage.setItem("agentmux.control_device_id", data.device_id);
     setStatus({
       tone: "ok",
@@ -462,8 +702,9 @@ function App() {
     setTokenExpiresAt("");
     setRefreshToken("");
     setRefreshExpiresAt("");
-    setCurrentUser(null);
-    setJoinSignal(null);
+	setCurrentUser(null);
+	setAccessMode("direct");
+	setJoinSignal(null);
     localStorage.setItem("agentmux.token", nextToken);
     localStorage.removeItem("agentmux.token_expires_at");
     localStorage.removeItem("agentmux.refresh_token");
@@ -479,10 +720,14 @@ function App() {
     setTokenExpiresAt("");
     setRefreshToken("");
     setRefreshExpiresAt("");
-    setCurrentUser(null);
-    setJoinSignal(null);
+	setCurrentUser(null);
+	setAccessMode("none");
+	setJoinSignal(null);
     setWorkers([]);
     setSessions([]);
+    workersRef.current = [];
+    workerEventsReady.current = false;
+    setToasts([]);
     authRef.current = { token: "", tokenExpiresAt: "", refreshToken: "", refreshExpiresAt: "" };
     localStorage.removeItem("agentmux.token");
     localStorage.removeItem("agentmux.token_expires_at");
@@ -565,11 +810,16 @@ function App() {
   }
 
   async function generateJoinSignal() {
+    if (accessMode === "direct") {
+      setJoinLoading(false);
+      setStatus({ tone: "warn", title: "Direct token is limited", detail: "Direct Token access can connect to shared sessions, but cannot generate new Worker signals." });
+      return;
+    }
     setJoinLoading(true);
     const res = await apiFetch("/api/signals", { method: "POST" });
     if (!res.ok) {
       setJoinLoading(false);
-      setStatus({ tone: "err", title: "Signal generation failed", detail: await res.text() });
+      setStatus({ tone: "err", title: "Signal generation failed", detail: signalGenerationErrorDetail(res.status, await res.text()) });
       return;
     }
     const data = (await res.json()) as SignalPayload;
@@ -579,8 +829,12 @@ function App() {
   }
 
   async function openJoinModal() {
+    if (accessMode === "direct") {
+      setStatus({ tone: "warn", title: "Direct token is limited", detail: "Direct Token access can connect to shared sessions, but cannot generate new Worker signals." });
+      return;
+    }
     setJoinOpen(true);
-    if (!joinSignal && token.trim()) {
+    if (!joinSignal) {
       await generateJoinSignal();
     }
   }
@@ -725,6 +979,58 @@ function App() {
     await refreshAll();
   }
 
+  async function refreshWorkerUpdateJobs(workerID: string) {
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerID)}/updates`);
+    if (!res.ok) return;
+    const payload = (await res.json()) as { jobs?: WorkerUpdateJob[] };
+    const latest = latestWorkerUpdateJob(payload.jobs || []);
+    if (!latest) return;
+    setWorkerUpdateJobs((items) => ({ ...items, [workerID]: latest }));
+    if (!workerUpdateJobActive(latest.status)) {
+      await refreshAll(authRef.current.token, { silent: true });
+    }
+  }
+
+  async function updateWorkerBinary(worker: WorkerView) {
+    const backend = (worker.backend || "").toLowerCase();
+    const allowDisruptive = backend !== "tmux";
+    if (allowDisruptive && !window.confirm(`Update ${workerDisplayLabel(worker)}?\n\nBackend ${backend || "unknown"} may lose in-process sessions when the worker restarts.`)) {
+      return;
+    }
+    const targetVersion = normalizeComparableVersion(hubVersion?.version || "") ? hubVersion?.version || "latest" : "latest";
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}/updates`, {
+      method: "POST",
+      body: JSON.stringify({ version: targetVersion, allow_disruptive_restart: allowDisruptive }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      setStatus({ tone: "err", title: "Worker update failed", detail: errorDetailFromResponseText(res.status, text) });
+      pushToast({ tone: "err", title: "Worker update failed", detail: `${workerDisplayLabel(worker)} · ${errorDetailFromResponseText(res.status, text)}` });
+      return;
+    }
+    const payload = await res.json();
+    const job = payload?.job as WorkerUpdateJob | undefined;
+    if (job) {
+      setWorkerUpdateJobs((items) => ({ ...items, [worker.id]: job }));
+    }
+    const jobId = job?.id || "queued";
+    setStatus({ tone: "ok", title: "Worker update queued", detail: `${workerDisplayLabel(worker)} · ${jobId}` });
+    pushToast({ tone: "ok", title: "Worker update queued", detail: `${workerDisplayLabel(worker)} · ${targetVersion}` });
+    await refreshAll();
+    void refreshWorkerUpdateJobs(worker.id);
+  }
+
+  async function evictWorker(worker: WorkerView) {
+    if (!window.confirm(`Evict worker ${workerDisplayLabel(worker)}?`)) return;
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}`, { method: "DELETE" });
+    if (!res.ok) {
+      setStatus({ tone: "err", title: "Worker eviction failed", detail: await res.text() });
+      return;
+    }
+    setStatus({ tone: "warn", title: "Worker evicted", detail: worker.id });
+    await refreshAll();
+  }
+
   function updateWorkerTerminalSettings(workerId: string, next: WorkerTerminalSettings) {
     setTerminalSettings((current) => {
       const updated = { ...current, workers: { ...current.workers, [workerId]: next } };
@@ -786,6 +1092,39 @@ function App() {
   const activeSessionIds = new Set(
     tabs.flatMap((tab) => collectPanes(tab.layout).map((pane) => pane.sessionId).filter((id): id is string => Boolean(id))),
   );
+  const directAccess = accessMode === "direct";
+
+  if (directAccess) {
+    return (
+      <div className="flex h-screen bg-background text-foreground">
+        <SimpleDirectControlView
+          sessions={sessions}
+          selectedSessionId={directSessionId}
+          token={token}
+          onSelectSession={setDirectSessionId}
+          onRefresh={() => void refreshAll()}
+          onSignIn={() => setAuthOpen(true)}
+          setStatus={setStatus}
+        />
+        <ToastViewport toasts={toasts} onDismiss={dismissToast} />
+        <AuthModal
+          open={authOpen}
+          authMode={authMode}
+          authForm={authForm}
+          currentUser={currentUser}
+          token={tokenDraft}
+          onClose={() => setAuthOpen(false)}
+          onModeChange={setAuthMode}
+          onFormChange={setAuthForm}
+          onTokenChange={setTokenDraft}
+          onSubmit={submitAuth}
+          onApplyDirectToken={() => void applyDirectToken()}
+          onOAuth={(provider) => void startOAuth(provider)}
+          onLogout={signOut}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-background text-foreground">
@@ -885,7 +1224,7 @@ function App() {
             <Plus className="h-4 w-4" />
             Create
           </Button>
-          <Button variant="secondary" onClick={() => void openJoinModal()}>
+          <Button variant="secondary" onClick={() => void openJoinModal()} title={canGenerateJoinSignal ? "Generate Worker join commands" : "Direct Token cannot generate Worker join commands"}>
             <UserPlus className="h-4 w-4" />
             Join
           </Button>
@@ -952,6 +1291,8 @@ function App() {
               sessionSearch={sessionSearch}
               activeSessionIds={activeSessionIds}
               previewStates={previewStates}
+              hubVersion={hubVersion}
+              workerUpdateJobs={workerUpdateJobs}
               onWorkerFilterChange={setWorkerFilter}
               onSessionSearchChange={setSessionSearch}
               onAttach={(session) => void attach(session.id)}
@@ -960,6 +1301,8 @@ function App() {
               onLoadPreview={(session, force) => void loadSessionPreview(session, force)}
               onKillSession={(session) => void killSession(session)}
               onUpdateWorker={(worker, patch) => void updateWorker(worker, patch)}
+              onUpdateWorkerBinary={(worker) => void updateWorkerBinary(worker)}
+              onEvictWorker={(worker) => void evictWorker(worker)}
             />
           </div>
           <div className={cn("absolute inset-0 min-h-0 min-w-0", mainView === "workspace" ? "block" : "invisible pointer-events-none")}>
@@ -987,6 +1330,7 @@ function App() {
           </div>
         </div>
       </main>
+      <ToastViewport toasts={toasts} onDismiss={dismissToast} />
       <AuthModal
         open={authOpen}
         authMode={authMode}
@@ -1018,10 +1362,149 @@ function App() {
         open={joinOpen}
         joinSignal={joinSignal}
         loading={joinLoading}
-        tokenReady={!!token.trim()}
+        tokenReady={canGenerateJoinSignal}
         onClose={() => setJoinOpen(false)}
         onGenerate={() => void generateJoinSignal()}
       />
+    </div>
+  );
+}
+
+function ToastViewport({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: string) => void }) {
+  if (!toasts.length) return null;
+  return (
+    <div className="pointer-events-none fixed right-3 top-14 z-[70] flex w-[min(360px,calc(100vw-24px))] flex-col gap-2">
+      {toasts.map((toast) => (
+        <div
+          key={toast.id}
+          className={cn(
+            "pointer-events-auto rounded-md border bg-card/95 p-3 shadow-2xl backdrop-blur",
+            toast.tone === "ok" && "border-emerald-500/40",
+            toast.tone === "warn" && "border-amber-500/40",
+            toast.tone === "err" && "border-red-500/40",
+            toast.tone === "idle" && "border-border",
+          )}
+        >
+          <div className="flex items-start gap-3">
+            <span
+              className={cn(
+                "mt-1 h-2 w-2 shrink-0 rounded-full",
+                toast.tone === "ok" && "bg-emerald-500",
+                toast.tone === "warn" && "bg-amber-500",
+                toast.tone === "err" && "bg-red-500",
+                toast.tone === "idle" && "bg-muted-foreground",
+              )}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-medium">{toast.title}</div>
+              <div className="truncate text-xs text-muted-foreground">{toast.detail}</div>
+            </div>
+            {toast.actionLabel && toast.onAction ? (
+              <Button variant="secondary" size="xs" onClick={toast.onAction}>
+                {toast.actionLabel}
+              </Button>
+            ) : null}
+            <Button variant="ghost" size="icon-sm" onClick={() => onDismiss(toast.id)} title="Dismiss notification">
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SimpleDirectControlView({
+  sessions,
+  selectedSessionId,
+  token,
+  onSelectSession,
+  onRefresh,
+  onSignIn,
+  setStatus,
+}: {
+  sessions: SessionView[];
+  selectedSessionId: string;
+  token: string;
+  onSelectSession: (sessionId: string) => void;
+  onRefresh: () => void;
+  onSignIn: () => void;
+  setStatus: React.Dispatch<React.SetStateAction<Status>>;
+}) {
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) || null;
+  const pane = React.useMemo(() => ({ type: "pane" as const, id: "direct-pane", sessionId: selectedSession?.id }), [selectedSession?.id]);
+  return (
+    <div className="flex h-full min-h-0 w-full bg-background">
+      <aside className="flex h-full w-80 shrink-0 flex-col border-r border-border bg-card">
+        <div className="flex h-14 items-center justify-between border-b border-border px-3">
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <img src="/agentmux-mark.svg" alt="" className="h-5 w-5 rounded-md" />
+            AgentMux
+          </div>
+          <Button variant="ghost" size="icon-sm" onClick={onRefresh} title="Refresh sessions">
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="border-b border-border px-3 py-2">
+          <div className="text-xs font-medium uppercase text-muted-foreground">Direct Token</div>
+          <div className="mt-1 text-sm font-medium">Session access</div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-2">
+          {sessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions.</div> : null}
+          <div className="space-y-1">
+            {sessions.map((session) => (
+              <button
+                key={session.id}
+                type="button"
+                className={cn(
+                  "w-full rounded-md border px-2 py-2 text-left transition-colors",
+                  selectedSession?.id === session.id ? "border-primary/50 bg-primary/10" : "border-transparent hover:border-border hover:bg-secondary",
+                )}
+                onClick={() => onSelectSession(session.id)}
+              >
+                <div className="truncate text-sm font-medium">{session.name || session.id}</div>
+                <div className="truncate text-xs text-muted-foreground">{session.worker_id} · {session.status || "unknown"}</div>
+                <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="border-t border-border p-3">
+          <Button variant="secondary" className="w-full" onClick={onSignIn}>
+            <LogIn className="h-4 w-4" />
+            Sign in for full control
+          </Button>
+        </div>
+      </aside>
+      <main className="flex min-w-0 flex-1 flex-col">
+        <header className="flex h-11 items-center justify-between border-b border-border bg-card px-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-medium">{selectedSession?.id || "Select a session"}</div>
+            <div className="truncate text-xs text-muted-foreground">Direct Token view</div>
+          </div>
+          <StatusBadge tone="warn">limited</StatusBadge>
+        </header>
+        <div className="min-h-0 flex-1">
+          <TerminalPane
+            pane={pane}
+            session={selectedSession}
+            worker={null}
+            active
+            interactive={Boolean(selectedSession)}
+            terminalSettings={{ workers: {} }}
+            token={token}
+            onFocus={() => {}}
+            onSplit={() => {}}
+            onClose={() => {}}
+            dropTarget={null}
+            onDropTarget={() => {}}
+            onDropPayload={() => {}}
+            onTerminalSettingsChange={() => {}}
+            setStatus={setStatus}
+            simple
+          />
+        </div>
+      </main>
     </div>
   );
 }
@@ -1034,6 +1517,8 @@ function OverviewPage({
   sessionSearch,
   activeSessionIds,
   previewStates,
+  hubVersion,
+  workerUpdateJobs,
   onWorkerFilterChange,
   onSessionSearchChange,
   onAttach,
@@ -1042,6 +1527,8 @@ function OverviewPage({
   onLoadPreview,
   onKillSession,
   onUpdateWorker,
+  onUpdateWorkerBinary,
+  onEvictWorker,
 }: {
   workers: WorkerView[];
   sessions: SessionView[];
@@ -1050,6 +1537,8 @@ function OverviewPage({
   sessionSearch: string;
   activeSessionIds: Set<string>;
   previewStates: Record<string, PreviewState>;
+  hubVersion: HubVersionPayload | null;
+  workerUpdateJobs: Record<string, WorkerUpdateJob>;
   onWorkerFilterChange: (workerID: string) => void;
   onSessionSearchChange: (query: string) => void;
   onAttach: (session: SessionView) => void;
@@ -1058,6 +1547,8 @@ function OverviewPage({
   onLoadPreview: (session: SessionView, force?: boolean) => void;
   onKillSession: (session: SessionView) => void;
   onUpdateWorker: (worker: WorkerView, patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
+  onUpdateWorkerBinary: (worker: WorkerView) => void;
+  onEvictWorker: (worker: WorkerView) => void;
 }) {
   const workerByID = React.useMemo(() => new Map(workers.map((worker) => [worker.id, worker])), [workers]);
   const onlineWorkers = workers.filter(workerIsOnline).length;
@@ -1093,8 +1584,12 @@ function OverviewPage({
                   worker={worker}
                   selected={workerFilter === worker.id}
                   sessionCount={allSessions.filter((session) => session.worker_id === worker.id).length}
+                  recommendedVersion={hubVersion?.version || ""}
+                  updateJob={workerUpdateJobs[worker.id]}
                   onSelect={() => onWorkerFilterChange(worker.id)}
                   onUpdate={(patch) => onUpdateWorker(worker, patch)}
+                  onUpdateBinary={() => onUpdateWorkerBinary(worker)}
+                  onEvict={() => onEvictWorker(worker)}
                 />
               ))}
             </div>
@@ -1165,17 +1660,30 @@ function WorkerCard({
   worker,
   selected,
   sessionCount,
+  recommendedVersion,
+  updateJob,
   onSelect,
   onUpdate,
+  onUpdateBinary,
+  onEvict,
 }: {
   worker: WorkerView;
   selected: boolean;
   sessionCount: number;
+  recommendedVersion: string;
+  updateJob?: WorkerUpdateJob;
   onSelect: () => void;
   onUpdate: (patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
+  onUpdateBinary: () => void;
+  onEvict: () => void;
 }) {
   const enabled = workerEnabled(worker);
   const online = workerIsOnline(worker);
+  const canUpdate = online && enabled && workerHasCapability(worker, "worker.update.apply");
+  const updateRecommended = canUpdate && workerUpdateRecommended(worker, recommendedVersion);
+  const updateActive = updateJob ? workerUpdateJobActive(updateJob.status) : false;
+  const updateFailed = updateJob?.status === "failed";
+  const showUpdateNotice = Boolean(updateRecommended || updateActive || updateFailed);
   return (
     <Card className={cn("space-y-3 bg-card p-3 transition-colors", selected && "border-primary/50 bg-primary/10")}>
       <button type="button" className="flex w-full min-w-0 items-start gap-2 text-left" onClick={onSelect}>
@@ -1192,10 +1700,30 @@ function WorkerCard({
             <StatusBadge tone={online ? "ok" : "warn"}>{workerStatusLabel(worker)}</StatusBadge>
             <StatusBadge tone={enabled ? "ok" : "err"}>{enabled ? "enabled" : "disabled"}</StatusBadge>
             <StatusBadge>{sessionCount} sessions</StatusBadge>
+            {worker.software?.version ? <StatusBadge>{worker.software.version}</StatusBadge> : null}
+            {workerPlatformLabel(worker) ? <StatusBadge>{workerPlatformLabel(worker)}</StatusBadge> : null}
+            {workerProtocolLabel(worker) ? <StatusBadge>{workerProtocolLabel(worker)}</StatusBadge> : null}
           </div>
         </div>
       </button>
-      <div className="grid grid-cols-3 gap-1">
+      {showUpdateNotice ? (
+        <button
+          type="button"
+          className={cn(
+            "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs",
+            updateFailed ? "border-red-500/35 bg-red-500/10 text-red-200" : "border-amber-500/35 bg-amber-500/10 text-amber-100",
+          )}
+          onClick={updateActive || !canUpdate ? undefined : onUpdateBinary}
+          disabled={updateActive || !canUpdate}
+          title={updateJob ? workerUpdateJobDetail(updateJob) : `Update to ${recommendedVersion || "latest"}`}
+        >
+          <span className="min-w-0 truncate">
+            {updateJob ? workerUpdateJobLabel(updateJob) : `Update available: ${worker.software?.version || "unknown"} -> ${recommendedVersion || "latest"}`}
+          </span>
+          {updateActive ? <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 shrink-0" />}
+        </button>
+      ) : null}
+      <div className="grid grid-cols-5 gap-1">
         <Button variant={enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ enabled: !enabled })}>
           <ShieldCheck className="h-3.5 w-3.5" />
           {enabled ? "Disable" : "Enable"}
@@ -1208,8 +1736,20 @@ function WorkerCard({
           <Bug className="h-3.5 w-3.5" />
           Debug
         </Button>
+        <Button variant={updateRecommended || updateJob ? "secondary" : "ghost"} size="xs" type="button" onClick={onUpdateBinary} disabled={!canUpdate || updateActive} title={canUpdate ? "Update worker to latest release" : "Worker update is unavailable"}>
+          <RefreshCw className="h-3.5 w-3.5" />
+          {updateActive ? "Updating" : "Update"}
+        </Button>
+        <Button variant="ghost" size="xs" type="button" onClick={onEvict} title="Evict worker">
+          <Unplug className="h-3.5 w-3.5" />
+          Evict
+        </Button>
       </div>
-      <div className="text-[11px] text-muted-foreground">Last seen {formatRelativeTime(worker.last_seen)}</div>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+        <span>Last seen {formatRelativeTime(worker.last_seen)}</span>
+        {worker.software?.service_backend ? <span>service {worker.software.service_backend}</span> : null}
+        {worker.software?.update_policy ? <span>updates {worker.software.update_policy}</span> : null}
+      </div>
     </Card>
   );
 }
@@ -1339,42 +1879,103 @@ function WorkspaceView({
   onDropPayload: (tabID: string, paneId: string, zone: DropZone, payload: DragPayload) => void;
   onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
+  simple?: boolean;
 }) {
+  const [editingTabId, setEditingTabId] = React.useState("");
+  const [editingTitle, setEditingTitle] = React.useState("");
+  const editInputRef = React.useRef<HTMLInputElement | null>(null);
+
+  React.useEffect(() => {
+    if (!editingTabId) return;
+    requestAnimationFrame(() => {
+      editInputRef.current?.focus();
+      editInputRef.current?.select();
+    });
+  }, [editingTabId]);
+
+  function startRename(tab: WorkspaceTab) {
+    setEditingTabId(tab.id);
+    setEditingTitle(tab.title);
+  }
+
+  function commitRename() {
+    if (!editingTabId) return;
+    const title = editingTitle.trim();
+    if (title) onRenameTab(editingTabId, title);
+    setEditingTabId("");
+    setEditingTitle("");
+  }
+
+  function cancelRename() {
+    setEditingTabId("");
+    setEditingTitle("");
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-background">
       <div className="flex h-9 items-center gap-2 border-b border-border bg-card px-2">
         <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {tabs.map((tab) => (
-            <button
+            <div
               key={tab.id}
-              type="button"
+              role="button"
+              tabIndex={0}
               className={cn(
                 "flex h-7 min-w-[112px] max-w-[260px] shrink-0 items-center rounded-md border px-2 text-xs transition-colors",
                 tab.id === activeTabId ? "border-primary/50 bg-primary/10 text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground",
               )}
               onClick={() => onActiveTabChange(tab.id)}
-              onDoubleClick={() => {
-                const title = window.prompt("Workspace name", tab.title);
-                if (title !== null) onRenameTab(tab.id, title);
+              onKeyDown={(event) => {
+                if (editingTabId) return;
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                onActiveTabChange(tab.id);
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                startRename(tab);
               }}
               title="Double-click to rename workspace"
             >
-              <span className="min-w-0 flex-1 truncate text-left">{tab.title}</span>
+              {editingTabId === tab.id ? (
+                <input
+                  ref={editInputRef}
+                  className="min-w-0 flex-1 rounded border border-primary/40 bg-background px-1 py-0.5 text-left text-xs text-foreground outline-none"
+                  value={editingTitle}
+                  onChange={(event) => setEditingTitle(event.target.value)}
+                  onClick={(event) => event.stopPropagation()}
+                  onDoubleClick={(event) => event.stopPropagation()}
+                  onBlur={commitRename}
+                  onKeyDown={(event) => {
+                    event.stopPropagation();
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitRename();
+                    } else if (event.key === "Escape") {
+                      event.preventDefault();
+                      cancelRename();
+                    }
+                  }}
+                />
+              ) : (
+                <span className="min-w-0 flex-1 truncate text-left">{tab.title}</span>
+              )}
               {tabs.length > 1 ? (
-                <span
-                  role="button"
-                  tabIndex={0}
+                <button
+                  type="button"
                   className="ml-1 grid h-4 w-4 shrink-0 place-items-center rounded hover:bg-secondary"
                   onClick={(event) => {
                     event.stopPropagation();
                     onCloseTab(tab.id);
                   }}
+                  title={`Close ${tab.title}`}
                 >
                   <X className="h-3 w-3" />
-                </span>
+                </button>
               ) : null}
-            </button>
+            </div>
           ))}
         </div>
         <Button variant="ghost" size="icon-sm" onClick={onCreateTab} title="New workspace tab">
@@ -1552,12 +2153,45 @@ function AuthModal({
   );
 }
 
-function SignalCommand({ title, value, mono = true }: { title: string; value: string; mono?: boolean }) {
+function SignalCommand({ title, value, mono = true, href = false }: { title: string; value: string; mono?: boolean; href?: boolean }) {
+  const [copied, setCopied] = React.useState(false);
+
+  async function copyValue() {
+    if (!value) return;
+    await copyText(value);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  }
+
   return (
     <div className="space-y-1">
-      <div className="text-[11px] font-medium uppercase text-muted-foreground">{title}</div>
-      <div className={cn("rounded-md border border-border bg-card px-2 py-2 text-[11px] text-foreground", mono && "font-mono")}>
-        {value}
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[11px] font-medium uppercase text-muted-foreground">{title}</div>
+        <div className="flex items-center gap-1">
+          {href && value ? (
+            <a
+              className="inline-flex h-6 items-center justify-center gap-1.5 rounded-md border border-transparent bg-transparent px-1.5 text-xs font-medium text-foreground transition-colors hover:bg-secondary"
+              href={value}
+              title={`Open ${title}`}
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              Open
+            </a>
+          ) : null}
+          <Button type="button" variant="ghost" size="xs" className="h-6 px-1.5" onClick={() => void copyValue()} disabled={!value} title={`Copy ${title}`}>
+            {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+            {copied ? "Copied" : "Copy"}
+          </Button>
+        </div>
+      </div>
+      <div className={cn("max-h-24 overflow-auto rounded-md border border-border bg-card px-2 py-2 text-[11px] text-foreground", mono && "font-mono")}>
+        {href && value ? (
+          <a className="break-all text-primary underline-offset-2 hover:underline" href={value}>
+            {value}
+          </a>
+        ) : (
+          <code className="whitespace-pre-wrap break-all">{value}</code>
+        )}
       </div>
     </div>
   );
@@ -1586,7 +2220,7 @@ function JoinSignalModal({
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
             <div className="text-sm font-semibold">Join Worker</div>
-            <div className="text-xs text-muted-foreground">Generate a tenant-scoped signal and copy Worker commands for this Hub.</div>
+            <div className="text-xs text-muted-foreground">Generate a Worker signal, Direct Token, and share URL for this Hub.</div>
           </div>
           <Button variant="ghost" size="icon-sm" onClick={onClose} title="Close">
             <X className="h-4 w-4" />
@@ -1595,7 +2229,7 @@ function JoinSignalModal({
         <div className="space-y-4 p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="text-xs text-muted-foreground">
-              {tokenReady ? "Use the install command on a fresh machine, or the direct join command when agentmux is already installed. Control devices sign in separately." : "Sign in or apply a control token before generating worker join commands."}
+              {tokenReady ? "Use the Worker command for machines and share the Direct Token or token URL with anonymous Control devices." : "Direct Token access cannot generate new Worker signals."}
             </div>
             <Button variant="secondary" size="sm" type="button" onClick={onGenerate} disabled={!tokenReady || loading}>
               <UserPlus className="h-4 w-4" />
@@ -1607,10 +2241,12 @@ function JoinSignalModal({
               <SignalCommand title="Signal" value={joinSignal.signal} mono={false} />
               <SignalCommand title="Install and join Worker" value={joinSignal.worker_command} />
               <SignalCommand title="Installed Worker join" value={joinSignal.worker_join_command || `agentmux worker join --hub ${wsBaseFromLocation()} --join ${joinSignal.signal} --name "$(hostname)"`} />
-              <SignalCommand title="Web Control login" value={joinSignal.control_url} mono={false} />
-              <SignalCommand title="TUI Control" value={joinSignal.control_command || `agentmux-tui --hub ${window.location.origin}`} />
+              <SignalCommand title="Direct Token" value={joinSignal.direct_token || ""} mono={false} />
+              <SignalCommand title="Web Control share URL" value={joinSignal.control_share_url || joinSignal.control_url} mono={false} href />
+              <SignalCommand title="TUI Direct Token" value={joinSignal.control_direct_command || `agentmux-tui --hub ${window.location.origin}${joinSignal.direct_token ? ` --token ${joinSignal.direct_token}` : ""}`} />
               <div className="md:col-span-2 text-[11px] text-muted-foreground">
-                Tenant {joinSignal.tenant_id} · expires {new Date(joinSignal.expires_at).toLocaleString()}
+                Tenant {joinSignal.tenant_id} · worker signal expires {new Date(joinSignal.expires_at).toLocaleString()}
+                {joinSignal.direct_token_expires_at ? ` · direct token expires ${new Date(joinSignal.direct_token_expires_at).toLocaleString()}` : ""}
               </div>
             </div>
           ) : (
@@ -1737,6 +2373,7 @@ function LayoutRenderer({
   onDropPayload,
   onTerminalSettingsChange,
   setStatus,
+  simple = false,
 }: {
   tabId: string;
   node: LayoutNode;
@@ -1754,6 +2391,7 @@ function LayoutRenderer({
   onDropPayload: (tabID: string, paneId: string, zone: DropZone, payload: DragPayload) => void;
   onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
+  simple?: boolean;
 }) {
   if (node.type === "pane") {
     const session = node.sessionId ? sessionByID.get(node.sessionId) || null : null;
@@ -1775,6 +2413,7 @@ function LayoutRenderer({
         onDropPayload={(zone, payload) => onDropPayload(tabId, node.id, zone, payload)}
         onTerminalSettingsChange={onTerminalSettingsChange}
         setStatus={setStatus}
+        simple={simple}
       />
     );
   }
@@ -1808,6 +2447,7 @@ function LayoutRenderer({
               onDropPayload={onDropPayload}
               onTerminalSettingsChange={onTerminalSettingsChange}
               setStatus={setStatus}
+              simple={simple}
             />
           </Panel>
         </React.Fragment>
@@ -1832,6 +2472,7 @@ function TerminalPane({
   onDropPayload,
   onTerminalSettingsChange,
   setStatus,
+  simple = false,
 }: {
   pane: PaneNode;
   session: SessionView | null;
@@ -1848,6 +2489,7 @@ function TerminalPane({
   onDropPayload: (zone: DropZone, payload: DragPayload) => void;
   onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
+  simple?: boolean;
 }) {
   const terminalRef = React.useRef<HTMLDivElement | null>(null);
   const terminal = React.useRef<Terminal | null>(null);
@@ -1859,6 +2501,7 @@ function TerminalPane({
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
   const activeRef = React.useRef(interactive);
+  const [prefixRecorderOpen, setPrefixRecorderOpen] = React.useState(false);
   const backend = sessionBackendLabel(session || undefined, worker);
   const isTmux = backend.toLowerCase() === "tmux";
   const workerTerminalSettings = workerTerminalSettingsFor(terminalSettings, worker?.id);
@@ -1881,10 +2524,14 @@ function TerminalPane({
 
   function configureTmuxPrefix() {
     if (!worker?.id) return;
-    const value = window.prompt(`tmux prefix for ${workerDisplayLabel(worker)}`, tmuxPrefixLabel);
-    if (!value) return;
-    const encoded = parseControlSequence(value);
-    onTerminalSettingsChange(worker.id, { ...workerTerminalSettings, tmuxPrefix: encoded });
+    setPrefixRecorderOpen(true);
+  }
+
+  function saveTmuxPrefix(value: string) {
+    if (!worker?.id) return;
+    onTerminalSettingsChange(worker.id, { ...workerTerminalSettings, tmuxPrefix: value || defaultTmuxPrefix });
+    setPrefixRecorderOpen(false);
+    requestAnimationFrame(() => terminal.current?.focus());
   }
 
   React.useEffect(() => {
@@ -1996,7 +2643,7 @@ function TerminalPane({
       if (terminalInputSuppressed()) return true;
       if (!activeRef.current) return true;
       if (event.type !== "keydown") return true;
-      if (!shouldCaptureTerminalKey(event)) return true;
+      if (!shouldSendKeyDownManually(event)) return true;
       const data = encodeKeyEvent(event);
       if (isTerminalDeviceReport(data)) return true;
       if (!data) return true;
@@ -2009,7 +2656,7 @@ function TerminalPane({
       if (terminalInputSuppressed()) return;
       if (!activeRef.current || event.defaultPrevented) return;
       if (!terminalHasKeyboardFocus(event, terminalRef.current)) return;
-      if (!shouldCaptureTerminalKey(event)) return;
+      if (!shouldSendKeyDownManually(event)) return;
       const data = encodeKeyEvent(event);
       if (isTerminalDeviceReport(data)) return;
       if (!data) return;
@@ -2054,6 +2701,7 @@ function TerminalPane({
         onFocus();
       }}
       onDragOver={(event) => {
+        if (simple) return;
         if (!hasAgentMuxDragPayload(event)) return;
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
@@ -2064,6 +2712,7 @@ function TerminalPane({
         onDropTarget(null);
       }}
       onDrop={(event) => {
+        if (simple) return;
         const payload = readDragPayload(event);
         if (!payload) return;
         event.preventDefault();
@@ -2072,11 +2721,11 @@ function TerminalPane({
     >
       <div className="flex h-7 items-center justify-between border-b border-border bg-card px-1.5">
         <div
-          className="flex min-w-0 flex-1 cursor-grab items-center gap-1.5 truncate text-xs font-medium text-muted-foreground active:cursor-grabbing"
-          draggable
+          className={cn("flex min-w-0 flex-1 items-center gap-1.5 truncate text-xs font-medium text-muted-foreground", !simple && "cursor-grab active:cursor-grabbing")}
+          draggable={!simple}
           onDragStart={(event) => setDragPayload(event, { kind: "pane", paneId: pane.id })}
           onDragEnd={() => onDropTarget(null)}
-          title="Drag pane"
+          title={simple ? pane.sessionId || "Session" : "Drag pane"}
         >
           <span className="truncate">{pane.sessionId || "Empty pane"}</span>
           {pane.sessionId ? <BackendBadge value={backend} /> : null}
@@ -2105,52 +2754,58 @@ function TerminalPane({
                 <Keyboard className="h-3.5 w-3.5" />
                 {tmuxPrefixLabel}
               </Button>
+              {!simple ? (
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    configureTmuxPrefix();
+                  }}
+                  title="Configure tmux prefix"
+                >
+                  <Settings className="h-4 w-4" />
+                </Button>
+              ) : null}
+            </>
+          ) : null}
+          {!simple ? (
+            <>
               <Button
                 variant="ghost"
                 size="icon-sm"
                 onClick={(event) => {
                   event.stopPropagation();
-                  configureTmuxPrefix();
+                  onSplit("horizontal");
                 }}
-                title="Configure tmux prefix"
+                title="Split right"
               >
-                <Settings className="h-4 w-4" />
+                <SplitSquareHorizontal className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSplit("vertical");
+                }}
+                title="Split down"
+              >
+                <SplitSquareVertical className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onClose();
+                }}
+                title="Close pane"
+              >
+                <X className="h-4 w-4" />
               </Button>
             </>
           ) : null}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(event) => {
-              event.stopPropagation();
-              onSplit("horizontal");
-            }}
-            title="Split right"
-          >
-            <SplitSquareHorizontal className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(event) => {
-              event.stopPropagation();
-              onSplit("vertical");
-            }}
-            title="Split down"
-          >
-            <SplitSquareVertical className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={(event) => {
-              event.stopPropagation();
-              onClose();
-            }}
-            title="Close pane"
-          >
-            <X className="h-4 w-4" />
-          </Button>
         </div>
       </div>
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden p-1">
@@ -2162,7 +2817,104 @@ function TerminalPane({
           </Card>
         )}
       </div>
-      <DropIndicator zone={dropTarget?.zone} />
+      <PrefixRecorderModal
+        open={prefixRecorderOpen}
+        workerLabel={worker ? workerDisplayLabel(worker) : "worker"}
+        value={tmuxPrefix}
+        onSave={saveTmuxPrefix}
+        onClose={() => {
+          setPrefixRecorderOpen(false);
+          requestAnimationFrame(() => terminal.current?.focus());
+        }}
+      />
+      {!simple ? <DropIndicator zone={dropTarget?.zone} /> : null}
+    </div>
+  );
+}
+
+function PrefixRecorderModal({
+  open,
+  workerLabel,
+  value,
+  onSave,
+  onClose,
+}: {
+  open: boolean;
+  workerLabel: string;
+  value: string;
+  onSave: (value: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = React.useState(value || defaultTmuxPrefix);
+  const recorderRef = React.useRef<HTMLDivElement | null>(null);
+
+  React.useEffect(() => {
+    if (!open) return;
+    setDraft(value || defaultTmuxPrefix);
+    void lockTerminalShortcutKeys();
+    requestAnimationFrame(() => recorderRef.current?.focus());
+    return () => {
+      unlockTerminalShortcutKeys();
+    };
+  }, [open, value]);
+
+  if (!open) return null;
+
+  function recordShortcut(event: React.KeyboardEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const native = event.nativeEvent;
+    if (native.key === "Enter" && !native.ctrlKey && !native.altKey && !native.metaKey && draft) {
+      onSave(draft);
+      return;
+    }
+    const encoded = encodeKeyEvent(native);
+    if (!encoded) return;
+    setDraft(encoded);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[80] grid place-items-center bg-background/55 p-4 backdrop-blur-sm"
+      onMouseDown={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <Card className="w-[min(420px,calc(100vw-32px))] border-border bg-card p-4 shadow-2xl">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold">tmux prefix</div>
+            <div className="truncate text-xs text-muted-foreground">{workerLabel}</div>
+          </div>
+          <Button variant="ghost" size="icon-sm" onClick={onClose} title="Close">
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+        <div
+          ref={recorderRef}
+          tabIndex={0}
+          className="mt-4 flex h-20 items-center justify-center rounded-md border border-dashed border-primary/45 bg-background text-lg font-semibold outline-none ring-offset-background focus:ring-2 focus:ring-primary/40"
+          onKeyDown={recordShortcut}
+          onClick={() => recorderRef.current?.focus()}
+        >
+          {displayControlSequence(draft)}
+        </div>
+        <div className="mt-3 text-xs text-muted-foreground">Press a shortcut, then Enter or Save.</div>
+        <div className="mt-4 flex items-center justify-between gap-2">
+          <Button variant="ghost" size="xs" onClick={() => setDraft(defaultTmuxPrefix)}>
+            Reset Ctrl-b
+          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="xs" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button variant="secondary" size="xs" onClick={() => onSave(draft)}>
+              <Check className="h-3.5 w-3.5" />
+              Save
+            </Button>
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -2396,6 +3148,12 @@ function shouldCaptureTerminalKey(event: KeyboardEvent) {
   return true;
 }
 
+function shouldSendKeyDownManually(event: KeyboardEvent) {
+  if (!shouldCaptureTerminalKey(event)) return false;
+  if (event.key.length === 1 && !event.ctrlKey && !event.altKey) return false;
+  return true;
+}
+
 function terminalHasKeyboardFocus(event: Event, element: Element | null) {
   if (!element) return false;
   if (event.target instanceof Node && element.contains(event.target)) return true;
@@ -2512,8 +3270,86 @@ function errorDetailFromResponseText(status: number, text: string) {
   return detail || `${status}`;
 }
 
+function signalGenerationErrorDetail(status: number, text: string) {
+  if (status === 401) return "The saved control token is invalid or expired. Sign in again, apply a Direct Token, or sign out to generate an anonymous share.";
+  if (status === 403) return "Direct Token access can connect to shared sessions, but cannot generate new Worker signals.";
+  if (status === 429) return "Too many anonymous signal requests. Wait a minute and try again.";
+  return errorDetailFromResponseText(status, text);
+}
+
+function webVersionSignature(data: HubVersionPayload) {
+  return [data.version, data.commit, data.build_time, data.protocol_version].filter(Boolean).join("|");
+}
+
+function versionLabel(data: HubVersionPayload) {
+  const version = data.version || "new build";
+  const commit = data.commit ? ` · ${data.commit.slice(0, 8)}` : "";
+  return `${version}${commit} is available.`;
+}
+
+function latestWorkerUpdateJob(jobs: WorkerUpdateJob[]) {
+  return jobs
+    .slice()
+    .sort((left, right) => Date.parse(right.updated_at || right.created_at || "") - Date.parse(left.updated_at || left.created_at || ""))
+    [0];
+}
+
+function workerUpdateJobActive(status: string) {
+  switch (status) {
+    case "queued":
+    case "sent":
+    case "started":
+    case "restarting":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function workerUpdateJobLabel(job: WorkerUpdateJob) {
+  const target = job.target_version || "latest";
+  if (job.status === "succeeded") return `Updated to ${target}`;
+  if (job.status === "failed") return `Update failed: ${job.message || job.id}`;
+  return `Update ${job.status || "queued"}: ${target}`;
+}
+
+function workerUpdateJobDetail(job: WorkerUpdateJob) {
+  return [job.id, job.status, job.message].filter(Boolean).join(" · ");
+}
+
+function workerUpdateRecommended(worker: WorkerView, recommendedVersion: string) {
+  if (!normalizeComparableVersion(recommendedVersion)) return false;
+  const current = normalizeComparableVersion(worker.software?.version || "");
+  const recommended = normalizeComparableVersion(recommendedVersion);
+  if (!worker.software?.version) return true;
+  if (!current || !recommended) return false;
+  return current !== recommended;
+}
+
+function normalizeComparableVersion(value: string) {
+  const normalized = value.trim().toLowerCase().replace(/^refs\/tags\//, "").replace(/^v/, "").replace(/-dirty$/, "");
+  if (!normalized || normalized === "dev" || normalized === "unknown") return "";
+  return normalized;
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
 }
 
 function setOptionalStorage(key: string, value?: string) {
@@ -2694,9 +3530,37 @@ function filterWorkers(workers: WorkerView[], query: string) {
   const needle = query.trim().toLowerCase();
   if (!needle) return workers;
   return workers.filter((worker) => {
-    const haystacks = [worker.id, worker.name, worker.addr, worker.backend, workerDisplayLabel(worker)];
+    const software = worker.software || {};
+    const haystacks = [
+      worker.id,
+      worker.name,
+      worker.addr,
+      worker.backend,
+      workerDisplayLabel(worker),
+      software.version,
+      software.commit,
+      software.os,
+      software.arch,
+      software.protocol_version,
+      software.service_backend,
+    ];
     return haystacks.some((value) => (value || "").toLowerCase().includes(needle));
   });
+}
+
+function workerPlatformLabel(worker: WorkerView) {
+  const software = worker.software;
+  if (!software?.os && !software?.arch) return "";
+  return [software.os, software.arch].filter(Boolean).join("/");
+}
+
+function workerProtocolLabel(worker: WorkerView) {
+  const version = worker.software?.protocol_version;
+  return version ? `p${version}` : "";
+}
+
+function workerHasCapability(worker: WorkerView, capability: string) {
+  return (worker.software?.capabilities || []).includes(capability);
 }
 
 function buildCWDOptions(workerID: string, sessions: SessionView[], recentCWDs: RecentCWDState) {
@@ -2757,7 +3621,11 @@ function displayControlSequence(value: string) {
     if (code >= 1 && code <= 26) return `Ctrl-${String.fromCharCode(code + 64).toLowerCase()}`;
     if (code === 0) return "Ctrl-Space";
     if (code === 27) return "Esc";
+    if (code === 9) return "Tab";
+    if (code === 13) return "Enter";
+    if (code === 127) return "Backspace";
   }
+  if (value.length === 2 && value.charCodeAt(0) === 27) return `Alt-${value[1]}`;
   return value;
 }
 

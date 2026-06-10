@@ -141,3 +141,45 @@ func Save(entry Entry) error {
 	}
 	return nil
 }
+
+func Delete(hubURL, role, deviceID string) error {
+	path, err := Path()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var cache Cache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return err
+	}
+	hubURL = NormalizeHubURL(hubURL)
+	role = strings.TrimSpace(role)
+	deviceID = strings.TrimSpace(deviceID)
+	next := cache.Entries[:0]
+	for _, existing := range cache.Entries {
+		if hubURL != "" && NormalizeHubURL(existing.HubURL) != hubURL {
+			next = append(next, existing)
+			continue
+		}
+		if role != "" && existing.Role != role {
+			next = append(next, existing)
+			continue
+		}
+		if deviceID != "" && existing.DeviceID != deviceID {
+			next = append(next, existing)
+			continue
+		}
+	}
+	cache.Entries = next
+	raw, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o600)
+}

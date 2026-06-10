@@ -2,6 +2,6 @@ tunnel: agentmux
 credentials-file: /etc/cloudflared/agentmux.json
 
 ingress:
-  - hostname: hub.example.com
+  - hostname: agentmux-cf.kinboy.wang
     service: http://127.0.0.1:8080
   - service: http_status:404

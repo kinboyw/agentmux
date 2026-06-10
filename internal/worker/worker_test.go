@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"private/agentmux/internal/credentialcache"
+	"private/agentmux/internal/protocol"
 )
 
 func TestWorkerURL(t *testing.T) {
@@ -19,6 +21,20 @@ func TestWorkerURL(t *testing.T) {
 	want := "wss://agents.example.com/ws/worker?token=secret"
 	if got != want {
 		t.Fatalf("unexpected url:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestDefaultWorkerSoftwareInventory(t *testing.T) {
+	t.Setenv("AGENTMUX_WORKER_SERVICE_BACKEND", "systemd-user")
+	software := defaultWorkerSoftware()
+	if software.ProtocolVersion != protocol.ProtocolVersion {
+		t.Fatalf("unexpected protocol version: %+v", software)
+	}
+	if software.OS != runtime.GOOS || software.Arch != runtime.GOARCH || software.ServiceBackend != "systemd-user" {
+		t.Fatalf("unexpected software inventory: %+v", software)
+	}
+	if len(software.Capabilities) == 0 {
+		t.Fatal("expected worker capabilities")
 	}
 }
 
@@ -55,6 +71,30 @@ func TestResolveAuthSavesJoinCredential(t *testing.T) {
 	}
 	if cached.Credential != "amx_cred_worker" || cached.CredentialID != "cred_worker" {
 		t.Fatalf("unexpected cached credential: %+v", cached)
+	}
+}
+
+func TestResolveAuthRejectsJoinWhenAlreadyJoinedToAnotherHub(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := credentialcache.Save(credentialcache.Entry{
+		HubURL: "https://old-hub.test", Role: "worker", DeviceID: "dev_cached",
+		DeviceName: "cached", Credential: "amx_cred_cached",
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("join should not call exchange when worker is bound to another hub")
+		return nil, nil
+	})}
+
+	_, err := ResolveAuth(context.Background(), AuthOptions{
+		HubURL: "https://new-hub.test", Join: "amx_sig_test", DeviceID: "dev_new", DeviceName: "renamed",
+	})
+	if err == nil || !strings.Contains(err.Error(), "already joined") {
+		t.Fatalf("expected already joined error, got %v", err)
 	}
 }
 

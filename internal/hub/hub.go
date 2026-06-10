@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"private/agentmux/internal/protocol"
+	buildversion "private/agentmux/internal/version"
 	"private/agentmux/internal/ws"
 )
 
@@ -42,7 +44,9 @@ type Server struct {
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
 	previews    map[string]chan protocol.Envelope
+	targets     map[string]chan protocol.Envelope
 	creates     map[string]chan protocol.Envelope
+	updateJobs  map[string]*workerUpdateJob
 	auth        AuthStore
 	rateLimiter *rateLimiter
 }
@@ -53,6 +57,7 @@ type workerConn struct {
 	name     string
 	addr     string
 	backend  string
+	software protocol.WorkerSoftware
 	lastSeen time.Time
 	conn     *ws.Conn
 	send     chan protocol.Envelope
@@ -66,11 +71,26 @@ type workerRecord struct {
 	name         string
 	addr         string
 	backend      string
+	software     protocol.WorkerSoftware
 	lastSeen     time.Time
 	connected    bool
 	disabled     bool
 	traceEnabled bool
 	debugEnabled bool
+}
+
+type workerUpdateJob struct {
+	ID                     string    `json:"id"`
+	TenantID               string    `json:"tenant_id,omitempty"`
+	WorkerID               string    `json:"worker_id"`
+	TargetVersion          string    `json:"target_version"`
+	Repo                   string    `json:"repo"`
+	Status                 string    `json:"status"`
+	Message                string    `json:"message,omitempty"`
+	AllowDisruptiveRestart bool      `json:"allow_disruptive_restart,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+	FinishedAt             time.Time `json:"finished_at,omitempty"`
 }
 
 type controlConn struct {
@@ -79,6 +99,7 @@ type controlConn struct {
 	send     chan protocol.Envelope
 	tenantID string
 	admin    bool
+	direct   bool
 	done     chan struct{}
 	close    sync.Once
 }
@@ -162,7 +183,9 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
 		previews:    map[string]chan protocol.Envelope{},
+		targets:     map[string]chan protocol.Envelope{},
 		creates:     map[string]chan protocol.Envelope{},
+		updateJobs:  map[string]*workerUpdateJob{},
 		auth:        defaultAuthStore(options.AuthStore),
 		rateLimiter: newRateLimiter(10, time.Minute),
 	}, nil
@@ -188,16 +211,19 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/", s.handleLanding)
 	mux.HandleFunc("/agentmux-mark.svg", s.handleRootAsset)
 	mux.HandleFunc("/install.sh", s.handleInstallScript)
+	mux.HandleFunc("/run.sh", s.handleRunScript)
 	mux.HandleFunc("/device", s.handleDevicePage)
 	mux.HandleFunc("/control", s.handleControlPage)
 	mux.HandleFunc("/assets/", s.handleWebAssets)
 	mux.HandleFunc("/docassets/", s.handleDocAssets)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.HandleFunc("/api/signals", s.handleSignals)
 	mux.HandleFunc("/api/join-tokens", s.handleJoinTokens)
 	mux.HandleFunc("/api/exchange", s.handleExchange)
 	mux.HandleFunc("/api/auth/register", s.handleAuthRegister)
 	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/me", s.requireAuth(s.handleAuthMe))
 	mux.HandleFunc("/api/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("/api/auth/device/start", s.handleDeviceStart)
 	mux.HandleFunc("/api/auth/device/poll", s.handleDevicePoll)
@@ -228,6 +254,38 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	info := buildversion.Get("hub")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"role":             info.Role,
+		"version":          info.Version,
+		"commit":           info.Commit,
+		"build_time":       info.BuildTime,
+		"go_version":       info.GoVersion,
+		"os":               info.OS,
+		"arch":             info.Arch,
+		"protocol_version": protocol.ProtocolVersion,
+		"capabilities": []string{
+			"api.version",
+			"worker.software_inventory",
+			"control.web",
+			"control.device_login",
+			"update.local",
+			"worker.update.remote",
+			"run.cached",
+		},
+		"compatibility": map[string]any{
+			"worker_protocol":  map[string]string{"min": "1", "preferred": protocol.ProtocolVersion},
+			"control_protocol": map[string]string{"min": "1", "preferred": protocol.ProtocolVersion},
+		},
+		"release_repo": s.releaseRepo,
+	})
 }
 
 func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
@@ -311,6 +369,16 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, installScriptTemplate, s.releaseRepo, baseURL, websocketBase(baseURL))
 }
 
+func (s *Server) handleRunScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	baseURL := s.requestBaseURL(r)
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = fmt.Fprintf(w, runScriptTemplate, s.releaseRepo, baseURL, websocketBase(baseURL))
+}
+
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
 	s.handleSignals(w, r)
 }
@@ -320,34 +388,62 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	token := bearerOrQueryToken(r)
 	auth, ok := s.authenticateRole(r, "control")
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if !ok && token != "" {
+		writeError(w, http.StatusUnauthorized, "invalid control credential")
 		return
 	}
 	tenantID := ""
-	if !auth.Admin {
-		tenantID = auth.Credential.TenantID
+	if ok {
+		if isDirectControl(auth) {
+			writeError(w, http.StatusForbidden, "direct token cannot generate join signals")
+			return
+		}
+		if !auth.Admin {
+			tenantID = auth.Credential.TenantID
+		}
+	} else if !s.rateLimiter.Allow(remoteHost(r.RemoteAddr) + "|anonymous-signals") {
+		writeError(w, http.StatusTooManyRequests, "too many anonymous signal requests")
+		return
 	}
 	minted, err := s.auth.MintSignalForTenant(tenantID, defaultSignalTTL, 0, []string{"worker:join"})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	controlSignal, err := s.auth.MintSignalForTenant(minted.TenantID, defaultSignalTTL, 1, []string{"control:join"})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	controlCredential, err := s.auth.Exchange(exchangeRequest{
+		Signal: controlSignal.Signal, Role: "control", DeviceName: "direct-share",
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	baseURL := s.requestBaseURL(r)
+	controlShareURL := baseURL + "/control?token=" + url.QueryEscape(controlCredential.Credential)
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"token":               minted.Signal,
-		"signal":              minted.Signal,
-		"signal_id":           minted.ID,
-		"tenant_id":           minted.TenantID,
-		"expires_at":          minted.ExpiresAt,
-		"uses_remaining":      minted.UsesRemaining,
-		"reusable":            minted.UsesRemaining < 0,
-		"scopes":              minted.Scopes,
-		"worker_command":      installWorkerCommand(baseURL, minted.Signal),
-		"worker_join_command": workerJoinCommand(baseURL, minted.Signal),
-		"control_command":     installControlCommand(baseURL),
-		"control_url":         baseURL + "/control",
+		"token":                   minted.Signal,
+		"signal":                  minted.Signal,
+		"signal_id":               minted.ID,
+		"tenant_id":               minted.TenantID,
+		"expires_at":              minted.ExpiresAt,
+		"uses_remaining":          minted.UsesRemaining,
+		"reusable":                minted.UsesRemaining < 0,
+		"scopes":                  minted.Scopes,
+		"direct_token":            controlCredential.Credential,
+		"direct_token_id":         controlCredential.CredentialID,
+		"direct_token_expires_at": controlCredential.ExpiresAt,
+		"control_share_url":       controlShareURL,
+		"worker_command":          installWorkerCommand(baseURL, minted.Signal),
+		"worker_join_command":     workerJoinCommand(baseURL, minted.Signal),
+		"control_command":         installControlCommand(baseURL),
+		"control_direct_command":  installControlDirectCommand(baseURL, controlCredential.Credential),
+		"control_url":             baseURL + "/control",
 	})
 }
 
@@ -403,6 +499,33 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, credential)
+}
+
+func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	auth := requestAuth(r)
+	payload := map[string]any{
+		"access_mode":   controlAccessMode(auth),
+		"role":          auth.Credential.Role,
+		"tenant_id":     auth.Credential.TenantID,
+		"device_id":     auth.Credential.DeviceID,
+		"credential_id": auth.Credential.ID,
+		"expires_at":    auth.Credential.ExpiresAt,
+	}
+	if auth.Admin {
+		payload["role"] = "admin"
+		payload["user"] = authUserView{Name: "Admin"}
+	} else if auth.Credential.UserEmail != "" {
+		payload["user"] = authUserView{
+			TenantID: auth.Credential.TenantID,
+			Email:    auth.Credential.UserEmail,
+			Name:     auth.Credential.Name,
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
@@ -555,6 +678,10 @@ func (s *Server) handleAuthOAuth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	auth := requestAuth(r)
+	if isDirectControl(auth) {
+		writeError(w, http.StatusForbidden, "direct token cannot list workers")
+		return
+	}
 	s.mu.RLock()
 	workers := make([]protocol.WorkerView, 0, len(s.workerViews))
 	for _, worker := range s.workerViews {
@@ -573,22 +700,59 @@ type workerPatchRequest struct {
 	DebugEnabled *bool `json:"debug_enabled"`
 }
 
+type workerUpdateRequest struct {
+	Version                string `json:"version"`
+	Repo                   string `json:"repo"`
+	AllowDisruptiveRestart bool   `json:"allow_disruptive_restart"`
+}
+
 func (s *Server) handleWorkerAction(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPatch {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	auth := requestAuth(r)
+	if isDirectControl(auth) {
+		writeError(w, http.StatusForbidden, "direct token cannot manage workers")
 		return
 	}
-	auth := requestAuth(r)
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/workers/"), "/")
-	if path == "" || strings.Contains(path, "/") {
+	if path == "" {
 		writeError(w, http.StatusNotFound, "worker path must be /api/workers/{id}")
 		return
 	}
-	workerID, err := url.PathUnescape(path)
+	parts := strings.Split(path, "/")
+	if len(parts) == 2 && parts[1] == "updates" {
+		workerID, err := url.PathUnescape(parts[0])
+		if err != nil || strings.TrimSpace(workerID) == "" || strings.Contains(workerID, "/") {
+			writeError(w, http.StatusBadRequest, "invalid worker id")
+			return
+		}
+		s.handleWorkerUpdates(w, r, auth, workerID)
+		return
+	}
+	if len(parts) != 1 || r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	workerID, err := url.PathUnescape(parts[0])
 	if err != nil || strings.TrimSpace(workerID) == "" || strings.Contains(workerID, "/") {
 		writeError(w, http.StatusBadRequest, "invalid worker id")
 		return
 	}
+
+	if r.Method == http.MethodDelete {
+		view, err := s.evictWorker(workerID, auth)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errWorkerNotFound) {
+				status = http.StatusNotFound
+			} else if errors.Is(err, errWorkerForbidden) {
+				status = http.StatusForbidden
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"worker": view, "status": "evicted"})
+		return
+	}
+
 	var req workerPatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -623,6 +787,163 @@ func (s *Server) handleWorkerAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"worker": view})
 }
 
+func (s *Server) handleWorkerUpdates(w http.ResponseWriter, r *http.Request, auth authContext, workerID string) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		jobs := make([]workerUpdateJob, 0)
+		for _, job := range s.updateJobs {
+			if job.WorkerID != workerID {
+				continue
+			}
+			if !auth.Admin && job.TenantID != auth.Credential.TenantID {
+				continue
+			}
+			jobs = append(jobs, *job)
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	case http.MethodPost:
+		var req workerUpdateRequest
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		if req.Version == "" {
+			req.Version = "latest"
+		}
+		if req.Repo == "" {
+			req.Repo = s.releaseRepo
+		}
+		job, err := s.startWorkerUpdate(workerID, auth, req)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errWorkerNotFound) {
+				status = http.StatusNotFound
+			} else if errors.Is(err, errWorkerForbidden) {
+				status = http.StatusForbidden
+			} else if errors.Is(err, errWorkerUnavailable) || errors.Is(err, errWorkerCapabilityMissing) || errors.Is(err, errWorkerDisruptiveUpdate) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) startWorkerUpdate(workerID string, auth authContext, req workerUpdateRequest) (workerUpdateJob, error) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	record := s.workerViews[workerID]
+	if record.id == "" {
+		s.mu.Unlock()
+		return workerUpdateJob{}, errWorkerNotFound
+	}
+	if !auth.Admin && record.tenantID != auth.Credential.TenantID {
+		s.mu.Unlock()
+		return workerUpdateJob{}, errWorkerForbidden
+	}
+	worker := s.workers[workerID]
+	if worker == nil || !record.connected {
+		s.mu.Unlock()
+		return workerUpdateJob{}, errWorkerUnavailable
+	}
+	if record.disabled {
+		s.mu.Unlock()
+		return workerUpdateJob{}, fmt.Errorf("%w: worker is disabled", errWorkerUnavailable)
+	}
+	if !hasCapability(record.software, "worker.update.apply") {
+		s.mu.Unlock()
+		return workerUpdateJob{}, errWorkerCapabilityMissing
+	}
+	if !strings.EqualFold(record.backend, "tmux") && !req.AllowDisruptiveRestart {
+		s.mu.Unlock()
+		return workerUpdateJob{}, fmt.Errorf("%w: backend %s", errWorkerDisruptiveUpdate, record.backend)
+	}
+	job := &workerUpdateJob{
+		ID: "upd_" + randomID(), TenantID: record.tenantID, WorkerID: workerID,
+		TargetVersion: req.Version, Repo: req.Repo, Status: "queued",
+		AllowDisruptiveRestart: req.AllowDisruptiveRestart,
+		CreatedAt:              now, UpdatedAt: now,
+	}
+	s.updateJobs[job.ID] = job
+	s.mu.Unlock()
+
+	payload := protocol.WorkerUpdateApply{
+		JobID: job.ID, Repo: req.Repo, Version: req.Version, Role: "worker",
+		Restart: true, AllowDisruptiveRestart: req.AllowDisruptiveRestart,
+	}
+	if err := s.sendToWorkerWithID(workerID, protocol.TypeWorkerUpdateApply, payload, "", "", job.ID); err != nil {
+		s.mu.Lock()
+		job.Status = "failed"
+		job.Message = err.Error()
+		job.UpdatedAt = time.Now().UTC()
+		job.FinishedAt = job.UpdatedAt
+		copy := *job
+		s.mu.Unlock()
+		return copy, err
+	}
+	s.mu.Lock()
+	job.Status = "sent"
+	job.Message = "update command sent"
+	job.UpdatedAt = time.Now().UTC()
+	copy := *job
+	s.mu.Unlock()
+	return copy, nil
+}
+
+var (
+	errWorkerNotFound          = errors.New("worker not found")
+	errWorkerForbidden         = errors.New("worker is not in credential tenant")
+	errWorkerUnavailable       = errors.New("worker is not connected")
+	errWorkerCapabilityMissing = errors.New("worker does not support remote update")
+	errWorkerDisruptiveUpdate  = errors.New("worker update requires disruptive restart confirmation")
+)
+
+func (s *Server) evictWorker(workerID string, auth authContext) (protocol.WorkerView, error) {
+	s.mu.Lock()
+	record := s.workerViews[workerID]
+	if record.id == "" {
+		s.mu.Unlock()
+		return protocol.WorkerView{}, errWorkerNotFound
+	}
+	if !auth.Admin && record.tenantID != auth.Credential.TenantID {
+		s.mu.Unlock()
+		return protocol.WorkerView{}, errWorkerForbidden
+	}
+	record.disabled = true
+	record.connected = false
+	record.lastSeen = time.Now().UTC()
+	worker := s.workers[workerID]
+	delete(s.workers, workerID)
+	for id := range s.sessions {
+		if strings.HasPrefix(id, workerID+"/") {
+			delete(s.sessions, id)
+		}
+	}
+	s.workerViews[workerID] = record
+	view := workerView(record)
+	s.mu.Unlock()
+
+	if worker != nil {
+		worker.close.Do(func() {
+			if worker.done != nil {
+				close(worker.done)
+			}
+		})
+		if worker.conn != nil {
+			_ = worker.conn.Close()
+		}
+	}
+	s.logger.Warn("worker evicted", "worker", workerID)
+	return view, nil
+}
+
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -639,6 +960,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 	case http.MethodPost:
 		auth := requestAuth(r)
+		if isDirectControl(auth) {
+			writeError(w, http.StatusForbidden, "direct token cannot create sessions")
+			return
+		}
 		var req protocol.CreateSession
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -690,6 +1015,10 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodDelete {
+		if isDirectControl(auth) {
+			writeError(w, http.StatusForbidden, "direct token cannot stop sessions")
+			return
+		}
 		if err := s.sendToWorker(workerID, protocol.TypeSessionKill, map[string]string{"name": name}, "", sessionID); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -699,6 +1028,10 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && len(parts) == 3 && parts[2] == "preview" {
+		if isDirectControl(auth) {
+			writeError(w, http.StatusForbidden, "direct token cannot preview sessions")
+			return
+		}
 		lines := safeQueryInt(r.URL.Query().Get("lines"), 80)
 		preview, err := s.requestSessionPreview(r.Context(), workerID, name, sessionID, lines)
 		if err != nil {
@@ -708,7 +1041,24 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, preview)
 		return
 	}
+	if r.Method == http.MethodGet && len(parts) == 3 && parts[2] == "targets" {
+		if isDirectControl(auth) {
+			writeError(w, http.StatusForbidden, "direct token cannot inspect session targets")
+			return
+		}
+		targets, err := s.requestSessionTargets(r.Context(), workerID, name, sessionID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, targets)
+		return
+	}
 	if r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "input" {
+		if isDirectControl(auth) {
+			writeError(w, http.StatusForbidden, "direct token cannot send REST input")
+			return
+		}
 		if !s.workerEnabled(workerID) {
 			writeError(w, http.StatusForbidden, "worker is disabled")
 			return
@@ -753,10 +1103,16 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		name:     hello.Name,
 		addr:     addr,
 		backend:  hello.Backend,
+		software: hello.WorkerSoftware,
 		lastSeen: time.Now().UTC(),
 		conn:     conn,
 		send:     make(chan protocol.Envelope, 64),
 		done:     make(chan struct{}),
+	}
+	if !s.workerAllowedToConnect(worker) {
+		_ = conn.Close()
+		s.logger.Warn("disabled worker connection rejected", "worker", worker.id)
+		return
 	}
 	s.registerWorker(worker)
 	defer s.unregisterWorker(worker)
@@ -775,6 +1131,16 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) workerAllowedToConnect(worker *workerConn) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	record := s.workerViews[worker.id]
+	if record.id == "" {
+		return true
+	}
+	return !record.disabled
+}
+
 func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 	auth, ok := s.authenticateRole(r, "control")
 	if !ok {
@@ -786,7 +1152,7 @@ func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("control websocket upgrade failed", "error", err)
 		return
 	}
-	control := &controlConn{id: "ctrl_" + randomID(), conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin, done: make(chan struct{})}
+	control := &controlConn{id: "ctrl_" + randomID(), conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin, direct: isDirectControl(auth), done: make(chan struct{})}
 	s.logger.Debug("control websocket connected", "control", control.id, "tenant", control.tenantID, "admin", control.admin)
 	defer s.removeControl(control)
 	go s.writeLoop("control", control.id, conn, control.send, control.done)
@@ -822,11 +1188,13 @@ func (s *Server) registerWorker(worker *workerConn) {
 	}
 	s.workers[worker.id] = worker
 	previous := s.workerViews[worker.id]
+	software := mergeWorkerSoftware(previous.software, worker.software)
 	s.workerViews[worker.id] = workerRecord{
 		id: worker.id, tenantID: worker.tenantID, name: worker.name, addr: worker.addr,
-		backend: worker.backend, lastSeen: worker.lastSeen, connected: true,
+		backend: worker.backend, software: software, lastSeen: worker.lastSeen, connected: true,
 		disabled: previous.disabled, traceEnabled: previous.traceEnabled, debugEnabled: previous.debugEnabled,
 	}
+	s.completeWorkerUpdateOnReconnectLocked(worker.id, software)
 	s.mu.Unlock()
 	s.logger.Info("worker connected", "worker", worker.id)
 }
@@ -862,6 +1230,7 @@ func (s *Server) unregisterWorker(worker *workerConn) {
 	if worker.backend != "" {
 		record.backend = worker.backend
 	}
+	record.software = mergeWorkerSoftware(record.software, worker.software)
 	s.workerViews[worker.id] = record
 	s.mu.Unlock()
 	s.logger.Info("worker disconnected", "worker", worker.id)
@@ -876,6 +1245,7 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 		if worker.backend != "" {
 			record.backend = worker.backend
 		}
+		record.software = mergeWorkerSoftware(record.software, worker.software)
 		s.workerViews[worker.id] = record
 	}
 	s.mu.Unlock()
@@ -894,14 +1264,21 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 		s.publish(env.StreamID, env)
 	case protocol.TypeSessionPreview:
 		s.completePreview(env)
+	case protocol.TypeSessionTargets:
+		s.completeTargets(env)
 	case protocol.TypeSessionCreated:
 		s.completeCreate(env)
+	case protocol.TypeWorkerUpdateResult:
+		s.completeWorkerUpdateResult(env)
 	case protocol.TypeError:
 		if env.ID != "" {
 			if s.completeCreate(env) {
 				return
 			}
 			if s.completePreview(env) {
+				return
+			}
+			if s.completeTargets(env) {
 				return
 			}
 		}
@@ -934,6 +1311,152 @@ func sessionBackend(session protocol.Session, worker workerRecord) string {
 	return worker.backend
 }
 
+func mergeWorkerSoftware(previous, next protocol.WorkerSoftware) protocol.WorkerSoftware {
+	if next.Version == "" {
+		next.Version = previous.Version
+	}
+	if next.Commit == "" {
+		next.Commit = previous.Commit
+	}
+	if next.BuildTime == "" {
+		next.BuildTime = previous.BuildTime
+	}
+	if next.GoVersion == "" {
+		next.GoVersion = previous.GoVersion
+	}
+	if next.ProtocolVersion == "" {
+		next.ProtocolVersion = previous.ProtocolVersion
+	}
+	if len(next.Capabilities) == 0 {
+		next.Capabilities = previous.Capabilities
+	}
+	if next.OS == "" {
+		next.OS = previous.OS
+	}
+	if next.Arch == "" {
+		next.Arch = previous.Arch
+	}
+	if next.InstallKind == "" {
+		next.InstallKind = previous.InstallKind
+	}
+	if next.ServiceBackend == "" {
+		next.ServiceBackend = previous.ServiceBackend
+	}
+	if next.UpdateChannel == "" {
+		next.UpdateChannel = previous.UpdateChannel
+	}
+	if next.UpdatePolicy == "" {
+		next.UpdatePolicy = previous.UpdatePolicy
+	}
+	return next
+}
+
+func hasCapability(software protocol.WorkerSoftware, capability string) bool {
+	for _, item := range software.Capabilities {
+		if item == capability {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) completeWorkerUpdateResult(env protocol.Envelope) {
+	var result protocol.WorkerUpdateResult
+	if err := env.DecodePayload(&result); err != nil {
+		return
+	}
+	jobID := result.JobID
+	if jobID == "" {
+		jobID = env.ID
+	}
+	if jobID == "" {
+		return
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.updateJobs[jobID]
+	if job == nil {
+		return
+	}
+	status := strings.ToLower(strings.TrimSpace(result.Status))
+	switch status {
+	case "started":
+		job.Status = "running"
+	case "restarting":
+		job.Status = "restarting"
+	case "failed", "rejected":
+		job.Status = status
+		job.FinishedAt = now
+	case "succeeded":
+		job.Status = "succeeded"
+		job.FinishedAt = now
+	default:
+		if status != "" {
+			job.Status = status
+		}
+	}
+	if result.Message != "" {
+		job.Message = result.Message
+	}
+	if result.Version != "" && result.Version != "latest" {
+		job.TargetVersion = result.Version
+	}
+	job.UpdatedAt = now
+}
+
+func (s *Server) completeWorkerUpdateOnReconnectLocked(workerID string, software protocol.WorkerSoftware) {
+	now := time.Now().UTC()
+	for _, job := range s.updateJobs {
+		if job.WorkerID != workerID || !workerUpdateActive(job.Status) {
+			continue
+		}
+		if !workerUpdateVersionMatches(job.TargetVersion, software.Version) {
+			continue
+		}
+		job.Status = "succeeded"
+		job.Message = "worker reconnected with version " + firstNonEmpty(software.Version, "unknown")
+		job.UpdatedAt = now
+		job.FinishedAt = now
+	}
+}
+
+func workerUpdateActive(status string) bool {
+	switch strings.ToLower(status) {
+	case "queued", "sent", "running", "restarting":
+		return true
+	default:
+		return false
+	}
+}
+
+func workerUpdateVersionMatches(target, actual string) bool {
+	target = normalizeVersionString(target)
+	actual = normalizeVersionString(actual)
+	if target == "" {
+		return actual != ""
+	}
+	if target == "latest" {
+		return actual != ""
+	}
+	return actual == target
+}
+
+func normalizeVersionString(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "refs/tags/")
+	return value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func workerView(worker workerRecord) protocol.WorkerView {
 	status := "offline"
 	if worker.connected {
@@ -945,6 +1468,7 @@ func workerView(worker workerRecord) protocol.WorkerView {
 		Name:         worker.name,
 		Addr:         worker.addr,
 		Backend:      worker.backend,
+		Software:     worker.software,
 		LastSeen:     worker.lastSeen,
 		Status:       status,
 		Online:       worker.connected,
@@ -978,14 +1502,19 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, "worker is disabled")
 			return
 		}
-		var size protocol.TerminalSize
-		if err := env.DecodePayload(&size); err != nil {
+		var open protocol.TerminalOpen
+		if err := env.DecodePayload(&open); err != nil {
 			sendError(control.send, env.SessionID, err.Error())
 			return
 		}
-		s.logger.Debug("control open stream", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows)
+		if control.direct && open.Target != nil {
+			sendError(control.send, env.SessionID, "direct token cannot open targeted panes")
+			return
+		}
+		size := open.Size()
+		s.logger.Debug("control open stream", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows, "pane_id", terminalTargetPane(open.Target))
 		s.addSubscriber(env.StreamID, control)
-		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, size, name, env.SessionID, env.StreamID); err != nil {
+		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, open, name, env.SessionID, env.StreamID); err != nil {
 			s.logger.Debug("control open forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
 		}
@@ -1128,6 +1657,48 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 	}
 }
 
+func (s *Server) requestSessionTargets(ctx context.Context, workerID, name, sessionID string) (protocol.SessionTargets, error) {
+	requestID := "targets_" + randomID()
+	reply := make(chan protocol.Envelope, 1)
+	s.logger.Debug("targets request start", "worker", workerID, "session_id", sessionID, "request_id", requestID)
+	s.mu.Lock()
+	s.targets[requestID] = reply
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.targets, requestID)
+		s.mu.Unlock()
+	}()
+
+	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionTargets, protocol.SessionTargetsRequest{}, name, sessionID, requestID); err != nil {
+		s.logger.Debug("targets request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
+		return protocol.SessionTargets{}, err
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return protocol.SessionTargets{}, ctx.Err()
+	case <-timer.C:
+		s.logger.Debug("targets request timed out", "worker", workerID, "session_id", sessionID, "request_id", requestID)
+		return protocol.SessionTargets{}, fmt.Errorf("session targets timed out")
+	case env := <-reply:
+		if env.Type == protocol.TypeError {
+			var payload protocol.ErrorPayload
+			_ = env.DecodePayload(&payload)
+			s.logger.Debug("targets request error", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", payload.Message)
+			return protocol.SessionTargets{}, errors.New(payload.Message)
+		}
+		var targets protocol.SessionTargets
+		if err := env.DecodePayload(&targets); err != nil {
+			s.logger.Debug("targets response decode failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
+			return protocol.SessionTargets{}, err
+		}
+		s.logger.Debug("targets request complete", "worker", workerID, "session_id", sessionID, "request_id", requestID, "targets", len(targets.Targets))
+		return targets, nil
+	}
+}
+
 func (s *Server) requestSessionSync(workerID string) {
 	time.Sleep(150 * time.Millisecond)
 	_ = s.sendToWorker(workerID, protocol.TypeSessionSync, nil, "", "")
@@ -1218,6 +1789,30 @@ func (s *Server) completePreview(env protocol.Envelope) bool {
 	default:
 	}
 	return true
+}
+
+func (s *Server) completeTargets(env protocol.Envelope) bool {
+	if env.ID == "" {
+		return false
+	}
+	s.mu.RLock()
+	reply := s.targets[env.ID]
+	s.mu.RUnlock()
+	if reply == nil {
+		return false
+	}
+	select {
+	case reply <- env:
+	default:
+	}
+	return true
+}
+
+func terminalTargetPane(target *protocol.TerminalTarget) string {
+	if target == nil {
+		return ""
+	}
+	return target.PaneID
 }
 
 func (s *Server) sendToWorker(workerID, messageType string, payload any, name, sessionID string, streamID ...string) error {
@@ -1326,6 +1921,23 @@ func (s *Server) authenticateRole(r *http.Request, role string) (authContext, bo
 func requestAuth(r *http.Request) authContext {
 	auth, _ := r.Context().Value(authContextKey{}).(authContext)
 	return auth
+}
+
+func controlAccessMode(auth authContext) string {
+	if auth.Admin {
+		return "admin"
+	}
+	if auth.Credential.Role == "control" && auth.Credential.UserEmail == "" {
+		return "direct"
+	}
+	if auth.Credential.Role == "control" {
+		return "account"
+	}
+	return auth.Credential.Role
+}
+
+func isDirectControl(auth authContext) bool {
+	return controlAccessMode(auth) == "direct"
 }
 
 func authTenantID(auth authContext) string {
@@ -1473,14 +2085,58 @@ HUB_HTTP="%s"
 HUB_WS="%s"
 BIN_DIR="${AGENTMUX_BIN_DIR:-$HOME/.local/bin}"
 BIN="$BIN_DIR/agentmux"
+HUB_BIN="$BIN_DIR/agentmux-hub"
 TUI_BIN="$BIN_DIR/agentmux-tui"
 
 mkdir -p "$BIN_DIR"
 
-if command -v agentmux >/dev/null 2>&1; then
-  BIN="$(command -v agentmux)"
+verify_sha256() {
+  archive="$1"
+  checksum_file="$2"
+  expected="$(cut -d ' ' -f 1 "$checksum_file" | head -n 1)"
+  if [ -z "$expected" ]; then
+    echo "empty checksum file: $checksum_file" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$archive" | cut -d ' ' -f 1)"
+  else
+    echo "sha256 verification requires sha256sum or shasum" >&2
+    exit 1
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "sha256 mismatch for $archive" >&2
+    echo "expected: $expected" >&2
+    echo "actual:   $actual" >&2
+    exit 1
+  fi
+}
+
+case "$ROLE" in
+  worker|control)
+    ASSET_ROLE="$ROLE"
+    INSTALL_BIN="$BIN"
+    ;;
+  hub)
+    ASSET_ROLE="hub"
+    INSTALL_BIN="$HUB_BIN"
+    ;;
+  *)
+    echo "usage: install.sh worker|control|hub [agentmux flags]" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$ROLE" = "hub" ] && command -v agentmux-hub >/dev/null 2>&1; then
+  INSTALL_BIN="$(command -v agentmux-hub)"
+elif command -v agentmux >/dev/null 2>&1; then
+  INSTALL_BIN="$(command -v agentmux)"
+elif command -v go >/dev/null 2>&1 && [ "$ROLE" = "hub" ] && [ -f "./cmd/agentmux-hub/main.go" ]; then
+  go build -o "$INSTALL_BIN" ./cmd/agentmux-hub
 elif command -v go >/dev/null 2>&1 && [ -f "./cmd/agentmux/main.go" ]; then
-  go build -o "$BIN" ./cmd/agentmux
+  go build -o "$INSTALL_BIN" ./cmd/agentmux
 elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   arch="$(uname -m)"
@@ -1493,7 +2149,8 @@ elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
     linux|darwin) ;;
     *) echo "unsupported OS: $os" >&2; exit 1 ;;
   esac
-  asset="agentmux-${os}-${arch}.tar.gz"
+  asset_base="agentmux-${ASSET_ROLE}-${os}-${arch}"
+  asset="${asset_base}.tar.gz"
   if [ "$VERSION" = "latest" ]; then
     url="https://github.com/${REPO}/releases/latest/download/${asset}"
   else
@@ -1502,29 +2159,163 @@ elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "Downloading $url" >&2
-  curl -fsSL "$url" -o "$tmp/$asset"
+  if ! curl -fsSL "$url" -o "$tmp/$asset"; then
+    if [ "$ROLE" = "hub" ]; then
+      exit 1
+    fi
+    legacy_base="agentmux-${os}-${arch}"
+    asset_base="$legacy_base"
+    asset="${legacy_base}.tar.gz"
+    if [ "$VERSION" = "latest" ]; then
+      url="https://github.com/${REPO}/releases/latest/download/${asset}"
+    else
+      url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+    fi
+    echo "Falling back to $url" >&2
+    curl -fsSL "$url" -o "$tmp/$asset"
+  fi
+  checksum_url="${url}.sha256"
+  echo "Verifying $checksum_url" >&2
+  curl -fsSL "$checksum_url" -o "$tmp/$asset.sha256"
+  verify_sha256 "$tmp/$asset" "$tmp/$asset.sha256"
   tar -xzf "$tmp/$asset" -C "$tmp"
-  install -m 0755 "$tmp/agentmux-${os}-${arch}" "$BIN"
+  install -m 0755 "$tmp/${asset_base}" "$INSTALL_BIN"
 else
   echo "agentmux binary is not installed." >&2
   echo "Install curl+tar, put agentmux in PATH, or run this script from a source checkout with Go installed." >&2
   exit 1
 fi
 
-if [ "$BIN" != "$TUI_BIN" ]; then
-  ln -sf "$BIN" "$TUI_BIN" 2>/dev/null || true
+if [ "$ROLE" = "control" ] && [ "$INSTALL_BIN" != "$TUI_BIN" ]; then
+  ln -sf "$INSTALL_BIN" "$TUI_BIN" 2>/dev/null || true
 fi
 
 case "$ROLE" in
   worker)
-    exec "$BIN" worker join --hub "$HUB_WS" "$@"
+    exec "$INSTALL_BIN" worker join --hub "$HUB_WS" "$@"
     ;;
   control)
-    exec "$BIN" control login --hub "$HUB_HTTP" "$@"
+    exec "$INSTALL_BIN" control login --hub "$HUB_HTTP" "$@"
     ;;
+  hub)
+    exec "$INSTALL_BIN" hub "$@"
+    ;;
+esac
+`
+
+const runScriptTemplate = `#!/bin/sh
+set -eu
+
+TARGET="${1:-control@latest}"
+shift || true
+
+ROLE="${TARGET%%@*}"
+VERSION="${TARGET#*@}"
+if [ "$ROLE" = "$VERSION" ]; then
+  VERSION="${AGENTMUX_VERSION:-latest}"
+fi
+
+REPO="${AGENTMUX_REPO:-%s}"
+HUB_HTTP="%s"
+HUB_WS="%s"
+CACHE_DIR="${AGENTMUX_CACHE_DIR:-$HOME/.cache/agentmux}"
+
+case "$ROLE" in
+  worker|control|hub) ;;
   *)
-    echo "usage: install.sh worker|control [agentmux flags]" >&2
+    echo "usage: run.sh worker|control|hub[@version] [agentmux flags]" >&2
     exit 2
+    ;;
+esac
+
+verify_sha256() {
+  archive="$1"
+  checksum_file="$2"
+  expected="$(cut -d ' ' -f 1 "$checksum_file" | head -n 1)"
+  if [ -z "$expected" ]; then
+    echo "empty checksum file: $checksum_file" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$archive" | cut -d ' ' -f 1)"
+  else
+    echo "sha256 verification requires sha256sum or shasum" >&2
+    exit 1
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "sha256 mismatch for $archive" >&2
+    echo "expected: $expected" >&2
+    echo "actual:   $actual" >&2
+    exit 1
+  fi
+}
+
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+esac
+case "$os" in
+  linux|darwin) ;;
+  *) echo "unsupported OS: $os" >&2; exit 1 ;;
+esac
+
+asset_role="$ROLE"
+asset_base="agentmux-${asset_role}-${os}-${arch}"
+asset="${asset_base}.tar.gz"
+if [ "$ROLE" = "hub" ]; then
+  bin_name="agentmux-hub"
+else
+  bin_name="agentmux"
+fi
+cache_bin="$CACHE_DIR/releases/$VERSION/$ROLE/${os}-${arch}/$bin_name"
+
+if [ ! -x "$cache_bin" ]; then
+  mkdir -p "$(dirname "$cache_bin")"
+  if [ "$VERSION" = "latest" ]; then
+    url="https://github.com/${REPO}/releases/latest/download/${asset}"
+  else
+    url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+  fi
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  echo "Downloading $url" >&2
+  if ! curl -fsSL "$url" -o "$tmp/$asset"; then
+    if [ "$ROLE" = "hub" ]; then
+      exit 1
+    fi
+    legacy_base="agentmux-${os}-${arch}"
+    asset_base="$legacy_base"
+    asset="${legacy_base}.tar.gz"
+    if [ "$VERSION" = "latest" ]; then
+      url="https://github.com/${REPO}/releases/latest/download/${asset}"
+    else
+      url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+    fi
+    echo "Falling back to $url" >&2
+    curl -fsSL "$url" -o "$tmp/$asset"
+  fi
+  checksum_url="${url}.sha256"
+  echo "Verifying $checksum_url" >&2
+  curl -fsSL "$checksum_url" -o "$tmp/$asset.sha256"
+  verify_sha256 "$tmp/$asset" "$tmp/$asset.sha256"
+  tar -xzf "$tmp/$asset" -C "$tmp"
+  install -m 0755 "$tmp/${asset_base}" "$cache_bin"
+fi
+
+case "$ROLE" in
+  control)
+    exec "$cache_bin" control app --hub "$HUB_HTTP" "$@"
+    ;;
+  worker)
+    exec "$cache_bin" worker --hub "$HUB_WS" "$@"
+    ;;
+  hub)
+    exec "$cache_bin" "$@"
     ;;
 esac
 `
@@ -1866,9 +2657,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .lang { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 3px; background: rgba(7, 10, 10, .72); }
     .lang button { min-height: 26px; border: 0; border-radius: 999px; padding: 0 9px; color: var(--muted); background: transparent; font-size: 12px; }
     .lang button.active { background: rgba(54, 214, 147, .18); color: var(--text); }
-    main { width: min(1360px, calc(100% - 44px)); margin: 0 auto; }
-    .hero { display: grid; grid-template-columns: minmax(0, .9fr) minmax(540px, 1.15fr); gap: 34px; align-items: center; padding: 62px 0 36px; }
+    main { width: min(1420px, calc(100% - 44px)); margin: 0 auto; }
+    .hero { display: grid; grid-template-columns: minmax(0, .78fr) minmax(620px, 1.35fr); gap: 32px; align-items: center; padding: 62px 0 36px; }
     h1 { margin: 0; font-size: clamp(43px, 6.4vw, 84px); line-height: .95; letter-spacing: 0; max-width: 780px; }
+    html[lang="zh-CN"] h1 { font-size: clamp(36px, 4.7vw, 64px); line-height: 1.08; max-width: 690px; }
     .lead { margin: 22px 0 0; max-width: 710px; color: var(--muted); font-size: 18px; line-height: 1.62; }
     .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 28px; }
     .status { width: 100%; color: var(--muted); font-size: 13px; }
@@ -1882,9 +2674,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       box-shadow: 0 28px 90px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .04);
       transform: perspective(1400px) rotateY(-3deg) rotateX(2deg);
     }
-    .visual-button { width: 100%; display: block; min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent; text-align: left; transform: none; }
+    .visual-button { width: 100%; display: block; min-height: 0; padding: 0; border: 0; border-radius: 0; background: #050707; text-align: left; transform: none; }
     .visual-button:hover { transform: none; }
-    .hero-visual img, .visual img { display: block; width: 100%; height: auto; }
+    .hero-visual img, .visual img { display: block; width: 100%; aspect-ratio: 16 / 9; height: auto; object-fit: contain; background: #050707; }
     .hero-visual .caption { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding: 10px 12px; color: var(--muted); font-size: 12px; background: rgba(6, 8, 8, .7); }
     .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; padding: 22px 0 52px; }
     .card, .panel, .visual {
@@ -1901,12 +2693,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .section-head h2, .panel h2 { margin: 0; font-size: 24px; }
     .section-head p, .panel p { margin: 5px 0 0; color: var(--muted); line-height: 1.5; }
     .visuals { display: grid; gap: 18px; padding: 0 0 56px; }
-    .visual { display: grid; grid-template-columns: minmax(0, 1.36fr) minmax(280px, .64fr); overflow: hidden; transition: transform .18s ease, border-color .18s ease; }
+    .visual { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(260px, .55fr); overflow: hidden; transition: transform .18s ease, border-color .18s ease; }
     .visual:hover { transform: translateY(-2px); border-color: rgba(54, 214, 147, .42); }
-    .visual:nth-child(even) { grid-template-columns: minmax(280px, .64fr) minmax(0, 1.36fr); }
+    .visual:nth-child(even) { grid-template-columns: minmax(260px, .55fr) minmax(0, 1.7fr); }
     .visual:nth-child(even) .visual-copy { order: -1; border-left: 0; border-right: 1px solid var(--line); }
-    .visual .visual-button { background: #050707; }
-    .visual img { min-height: 280px; object-fit: cover; }
     .visual-copy { padding: 20px; border-left: 1px solid var(--line); display: flex; flex-direction: column; justify-content: center; }
     .visual h2 { margin: 0 0 8px; font-size: 19px; }
     .visual p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
@@ -1918,6 +2708,8 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
     .command { border: 1px solid var(--line); border-radius: 7px; background: rgba(3, 5, 5, .82); overflow: hidden; }
     .command-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; padding: 8px 10px; }
+    .command-actions { display: flex; align-items: center; gap: 7px; }
+    .command-actions a, .command-actions button { min-height: 27px; border-radius: 6px; padding: 0 8px; font-size: 12px; }
     pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #d7e5df; font-size: 13px; line-height: 1.55; }
     .footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; padding: 18px 0 34px; display: flex; justify-content: space-between; gap: 16px; }
     .lightbox { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center; padding: 26px; background: rgba(0, 0, 0, .76); backdrop-filter: blur(16px); }
@@ -1941,13 +2733,13 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       .hero { padding-top: 36px; }
       .hero-visual { transform: none; }
       .visual-copy, .visual:nth-child(even) .visual-copy { order: 0; border-left: 0; border-right: 0; border-top: 1px solid var(--line); }
-      .visual img { min-height: 0; object-fit: contain; }
       .section-head, .panel-head, .footer { align-items: flex-start; flex-direction: column; }
     }
     @media (max-width: 620px) {
       .navlinks { gap: 8px; }
       .navlinks a:not(.github-link):not(.version-link) { display: none; }
       h1 { font-size: 42px; }
+      html[lang="zh-CN"] h1 { font-size: 34px; line-height: 1.12; }
       .lead { font-size: 16px; }
       .lightbox { padding: 10px; }
     }
@@ -1975,9 +2767,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     <main>
       <section class="hero">
         <div>
-          <div class="pill"><span class="dot"></span><span data-i18n="eyebrow">Open-source tmux control plane for coding agents</span></div>
+          <div class="pill"><span class="dot"></span><span data-i18n="eyebrow">Open-source terminal control plane for coding agents</span></div>
           <h1 data-i18n="heroTitle">Bring every agent session back to one hub.</h1>
-          <p class="lead" data-i18n="heroLead">AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux sessions, Hub routes identity and WebSockets, Control gives you a browser and CLI surface from anywhere.</p>
+          <p class="lead" data-i18n="heroLead">AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux or PTY sessions, Hub routes identity and WebSockets, Control gives you browser and TUI access from anywhere.</p>
           <div class="actions">
             <button id="mint" class="primary" data-i18n="generateSignal">Generate join signal</button>
             <a class="button" href="/control" data-i18n="openControl">Open Web Control</a>
@@ -1997,9 +2789,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       </section>
 
       <section class="cards">
-        <div class="card"><h2 data-i18n="cardAgentTitle">Agent-unaware</h2><p data-i18n="cardAgentBody">No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.</p></div>
+        <div class="card"><h2 data-i18n="cardAgentTitle">Agent-unaware</h2><p data-i18n="cardAgentBody">No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the terminal layer.</p></div>
         <div class="card"><h2 data-i18n="cardCloudTitle">Cloudflare-ready</h2><p data-i18n="cardCloudBody">Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.</p></div>
-        <div class="card"><h2 data-i18n="cardControlTitle">Multi-session control</h2><p data-i18n="cardControlBody">The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.</p></div>
+        <div class="card"><h2 data-i18n="cardControlTitle">Multi-session control</h2><p data-i18n="cardControlBody">Registered Control supports workspaces, previews, Worker management, and updates. Direct Token sharing stays limited to session list and terminal access.</p></div>
       </section>
 
       <section aria-label="AgentMux architecture visuals">
@@ -2014,7 +2806,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
             <button class="visual-button" type="button" data-full="/docassets/onboarding.png" data-title="Signal onboarding">
               <img src="/docassets/onboarding.png" alt="AgentMux signal onboarding flow">
             </button>
-            <div class="visual-copy"><h2 data-i18n="onboardingTitle">Signal onboarding</h2><p data-i18n="onboardingBody">Generate a short-lived signal, exchange it for scoped credentials, then connect workers and controls.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
+            <div class="visual-copy"><h2 data-i18n="onboardingTitle">Signal onboarding</h2><p data-i18n="onboardingBody">Generate a short-lived Worker signal plus a Direct Token share URL, then connect machines and anonymous Control devices.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
           </article>
           <article class="visual">
             <button class="visual-button" type="button" data-full="/docassets/cloudflare-deployment.png" data-title="Cloudflare deployment">
@@ -2026,7 +2818,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
             <button class="visual-button" type="button" data-full="/docassets/web-control-workspace.png" data-title="Web Control workspace">
               <img src="/docassets/web-control-workspace.png" alt="AgentMux Web Control multi-pane workspace">
             </button>
-            <div class="visual-copy"><h2 data-i18n="workspaceTitle">Multi-pane Web Control</h2><p data-i18n="workspaceBody">Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
+            <div class="visual-copy"><h2 data-i18n="workspaceTitle">Multi-pane Web Control</h2><p data-i18n="workspaceBody">Operate multiple long-lived terminal sessions from a compact browser workspace.</p><span class="hint" data-i18n="clickZoom">Click to inspect</span></div>
           </article>
         </div>
       </section>
@@ -2035,7 +2827,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="panel-head">
           <div>
             <h2 data-i18n="quickTitle">Quick Start</h2>
-            <p data-i18n="quickLead">This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your tmux sessions, then open Web Control from this browser.</p>
+            <p data-i18n="quickLead">This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your sessions, then open the Web Control share URL or copy the Direct Token into TUI.</p>
           </div>
           <button id="mint2" data-i18n="generate">Generate</button>
         </div>
@@ -2046,11 +2838,11 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
           </div>
           <div class="command">
             <div class="command-title"><span data-i18n="workerStep">Worker side</span></div>
-            <pre data-i18n="workerStepBody">Click Generate to create a short-lived command for the machine running tmux and agents.</pre>
+            <pre data-i18n="workerStepBody">Click Generate to create a short-lived command for the machine running agents.</pre>
           </div>
           <div class="command">
             <div class="command-title"><span data-i18n="controlStep">Control side</span></div>
-            <pre data-i18n="controlStepBody">After the Worker is connected, sign in to Web Control or run agentmux control login to manage tmux-backed agent workspaces.</pre>
+            <pre data-i18n="controlStepBody">After the Worker is connected, open the share URL for simple Direct Token access, or sign in for the full management workspace.</pre>
           </div>
         </div>
       </section>
@@ -2084,7 +2876,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       </section>
 
       <footer class="footer">
-        <span data-i18n="footerSecurity">Default admin token stays local. Worker signals exchange into scoped credentials; Control devices sign in.</span>
+        <span data-i18n="footerSecurity">Anonymous shares are scoped Direct Tokens. Registered Control accounts unlock Worker management, updates, previews, and workspaces.</span>
         <span><span data-i18n="footerDocs">Docs</span>: README.md · docs/USAGE.md · docs/API.md · docs/PRODUCT_ARCHITECTURE.md · <a class="with-icon" href="{{.GitHubURL}}" rel="noreferrer"><svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>{{.ReleaseRepo}}</a></span>
       </footer>
     </main>
@@ -2107,52 +2899,59 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         navControl: 'Web Control',
         navQuick: 'Quick Start',
         navGithub: 'GitHub',
-        eyebrow: 'Open-source tmux control plane for coding agents',
+        eyebrow: 'Open-source terminal control plane for coding agents',
         heroTitle: 'Bring every agent session back to one hub.',
-        heroLead: 'AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux sessions, Hub routes identity and WebSockets, Control gives you a browser and CLI surface from anywhere.',
+        heroLead: 'AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux or PTY sessions, Hub routes identity and WebSockets, Control gives you browser and TUI access from anywhere.',
         generateSignal: 'Generate join signal',
         openControl: 'Open Web Control',
         openGithub: 'Open-source on GitHub',
         heroVisual: 'Hub, Worker, Control and WSS relay architecture',
         clickZoom: 'Click to inspect',
         cardAgentTitle: 'Agent-unaware',
-        cardAgentBody: 'No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the shell/tmux layer.',
+        cardAgentBody: 'No agent SDK, callback server, or vendor-specific remote feature. AgentMux attaches below the agent at the terminal layer.',
         cardCloudTitle: 'Cloudflare-ready',
         cardCloudBody: 'Run Hub behind Cloudflare Tunnel or a proxy. HTTPS becomes WSS, and workers keep outbound-only connectivity by default.',
         cardControlTitle: 'Multi-session control',
-        cardControlBody: 'The Web Control surface supports resizable panes, drag placement, session creation, and browser credentials.',
+        cardControlBody: 'Registered Control supports workspaces, previews, Worker management, and updates. Direct Token sharing stays limited to session list and terminal access.',
         visualTitle: 'Architecture in practice',
         visualLead: 'Large technical diagrams are embedded directly into the Hub landing page and can be opened for detail review.',
         onboardingTitle: 'Signal onboarding',
-        onboardingBody: 'Generate a short-lived signal, exchange it for scoped credentials, then connect workers and controls.',
+        onboardingBody: 'Generate a short-lived Worker signal plus a Direct Token share URL, then connect machines and anonymous Control devices.',
         cloudflareTitle: 'Cloudflare-ready deployment',
         cloudflareBody: 'Keep Hub and SQLite on your server while Cloudflare terminates HTTPS and WSS through a tunnel.',
         workspaceTitle: 'Multi-pane Web Control',
-        workspaceBody: 'Operate multiple long-lived tmux-backed agent sessions from a compact browser workspace.',
+        workspaceBody: 'Operate multiple long-lived terminal sessions from a compact browser workspace.',
         quickTitle: 'Quick Start',
-        quickLead: 'This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your tmux sessions, then open Web Control from this browser.',
+        quickLead: 'This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your sessions, then open the Web Control share URL or copy the Direct Token into TUI.',
         generate: 'Generate',
         currentHub: 'Current Hub',
         workerStep: 'Worker side',
-        workerStepBody: 'Click Generate to create a short-lived command for the machine running tmux and agents.',
+        workerStepBody: 'Click Generate to create a short-lived command for the machine running agents.',
         controlStep: 'Control side',
-        controlStepBody: 'After the Worker is connected, sign in to Web Control or run agentmux-tui with this Hub URL to manage tmux-backed agent workspaces.',
+        controlStepBody: 'After the Worker is connected, open the share URL for simple Direct Token access, or sign in for the full management workspace.',
         selfHostTitle: 'Self-host Hub',
         selfHostLead: 'Only use this when you want to run your own Hub. The Docker image already defaults to port 8081 and stores data under /var/lib/agentmux.',
         runHubBinary: 'Run Hub with binary',
         runHubDocker: 'Run Hub with Docker',
         runHubPersist: 'Optional Docker persistence',
         quickTunnel: 'Optional tunnel when Hub has no public URL',
-        footerSecurity: 'Default admin token stays local. Worker signals exchange into scoped credentials; Control devices sign in.',
+        footerSecurity: 'Anonymous shares are scoped Direct Tokens. Registered Control accounts unlock Worker management, updates, previews, and workspaces.',
         footerDocs: 'Docs',
         generating: 'Generating signal...',
         failed: 'Failed: ',
+        invalidControlToken: 'The saved control token is invalid or expired. Sign in again, apply a Direct Token, or clear the token to generate an anonymous share.',
+        directTokenCannotGenerate: 'Direct Token access can only connect to shared sessions. Sign in with an account or open this Hub without a token to generate a new share.',
+        rateLimited: 'Too many anonymous signal requests. Wait a minute and try again.',
         signalReady: 'Signal ready · expires ',
         signal: 'Signal',
         workerCommand: 'Worker install + join command',
         workerJoinCommand: 'Installed Worker join command',
         webControl: 'Web Control',
+        directToken: 'Direct Token',
+        webControlShare: 'Web Control share URL',
+        controlDirectCommand: 'TUI Direct Token command',
         controlCommand: 'TUI Control command',
+        open: 'Open',
         copy: 'Copy',
         copied: 'Copied'
       },
@@ -2160,52 +2959,59 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         navControl: '网页控制台',
         navQuick: '快速开始',
         navGithub: 'GitHub',
-        eyebrow: '面向 coding agent 的开源 tmux 控制平面',
+        eyebrow: '面向 coding agent 的开源终端控制平面',
         heroTitle: '把所有 agent 会话收回到一个 Hub。',
-        heroLead: 'AgentMux 让 Codex、Claude、Gemini、OpenCode 和普通 shell 完全无感。Worker 管理本地 tmux 会话，Hub 负责身份与 WebSocket 路由，Control 让你从浏览器或 CLI 在任意设备接管会话。',
+        heroLead: 'AgentMux 让 Codex、Claude、Gemini、OpenCode 和普通 shell 完全无感。Worker 管理本地 tmux 或 PTY 会话，Hub 负责身份与 WebSocket 路由，Control 让你从浏览器或 TUI 在任意设备接管会话。',
         generateSignal: '生成接入信令',
         openControl: '打开网页控制台',
         openGithub: '在 GitHub 查看源码',
         heroVisual: 'Hub、Worker、Control 与 WSS 中继架构',
         clickZoom: '点击查看大图',
         cardAgentTitle: 'Agent 无感',
-        cardAgentBody: '不依赖 agent SDK、回调服务或厂商远程能力。AgentMux 在 shell/tmux 层接入，agent 只看到本地终端。',
+        cardAgentBody: '不依赖 agent SDK、回调服务或厂商远程能力。AgentMux 在终端层接入，agent 只看到本地终端。',
         cardCloudTitle: '适配 Cloudflare',
         cardCloudBody: 'Hub 可以放在 Cloudflare Tunnel 或反向代理之后。HTTPS 自动对应 WSS，Worker 默认只需要出站连接。',
         cardControlTitle: '多会话控制',
-        cardControlBody: 'Web Control 支持可调整窗格、拖拽布局、会话创建，以及浏览器侧凭证。',
+        cardControlBody: '注册 Control 支持工作区、预览、Worker 管理和更新。Direct Token 分享只保留会话列表和终端连接。',
         visualTitle: '架构如何落地',
         visualLead: '关键技术图示直接嵌入 Hub 落地页，点击即可放大查看细节。',
         onboardingTitle: '信令接入流程',
-        onboardingBody: '生成限时信令，交换为受限凭证，然后接入 Worker 与 Control。',
+        onboardingBody: '生成限时 Worker 信令和 Direct Token 分享链接，然后接入机器与匿名 Control 设备。',
         cloudflareTitle: 'Cloudflare 部署形态',
         cloudflareBody: 'Hub 和 SQLite 留在自己的服务器上，由 Cloudflare 通过 Tunnel 承载 HTTPS 与 WSS。',
         workspaceTitle: '多窗格网页控制台',
         workspaceBody: '在紧凑的浏览器工作区里操作多个长期运行的 tmux agent 会话。',
         quickTitle: '快速开始',
-        quickLead: '当前 Hub 已经在运行。生成接入信令，在拥有 tmux 会话的机器上运行 Worker 命令，然后从当前浏览器打开 Web Control。',
+        quickLead: '当前 Hub 已经在运行。生成接入信令，在拥有会话的机器上运行 Worker 命令，然后打开 Web Control 分享链接，或把 Direct Token 复制到 TUI。',
         generate: '生成',
         currentHub: '当前 Hub',
         workerStep: 'Worker 侧',
-        workerStepBody: '点击生成，为运行 tmux 和 agent 的机器创建一条限时 Worker 接入命令。',
+        workerStepBody: '点击生成，为运行 agent 的机器创建一条限时 Worker 接入命令。',
         controlStep: 'Control 侧',
-        controlStepBody: 'Worker 接入后，登录 Web Control，或者用当前 Hub 地址运行 agentmux-tui 来管理 tmux agent 工作区。',
+        controlStepBody: 'Worker 接入后，打开分享链接即可简单连接会话；登录账号后可使用完整管理工作区。',
         selfHostTitle: '自托管 Hub',
         selfHostLead: '只有当你想运行自己的 Hub 时才需要这里。Docker 镜像已默认使用 8081 端口，并把数据放在 /var/lib/agentmux。',
         runHubBinary: '用二进制运行 Hub',
         runHubDocker: '用 Docker 运行 Hub',
         runHubPersist: '可选 Docker 持久化',
         quickTunnel: 'Hub 无公网地址时可选穿透',
-        footerSecurity: '默认管理员 token 保持本地使用。Worker 信令会交换为受限凭证；Control 设备通过登录接入。',
+        footerSecurity: '匿名分享使用受限 Direct Token；注册 Control 账号可使用 Worker 管理、更新、预览和工作区。',
         footerDocs: '文档',
         generating: '正在生成信令...',
         failed: '失败：',
+        invalidControlToken: '已保存的 control token 无效或已过期。请重新登录、输入 Direct Token，或清空 token 后生成匿名分享。',
+        directTokenCannotGenerate: 'Direct Token 只能连接已分享的会话。请登录账号，或不带 token 打开 Hub 后再生成新的分享。',
+        rateLimited: '匿名信令生成过于频繁，请稍等一分钟后再试。',
         signalReady: '信令已就绪 · 过期时间 ',
         signal: '信令',
         workerCommand: 'Worker 安装并接入命令',
         workerJoinCommand: '已安装 Worker 接入命令',
         webControl: '网页控制台',
+        directToken: 'Direct Token 口令',
+        webControlShare: '网页控制台分享链接',
+        controlDirectCommand: 'TUI Direct Token 命令',
         controlCommand: 'TUI Control 命令',
+        open: '打开',
         copy: '复制',
         copied: '已复制'
       }
@@ -2233,18 +3039,34 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
       status.textContent = t('generating');
       const res = await fetch('/api/signals', { method: 'POST' });
       if (!res.ok) {
-        status.textContent = t('failed') + await res.text();
+        status.textContent = signalErrorMessage(res.status, await res.text());
         return;
       }
       const data = await res.json();
       const signal = data.signal || data.token;
       status.textContent = t('signalReady') + new Date(data.expires_at).toLocaleString();
       result.innerHTML =
-        commandBlock(t('signal'), signal, false) +
+        commandBlock(t('signal'), signal, true) +
         commandBlock(t('workerCommand'), data.worker_command, true) +
         commandBlock(t('workerJoinCommand'), data.worker_join_command || '', true) +
-        commandBlock(t('webControl'), data.control_url, false) +
-        commandBlock(t('controlCommand'), data.control_command, true);
+        commandBlock(t('directToken'), data.direct_token || '', true) +
+        linkBlock(t('webControlShare'), data.control_share_url || data.control_url) +
+        commandBlock(t('controlDirectCommand'), data.control_direct_command || data.control_command, true);
+    }
+    function signalErrorMessage(statusCode, text) {
+      if (statusCode === 401) return t('invalidControlToken');
+      if (statusCode === 403) return t('directTokenCannotGenerate');
+      if (statusCode === 429) return t('rateLimited');
+      return t('failed') + responseErrorDetail(text);
+    }
+    function responseErrorDetail(text) {
+      if (!text) return '';
+      try {
+        const payload = JSON.parse(text);
+        return payload.error || text;
+      } catch {
+        return text;
+      }
     }
     function setLanguage(lang) {
       currentLang = dictionaries[lang] ? lang : 'en';
@@ -2265,8 +3087,14 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     }
     function commandBlock(title, value, copyable) {
       return '<div class="command"><div class="command-title"><span>' + escapeHTML(title) + '</span>' +
-        (copyable ? '<button data-copy="' + escapeAttr(value) + '" onclick="copyValue(this)">' + escapeHTML(t('copy')) + '</button>' : '') +
+        (copyable ? '<div class="command-actions"><button data-copy="' + escapeAttr(value) + '" onclick="copyValue(this)">' + escapeHTML(t('copy')) + '</button></div>' : '') +
         '</div><pre>' + escapeHTML(value) + '</pre></div>';
+    }
+    function linkBlock(title, value) {
+      return '<div class="command"><div class="command-title"><span>' + escapeHTML(title) + '</span>' +
+        '<div class="command-actions"><a href="' + escapeAttr(value) + '">' + escapeHTML(t('open')) + '</a>' +
+        '<button data-copy="' + escapeAttr(value) + '" onclick="copyValue(this)">' + escapeHTML(t('copy')) + '</button></div>' +
+        '</div><pre><a href="' + escapeAttr(value) + '">' + escapeHTML(value) + '</a></pre></div>';
     }
     async function copyValue(button) {
       await navigator.clipboard.writeText(button.getAttribute('data-copy') || '');

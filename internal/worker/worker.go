@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +35,7 @@ type AuthOptions struct {
 	Join       string
 	DeviceID   string
 	DeviceName string
+	InstanceID string
 }
 
 type AuthResult struct {
@@ -55,12 +60,23 @@ type ExchangedCredential struct {
 	Scopes       []string  `json:"scopes"`
 }
 
+type ExchangeHTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e ExchangeHTTPError) Error() string {
+	return fmt.Sprintf("POST /api/exchange failed: %s: %s", e.Status, e.Body)
+}
+
 type Worker struct {
 	HubURL   string
 	Token    string
 	ID       string
 	Name     string
 	Version  string
+	Software protocol.WorkerSoftware
 	Backend  sessionbackend.Backend
 	Logger   *slog.Logger
 	Interval time.Duration
@@ -82,10 +98,55 @@ func New(hubURL, token, id, name string, backend sessionbackend.Backend, logger 
 	}
 	return &Worker{
 		HubURL: hubURL, Token: token, ID: id, Name: name, Version: "dev",
-		Backend: backend, Logger: logger, Interval: time.Second,
+		Software: defaultWorkerSoftware(),
+		Backend:  backend, Logger: logger, Interval: time.Second,
 		streams: map[string]context.CancelFunc{},
 		terms:   map[string]sessionbackend.Stream{},
 	}
+}
+
+func defaultWorkerSoftware() protocol.WorkerSoftware {
+	return protocol.WorkerSoftware{
+		Version:         "dev",
+		GoVersion:       runtime.Version(),
+		OS:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		ProtocolVersion: protocol.ProtocolVersion,
+		Capabilities:    append([]string(nil), protocol.DefaultWorkerCapabilities...),
+		InstallKind:     getenv("AGENTMUX_WORKER_INSTALL_KIND", "process"),
+		ServiceBackend:  getenv("AGENTMUX_WORKER_SERVICE_BACKEND", "process"),
+		UpdateChannel:   getenv("AGENTMUX_UPDATE_CHANNEL", "stable"),
+		UpdatePolicy:    getenv("AGENTMUX_UPDATE_POLICY", "manual"),
+	}
+}
+
+func getenv(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func IsRetryableAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var httpErr ExchangeHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusRequestTimeout || httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return !errors.Is(urlErr.Err, context.Canceled)
+	}
+	return false
 }
 
 func ResolveAuth(ctx context.Context, opts AuthOptions) (AuthResult, error) {
@@ -99,7 +160,13 @@ func ResolveAuth(ctx context.Context, opts AuthOptions) (AuthResult, error) {
 		deviceID = deviceName
 	}
 	if opts.Join != "" {
-		credential, err := ExchangeSignalDetail(ctx, hubURL, opts.Join, deviceID, deviceName)
+		if existing, ok := credentialcache.LoadLatest("worker", ""); ok {
+			existingHub := credentialcache.NormalizeHubURL(existing.HubURL)
+			if existingHub != "" && hubURL != "" && existingHub != hubURL {
+				return AuthResult{}, fmt.Errorf("worker is already joined to %s; run worker leave before joining %s", existingHub, hubURL)
+			}
+		}
+		credential, err := ExchangeSignalDetail(ctx, hubURL, opts.Join, deviceID, deviceName, opts.InstanceID)
 		if err != nil {
 			return AuthResult{}, err
 		}
@@ -144,7 +211,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	backoff := 2 * time.Second
 	for {
 		if err := w.runOnce(ctx, target); err != nil && ctx.Err() == nil {
-			w.Logger.Error("worker connection failed", "error", err)
+			w.Logger.Error("worker connection failed; retrying", "retry_in", backoff.String(), "error", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -163,7 +230,11 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 		return err
 	}
 	defer conn.Close()
-	hello, _ := protocol.NewEnvelope(protocol.TypeWorkerHello, protocol.WorkerHello{Name: w.Name, Version: w.Version, Backend: w.Backend.Name()})
+	software := w.Software
+	if software.Version == "" {
+		software.Version = w.Version
+	}
+	hello, _ := protocol.NewEnvelope(protocol.TypeWorkerHello, protocol.WorkerHello{Name: w.Name, Backend: w.Backend.Name(), WorkerSoftware: software})
 	hello.WorkerID = w.ID
 	if err := writeEnvelope(conn, hello); err != nil {
 		return err
@@ -263,6 +334,28 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			reply.WorkerID = w.ID
 			reply.SessionID = env.SessionID
 			_ = writeEnvelope(conn, reply)
+		case protocol.TypeSessionTargets:
+			_, name, ok := protocol.SplitSessionID(env.SessionID)
+			if !ok {
+				name = payloadName(env)
+			}
+			w.Logger.Debug("targets request received", "session_id", env.SessionID, "name", name, "request_id", env.ID)
+			targets := []protocol.TerminalTarget{{SessionName: name}}
+			if backend, ok := w.Backend.(sessionbackend.TargetBackend); ok {
+				items, err := backend.Targets(ctx, name)
+				if err != nil {
+					w.Logger.Debug("targets request failed", "session_id", env.SessionID, "name", name, "request_id", env.ID, "error", err)
+					w.sendRequestError(conn, env.ID, env.SessionID, err.Error())
+					continue
+				}
+				targets = protocolTargets(items)
+			}
+			reply, _ := protocol.NewEnvelope(protocol.TypeSessionTargets, protocol.SessionTargets{Targets: targets})
+			reply.ID = env.ID
+			reply.WorkerID = w.ID
+			reply.SessionID = env.SessionID
+			w.Logger.Debug("targets request complete", "session_id", env.SessionID, "name", name, "request_id", env.ID, "targets", len(targets))
+			_ = writeEnvelope(conn, reply)
 		case protocol.TypeTerminalInput:
 			_, name, ok := protocol.SplitSessionID(env.SessionID)
 			if !ok {
@@ -284,10 +377,14 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			if !ok {
 				name = payloadName(env)
 			}
-			var size protocol.TerminalSize
-			_ = env.DecodePayload(&size)
-			w.Logger.Debug("terminal open received", "session_id", env.SessionID, "stream_id", env.StreamID, "name", name, "cols", size.Cols, "rows", size.Rows)
-			w.startStream(ctx, conn, env.StreamID, protocol.SessionID(w.ID, name), name, size)
+			var open protocol.TerminalOpen
+			if err := env.DecodePayload(&open); err != nil {
+				w.sendStreamError(conn, env.StreamID, env.SessionID, err.Error())
+				continue
+			}
+			size := open.Size()
+			w.Logger.Debug("terminal open received", "session_id", env.SessionID, "stream_id", env.StreamID, "name", name, "cols", size.Cols, "rows", size.Rows, "pane_id", protocolTargetPane(open.Target))
+			w.startStream(ctx, conn, env.StreamID, protocol.SessionID(w.ID, name), name, size, open.Target)
 		case protocol.TypeTerminalResize:
 			var size protocol.TerminalSize
 			if err := env.DecodePayload(&size); err != nil {
@@ -302,8 +399,112 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 		case protocol.TypeTerminalClose:
 			w.Logger.Debug("terminal close received", "session_id", env.SessionID, "stream_id", env.StreamID)
 			w.stopStream(env.StreamID)
+		case protocol.TypeWorkerUpdateApply:
+			w.handleUpdateApply(conn, env)
 		}
 	}
+}
+
+func (w *Worker) handleUpdateApply(conn *ws.Conn, env protocol.Envelope) {
+	var req protocol.WorkerUpdateApply
+	if err := env.DecodePayload(&req); err != nil {
+		w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: firstNonEmpty(req.JobID, env.ID), Status: "failed", Message: err.Error()})
+		return
+	}
+	if req.JobID == "" {
+		req.JobID = env.ID
+	}
+	if req.Version == "" {
+		req.Version = "latest"
+	}
+	if req.Role == "" {
+		req.Role = "worker"
+	}
+	if req.Role != "worker" {
+		w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "rejected", Version: req.Version, Message: "worker can only apply worker updates"})
+		return
+	}
+	backend := strings.ToLower(w.Backend.Name())
+	if backend != "tmux" && !req.AllowDisruptiveRestart {
+		w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "rejected", Version: req.Version, Message: "worker update requires disruptive restart confirmation for backend " + backend})
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "failed", Version: req.Version, Message: err.Error()})
+		return
+	}
+	args := []string{"update", "apply", "--role", "worker", "--version", req.Version, "--path", executable}
+	if req.Repo != "" {
+		args = append(args, "--repo", req.Repo)
+	}
+	serviceBackend := strings.ToLower(w.Software.ServiceBackend)
+	if supervisedWorkerService(serviceBackend) {
+		w.Logger.Info("worker supervised update started", "job", req.JobID, "version", req.Version, "service_backend", serviceBackend)
+		w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "started", Version: req.Version, Message: "staging update"})
+		go func() {
+			cmd := exec.Command(executable, args...)
+			cmd.Env = append(os.Environ(), "AGENTMUX_UPDATE_JOB_ID="+req.JobID)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				w.Logger.Error("worker supervised update failed", "job", req.JobID, "error", err, "output", strings.TrimSpace(string(output)))
+				w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "failed", Version: req.Version, Message: compactUpdateOutput(err, output)})
+				return
+			}
+			w.Logger.Info("worker supervised update staged", "job", req.JobID, "version", req.Version)
+			w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "restarting", Version: req.Version, Message: "update staged; worker exiting for service restart"})
+			time.Sleep(250 * time.Millisecond)
+			os.Exit(0)
+		}()
+		return
+	}
+	if req.Restart {
+		args = append(args, "--restart")
+	}
+	cmd := exec.Command(executable, args...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "AGENTMUX_UPDATE_JOB_ID="+req.JobID)
+	if err := cmd.Start(); err != nil {
+		w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "failed", Version: req.Version, Message: err.Error()})
+		return
+	}
+	w.Logger.Info("worker update started", "job", req.JobID, "version", req.Version, "pid", cmd.Process.Pid)
+	w.sendUpdateResult(conn, env.ID, protocol.WorkerUpdateResult{JobID: req.JobID, Status: "started", Version: req.Version, Message: fmt.Sprintf("pid=%d", cmd.Process.Pid)})
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			w.Logger.Error("worker update process failed", "job", req.JobID, "error", err)
+			return
+		}
+		w.Logger.Info("worker update process exited", "job", req.JobID)
+	}()
+}
+
+func supervisedWorkerService(serviceBackend string) bool {
+	switch serviceBackend {
+	case "systemd-user", "launchd":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactUpdateOutput(err error, output []byte) string {
+	text := strings.TrimSpace(string(output))
+	if text == "" {
+		return err.Error()
+	}
+	if len(text) > 600 {
+		text = text[:600] + "..."
+	}
+	return err.Error() + ": " + text
+}
+
+func (w *Worker) sendUpdateResult(conn *ws.Conn, requestID string, result protocol.WorkerUpdateResult) {
+	reply, _ := protocol.NewEnvelope(protocol.TypeWorkerUpdateResult, result)
+	reply.ID = requestID
+	reply.WorkerID = w.ID
+	_ = writeEnvelope(conn, reply)
 }
 
 func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
@@ -326,14 +527,14 @@ func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
 	return writeEnvelope(conn, env)
 }
 
-func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, sessionID, name string, size protocol.TerminalSize) {
+func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, sessionID, name string, size protocol.TerminalSize, target *protocol.TerminalTarget) {
 	if name == "" || streamID == "" {
 		w.Logger.Debug("terminal open ignored", "session_id", sessionID, "stream_id", streamID, "name", name)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
-	w.Logger.Debug("terminal backend open start", "session_id", sessionID, "stream_id", streamID, "name", name, "cols", size.Cols, "rows", size.Rows)
-	terminal, err := w.Backend.Open(ctx, name, size.Cols, size.Rows)
+	w.Logger.Debug("terminal backend open start", "session_id", sessionID, "stream_id", streamID, "name", name, "cols", size.Cols, "rows", size.Rows, "pane_id", protocolTargetPane(target))
+	terminal, err := w.openTerminalTarget(ctx, name, size, target)
 	if err != nil {
 		w.Logger.Debug("terminal backend open failed", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
 		w.sendStreamError(conn, streamID, sessionID, err.Error())
@@ -377,6 +578,33 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 			}
 		}
 	}()
+}
+
+func (w *Worker) openTerminalTarget(ctx context.Context, name string, size protocol.TerminalSize, target *protocol.TerminalTarget) (sessionbackend.Stream, error) {
+	if target != nil && target.PaneID != "" {
+		backend, ok := w.Backend.(sessionbackend.TargetBackend)
+		if !ok {
+			return nil, fmt.Errorf("worker backend %s does not support pane targets", w.Backend.Name())
+		}
+		item := sessionbackend.TerminalTarget{
+			SessionName:  firstNonEmpty(target.SessionName, name),
+			WindowID:     target.WindowID,
+			WindowIndex:  target.WindowIndex,
+			WindowName:   target.WindowName,
+			WindowActive: target.WindowActive,
+			PaneID:       target.PaneID,
+			PaneIndex:    target.PaneIndex,
+			PaneActive:   target.PaneActive,
+			CWD:          target.CWD,
+			Command:      target.Command,
+			Left:         target.Left,
+			Top:          target.Top,
+			Width:        target.Width,
+			Height:       target.Height,
+		}
+		return backend.OpenTarget(ctx, item, size.Cols, size.Rows)
+	}
+	return w.Backend.Open(ctx, name, size.Cols, size.Rows)
 }
 
 func (w *Worker) removeStream(streamID string) {
@@ -495,14 +723,14 @@ func (w *Worker) sendStreamError(conn *ws.Conn, streamID, sessionID, message str
 }
 
 func ExchangeSignal(ctx context.Context, hubURL, signal, deviceID, deviceName string) (string, string, error) {
-	payload, err := ExchangeSignalDetail(ctx, hubURL, signal, deviceID, deviceName)
+	payload, err := ExchangeSignalDetail(ctx, hubURL, signal, deviceID, deviceName, "")
 	if err != nil {
 		return "", "", err
 	}
 	return payload.Credential, payload.DeviceID, nil
 }
 
-func ExchangeSignalDetail(ctx context.Context, hubURL, signal, deviceID, deviceName string) (ExchangedCredential, error) {
+func ExchangeSignalDetail(ctx context.Context, hubURL, signal, deviceID, deviceName string, instanceID ...string) (ExchangedCredential, error) {
 	base, err := httpBaseURL(hubURL)
 	if err != nil {
 		return ExchangedCredential{}, err
@@ -512,6 +740,9 @@ func ExchangeSignalDetail(ctx context.Context, hubURL, signal, deviceID, deviceN
 		"role":        "worker",
 		"device_id":   deviceID,
 		"device_name": deviceName,
+	}
+	if len(instanceID) > 0 && strings.TrimSpace(instanceID[0]) != "" {
+		req["instance_id"] = strings.TrimSpace(instanceID[0])
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -529,7 +760,11 @@ func ExchangeSignalDetail(ctx context.Context, hubURL, signal, deviceID, deviceN
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return ExchangedCredential{}, fmt.Errorf("POST /api/exchange failed: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return ExchangedCredential{}, ExchangeHTTPError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       strings.TrimSpace(string(data)),
+		}
 	}
 	var payload ExchangedCredential
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -589,6 +824,45 @@ func payloadName(env protocol.Envelope) string {
 	}
 	_ = env.DecodePayload(&payload)
 	return payload.Name
+}
+
+func protocolTargets(targets []sessionbackend.TerminalTarget) []protocol.TerminalTarget {
+	result := make([]protocol.TerminalTarget, 0, len(targets))
+	for _, target := range targets {
+		result = append(result, protocol.TerminalTarget{
+			SessionName:  target.SessionName,
+			WindowID:     target.WindowID,
+			WindowIndex:  target.WindowIndex,
+			WindowName:   target.WindowName,
+			WindowActive: target.WindowActive,
+			PaneID:       target.PaneID,
+			PaneIndex:    target.PaneIndex,
+			PaneActive:   target.PaneActive,
+			CWD:          target.CWD,
+			Command:      target.Command,
+			Left:         target.Left,
+			Top:          target.Top,
+			Width:        target.Width,
+			Height:       target.Height,
+		})
+	}
+	return result
+}
+
+func protocolTargetPane(target *protocol.TerminalTarget) string {
+	if target == nil {
+		return ""
+	}
+	return target.PaneID
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func readEnvelope(conn *ws.Conn) (protocol.Envelope, error) {

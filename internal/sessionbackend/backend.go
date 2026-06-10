@@ -32,6 +32,28 @@ type Backend interface {
 	Open(ctx context.Context, name string, cols int, rows int) (Stream, error)
 }
 
+type TerminalTarget struct {
+	SessionName  string
+	WindowID     string
+	WindowIndex  int
+	WindowName   string
+	WindowActive bool
+	PaneID       string
+	PaneIndex    int
+	PaneActive   bool
+	CWD          string
+	Command      string
+	Left         int
+	Top          int
+	Width        int
+	Height       int
+}
+
+type TargetBackend interface {
+	Targets(ctx context.Context, name string) ([]TerminalTarget, error)
+	OpenTarget(ctx context.Context, target TerminalTarget, cols int, rows int) (Stream, error)
+}
+
 func ValidateSessionName(name string) error {
 	if !sessionNamePattern.MatchString(name) {
 		return fmt.Errorf("invalid session name %q", name)

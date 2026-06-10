@@ -5,9 +5,9 @@
 AgentMux should feel like a ZeroTier-style control plane for coding agents:
 
 1. Open the Hub landing page.
-2. Generate a short-lived join signal.
+2. Generate a short-lived Worker signal and a scoped Direct Token.
 3. Paste a one-line command on a worker machine.
-4. Open a control surface from any trusted device.
+4. Open the generated Web Control share URL or use the Direct Token from TUI.
 5. Manage long-lived agent sessions without the agent knowing anything about
    remote access.
 
@@ -56,8 +56,8 @@ Worker is an outbound connector.
 
 - Joins a hub using a short-lived signal or registered-user token.
 - Maintains a long-lived device identity after enrollment.
-- Reports local tmux sessions.
-- Creates, attaches, resizes, and stops tmux-backed agent sessions.
+- Reports local terminal sessions.
+- Creates, attaches, resizes, and stops tmux-backed or built-in PTY agent sessions.
 - Never requires inbound ports in the default relay mode.
 
 ### Control
@@ -84,14 +84,14 @@ Stack:
 - xterm.js for terminal rendering.
 - resizable pane layout for multi-session work.
 
-Expected UX:
+Implemented UX:
 
 - Collapsible navigation/sidebar.
 - Multi-pane session layout with draggable resize handles.
 - Multiple concurrently attached sessions.
 - Login/register flow that returns scoped control credentials.
+- Direct Token mode for anonymous shared-session access.
 - GitHub and Google OAuth entry points behind provider-specific API routes.
-- Workspace/tenant selector after registered-user auth lands.
 - UI status, auth, and session metadata outside terminal buffers.
 
 Deployment model:
@@ -107,6 +107,10 @@ Current implementation boundary:
 - Password hashing is a development placeholder using standard-library SHA-256.
 - GitHub/Google OAuth routes exist and return a structured "not configured"
   response until provider config and callback handling are implemented.
+- Direct Token access is intentionally limited to listing shared sessions,
+  opening an existing session stream, and switching sessions. It cannot create
+  or stop sessions, generate join signals, list or manage Workers, load
+  previews, use workspaces, or trigger version/update features.
 - Production auth should add persistent storage, password KDF such as Argon2id
   or external identity only, secure cookies/session rotation, CSRF protection,
   revocation, audit logs, and tenant/workspace policy enforcement.
@@ -129,13 +133,14 @@ SQLite file.
 
 ### Anonymous Flow
 
-Anonymous users can generate a temporary join signal from the Hub landing page.
+Anonymous users can generate a temporary Worker join signal and a Control
+Direct Token from the Hub landing page.
 
 Properties:
 
 - Short TTL, for example 10 minutes.
 - Limited scope.
-- Limited number of uses.
+- Worker signal and Direct Token are tenant-scoped.
 - No durable account ownership.
 - Good for local demos, trusted personal machines, and quick trials.
 
@@ -163,30 +168,51 @@ Initial scopes:
 - `worker:join`
 - `control:join`
 
+The landing page presents URLs as links with copy actions, and tokens/commands
+as code blocks with copy actions. The generated Web Control share URL carries
+the Direct Token:
+
+```text
+https://hub.example.com/control?token=amx_cred_xxx
+```
+
+The matching TUI path is:
+
+```bash
+agentmux-tui --hub https://hub.example.com --token 'amx_cred_xxx'
+```
+
 ### Registered Flow
 
-Registered users get durable workspaces and stronger controls.
+Registered users get the full management surface and stronger controls.
 
 Capabilities:
 
 - persistent workers
 - multiple controls
-- named workspaces
+- Web Control workspaces
 - access policies
 - audit logs
 - session history
 - worker labels
 - team sharing
-- direct-mode coordination
+- Worker enable/disable, eviction, and update orchestration
 
-Registered users should still use short-lived join signals for new devices, but
-the resulting worker/control gets a durable device credential.
+Registered users should still use short-lived join signals for new Workers, but
+the generated signal is attached to the registered tenant. Control devices can
+use browser sign-in, device login, or generated Direct Tokens depending on the
+desired access boundary.
 
 The current prototype exposes:
 
 ```text
 POST /api/auth/register
 POST /api/auth/login
+GET  /api/auth/me
+POST /api/auth/refresh
+POST /api/auth/device/start
+POST /api/auth/device/poll
+POST /api/auth/device/approve
 GET  /api/auth/oauth/{github|google}
 ```
 
@@ -220,9 +246,8 @@ Response:
 }
 ```
 
-The current in-memory implementation may issue reusable credentials for a short
-period. Production credentials should be revocable, auditable, tenant-scoped,
-and persisted.
+Credentials are tenant-scoped and persisted when Hub runs with `--data`.
+Production credentials should add revocation and audit trails.
 
 ![AgentMux token and tenant model](assets/visuals/agentmux-6-token-and-tenant-model-v1.png)
 
@@ -239,12 +264,10 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- worker \
   --name "$(hostname)"
 ```
 
-Control CLI:
+Control share:
 
 ```bash
-curl -fsSL https://hub.example.com/install.sh | sh -s -- control \
-  --hub https://hub.example.com \
-  --join amx_sig_xxx
+agentmux-tui --hub https://hub.example.com --token 'amx_cred_xxx'
 ```
 
 For local development:
@@ -255,10 +278,38 @@ go run ./cmd/agentmux worker --hub ws://127.0.0.1:8081 --join amx_sig_xxx --name
 
 `--join` performs signal exchange and uses the returned credential as the
 runtime bearer token. `--token` remains as a local development/admin override.
+Worker keeps a stable local instance id, so the same Worker instance cannot
+reuse the same signal by changing only `--name`. If a Worker was accidentally
+joined to the wrong Hub, run `agentmux worker leave` before joining again.
 
 The `/install.sh` endpoint is intentionally conservative: it uses an existing
 `agentmux` binary from `PATH`, builds from source when run inside a checkout, or
-downloads the matching Linux/macOS release archive from GitHub.
+downloads the matching role-specific Linux/macOS release archive from GitHub.
+Release assets are split by role so Hub can ship as a smaller cross-platform
+binary; Windows support starts with `agentmux-hub-windows-amd64.tar.gz` while
+Worker and terminal Control remain Linux/macOS until the Windows PTY/service
+model is implemented.
+
+## Update Model
+
+AgentMux should support both installed updates and `npx`-style cached execution.
+
+- Hub and Worker are service-like roles. They should update through staged,
+  verified binaries and explicit restarts. Docker Hub deployments should update
+  by replacing the container image rather than mutating binaries inside the
+  container.
+- Control CLI/TUI can support a faster `agentmux run control@latest` workflow
+  that downloads a verified binary into a versioned cache and executes it
+  without changing the installed binary.
+- Remote Worker update should be Hub-orchestrated and backend-aware. It is safe
+  by default for tmux-backed sessions because tmux state survives Worker
+  restart, but PTY-backed sessions require a disruptive-restart confirmation.
+- Compatibility is capability-driven: Hub, Worker, and Control publish protocol
+  versions and capabilities, and UI/API paths degrade when an older endpoint is
+  missing an optional capability.
+
+See [In-Place Update Strategy](UPDATE_STRATEGY.md) for the command model,
+protocol additions, persistence tables, and rollout phases.
 
 ## Trust and Token Model
 
@@ -273,6 +324,9 @@ Use three token classes:
    - long-lived
    - scoped to worker/control
    - revocable from Hub
+
+   A Control credential without a user email is treated as a Direct Token. It is
+   scoped to shared-session connection and cannot mutate Hub/Worker state.
 
 3. Hub admin token
    - deployment/local-development control plane override
@@ -294,7 +348,7 @@ expires_at = signal expiry or short anonymous workspace TTL
 Registered onboarding attaches signals and credentials to a durable tenant:
 
 ```text
-tenant_id = org_<id>
+tenant_id = tenant_<id>
 user_id = usr_<id>
 ```
 
@@ -305,13 +359,9 @@ memory or SQLite. Worker connectivity and terminal streams remain runtime state.
 
 - Persist tenant records, workers, layouts, revocations, and audit events in
   SQLite.
-- Add explicit scopes to every API and WebSocket route.
 - Add credential revocation and expiry cleanup.
-- Vendor xterm.js assets into Go embed; remove CDN dependency.
-- Split Web control code into static files before it grows further.
 - Add worker policy: allowed commands, allowed working directories, max sessions.
 - Add session ownership/audit events.
-- Add registered-user auth and tenant selection.
 - Add direct-mode signaling after relay mode is stable.
 
 ## Routing Modes
@@ -400,7 +450,7 @@ The Go CLI should remain a debug tool. The product-grade control should be web.
 GitHub Actions now provide two tracks:
 
 - CI on pushes and pull requests: Go tests, Web Control build, binary build.
-- Release on `v*` tags: cross-compiled Linux and macOS tarballs. Windows assets are deferred until the terminal backend has a native ConPTY path.
+- Release on `v*` tags: role-specific Linux/macOS tarballs plus Hub-only Windows artifacts.
 - Docker image publishing on `v*` tags: multi-arch Linux images are pushed to `ghcr.io/kinboyw/agentmux`.
 
 The release build rebuilds Web Control and embeds it into `internal/hub/webdist`

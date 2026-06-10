@@ -20,7 +20,7 @@ WebSocket endpoints accept either the same Authorization header or:
 ### `GET /control`
 
 Serves the browser control shell. Pass either a development/admin token or a
-short-lived signal:
+short-lived signal/direct token:
 
 ```text
 http://127.0.0.1:8081/control?token=<token>
@@ -49,12 +49,29 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_
 Control mode:
 
 ```bash
-curl -fsSL https://hub.example.com/install.sh | sh -s -- control --join 'amx_sig_...'
+curl -fsSL https://hub.example.com/install.sh | sh -s -- control
 ```
 
 The script uses an existing `agentmux` in `PATH`, builds from source when run
-inside a checkout, or downloads a matching Linux/macOS release archive from
-GitHub.
+inside a checkout, or downloads a matching role-specific Linux/macOS release
+archive from GitHub. Worker and Control install commands prefer
+`agentmux-worker-*` and `agentmux-control-*` assets, with fallback to legacy
+`agentmux-*` assets. Hub-only Windows artifacts are published separately as
+`agentmux-hub-windows-amd64.tar.gz`.
+
+### `GET /run.sh`
+
+Serves an `npx`-style cached runner. It downloads and verifies a release asset
+under `~/.cache/agentmux`, then executes it without changing the installed
+binary.
+
+```bash
+curl -fsSL https://hub.example.com/run.sh | sh -s -- control@latest
+curl -fsSL https://hub.example.com/run.sh | sh -s -- hub@v0.1.0 --addr 127.0.0.1:8081
+```
+
+Control defaults to `control app --hub <current-hub>`. Worker defaults to
+`worker --hub <current-hub-ws>`.
 
 ### `GET /health`
 
@@ -64,11 +81,42 @@ Returns hub liveness.
 {"status":"ok"}
 ```
 
+### `GET /api/version`
+
+Returns Hub build metadata. This endpoint is unauthenticated so the landing page
+and Web Control can detect refresh/update opportunities.
+
+```json
+{
+  "role": "hub",
+  "version": "v0.1.0",
+  "commit": "abc1234",
+  "build_time": "2026-06-10T12:00:00Z",
+  "go_version": "go1.26.4",
+  "os": "linux",
+  "arch": "amd64",
+  "protocol_version": "1",
+  "capabilities": ["api.version", "worker.software_inventory"],
+  "compatibility": {
+    "worker_protocol": {"min": "1", "preferred": "1"},
+    "control_protocol": {"min": "1", "preferred": "1"}
+  },
+  "release_repo": "kinboyw/agentmux"
+}
+```
+
 ### `POST /api/signals`
 
-Mints a short-lived bootstrap signal. The landing page calls this endpoint
-without authentication. A signal cannot call normal API or WebSocket routes
-directly; worker and control clients must exchange it for a credential.
+Mints a short-lived Worker bootstrap signal and a scoped Control Direct Token.
+This endpoint supports anonymous generation when no token is supplied. If a
+registered Control credential or admin token is supplied, the generated material
+is scoped to that tenant. Direct Token credentials cannot call this endpoint,
+and invalid supplied credentials return `401` instead of silently falling back
+to anonymous generation.
+
+A raw signal cannot call normal API or WebSocket routes directly; Worker must
+exchange it for a credential. The generated Direct Token is already a scoped
+Control credential and is limited to simple shared-session access.
 
 Response:
 
@@ -81,10 +129,16 @@ Response:
   "expires_at": "2026-06-09T12:10:00Z",
   "uses_remaining": -1,
   "reusable": true,
-  "scopes": ["worker:join", "control:join"],
+  "scopes": ["worker:join"],
   "worker_command": "curl -fsSL http://127.0.0.1:8081/install.sh | sh -s -- worker --join 'amx_sig_...' --name \"$(hostname)\"",
-  "control_command": "curl -fsSL http://127.0.0.1:8081/install.sh | sh -s -- control --join 'amx_sig_...'",
-  "control_url": "http://127.0.0.1:8081/control?signal=amx_sig_..."
+  "worker_join_command": "agentmux worker join --hub 'ws://127.0.0.1:8081' --join 'amx_sig_...' --name \"$(hostname)\"",
+  "direct_token": "amx_cred_...",
+  "direct_token_id": "cred_...",
+  "direct_token_expires_at": "2026-06-09T12:10:00Z",
+  "control_share_url": "http://127.0.0.1:8081/control?token=amx_cred_...",
+  "control_direct_command": "agentmux-tui --hub 'http://127.0.0.1:8081' --token 'amx_cred_...'",
+  "control_command": "agentmux-tui --hub 'http://127.0.0.1:8081'",
+  "control_url": "http://127.0.0.1:8081/control"
 }
 ```
 
@@ -95,6 +149,11 @@ commands and `control_url` use that URL instead of request-local host headers.
 Use a stable hostname for production. With `cloudflared tunnel --url`, copy the
 printed `https://*.trycloudflare.com` URL and restart Hub with that value before
 generating join commands.
+
+Direct Token access is intentionally restricted. It can list shared sessions and
+open existing session streams. It cannot generate new signals, list or manage
+Workers, create/stop sessions, send REST input, load previews, inspect targets,
+open targeted panes, or use registered-account features.
 
 ### `POST /api/exchange`
 
@@ -128,14 +187,122 @@ Response:
 ### `GET /api/workers`
 
 Returns connected workers.
+Direct Token credentials receive `403`.
 
 ```json
 {
   "workers": [
-    {"id":"local","name":"local","addr":"127.0.0.1","last_seen":"2026-06-08T12:00:00Z"}
+    {
+      "id":"local",
+      "name":"local",
+      "addr":"127.0.0.1",
+      "backend":"tmux",
+      "software":{
+        "version":"v0.1.0",
+        "commit":"abc1234",
+        "protocol_version":"1",
+        "capabilities":["session.snapshot","terminal.open"],
+        "os":"linux",
+        "arch":"amd64",
+        "service_backend":"systemd-user",
+        "update_policy":"manual"
+      },
+      "last_seen":"2026-06-08T12:00:00Z",
+      "online":true
+    }
   ]
 }
 ```
+
+### `PATCH /api/workers/{worker}`
+
+Updates runtime controls for a registered worker. This is a tenant-scoped
+operation; direct shared control tokens cannot manage workers.
+
+Request:
+
+```json
+{"enabled":true,"trace_enabled":false,"debug_enabled":false}
+```
+
+Response:
+
+```json
+{"status":"updated"}
+```
+
+### `DELETE /api/workers/{worker}`
+
+Evicts a Worker from the current tenant. Hub closes the live Worker connection
+when it is online, removes the runtime Worker/session snapshots, and returns the
+last visible Worker record. This lets Control clean up an accidental or stale
+Worker join before re-joining the correct instance. Direct Token credentials
+receive `403`.
+
+Response:
+
+```json
+{"status":"evicted","worker":{"id":"local","name":"local","online":false}}
+```
+
+### `GET /api/workers/{worker}/updates`
+
+Returns in-memory update jobs for a worker.
+
+Response:
+
+```json
+{
+  "jobs": [
+    {
+      "id": "upd_...",
+      "worker_id": "mywsl",
+      "target_version": "latest",
+      "repo": "kinboyw/agentmux",
+      "status": "sent",
+      "message": "waiting for worker",
+      "created_at": "2026-06-10T12:00:00Z",
+      "updated_at": "2026-06-10T12:00:01Z"
+    }
+  ]
+}
+```
+
+### `POST /api/workers/{worker}/updates`
+
+Queues a remote Worker binary update. Hub sends `worker.update.apply` to the
+connected Worker, the Worker stages a verified release with `agentmux update
+apply`, then restarts itself. For tmux-backed Workers, sessions keep running
+inside tmux. For built-in PTY Workers, the request must explicitly allow a
+disruptive restart.
+
+Request:
+
+```json
+{"version":"latest","allow_disruptive_restart":false}
+```
+
+Response:
+
+```json
+{
+  "job": {
+    "id": "upd_...",
+    "worker_id": "mywsl",
+    "target_version": "latest",
+    "status": "sent",
+    "created_at": "2026-06-10T12:00:00Z",
+    "updated_at": "2026-06-10T12:00:00Z"
+  }
+}
+```
+
+Possible errors:
+
+- `404`: worker is unknown.
+- `403`: worker belongs to another tenant or the token is a direct shared token.
+- `409`: worker is offline, disabled, missing `worker.update.apply`, or uses
+  `pty` without disruptive restart confirmation.
 
 ### `GET /api/sessions`
 
@@ -174,6 +341,48 @@ Response:
 
 The hub waits for the worker to confirm the session creation. Worker-side CWD
 or command validation errors are returned as `400 Bad Request`.
+
+### `GET /api/sessions/{worker}/{name}/preview`
+
+Returns a terminal preview for a session.
+
+Query parameters:
+
+- `lines`: maximum preview lines, default `80`
+
+Response:
+
+```json
+{"data":"...","scope":"active_pane"}
+```
+
+### `GET /api/sessions/{worker}/{name}/targets`
+
+Returns attachable terminal targets for a session. tmux workers report one item
+per pane across all windows so narrow clients can navigate to the pane level.
+Workers without pane-aware backends may return a single session-level target.
+
+Response:
+
+```json
+{
+  "targets": [
+    {
+      "session_name": "demo",
+      "window_id": "@1",
+      "window_index": 0,
+      "window_name": "main",
+      "pane_id": "%1",
+      "pane_index": 0,
+      "pane_active": true,
+      "cwd": "/repo",
+      "command": "codex",
+      "width": 80,
+      "height": 24
+    }
+  ]
+}
+```
 
 ### `POST /api/sessions/{worker}/{name}/input`
 

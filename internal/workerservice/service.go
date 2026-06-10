@@ -186,6 +186,70 @@ func Logs(ctx context.Context, lines int) (string, error) {
 	return out, err
 }
 
+func FollowLogs(ctx context.Context, lines int, out io.Writer) error {
+	if lines <= 0 {
+		lines = 80
+	}
+	if runtime.GOOS == "linux" && systemdServiceExists() && systemdUserAvailable(ctx) {
+		cmd := exec.CommandContext(ctx, "journalctl", "--user", "-u", ServiceName+".service", "-n", strconv.Itoa(lines), "-f")
+		cmd.Stdout = out
+		cmd.Stderr = out
+		if err := cmd.Run(); err == nil || ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	logPath, err := LogPath()
+	if err != nil {
+		return err
+	}
+	offset := int64(0)
+	if data, err := os.ReadFile(logPath); err == nil {
+		text := tailLines(string(data), lines)
+		if text != "" {
+			_, _ = io.WriteString(out, text)
+			if !strings.HasSuffix(text, "\n") {
+				_, _ = io.WriteString(out, "\n")
+			}
+		}
+		offset = int64(len(data))
+	} else if os.IsNotExist(err) {
+		_, _ = fmt.Fprintf(out, "waiting for worker log: %s\n", logPath)
+	} else {
+		return err
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			file, err := os.Open(logPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+			info, err := file.Stat()
+			if err != nil {
+				_ = file.Close()
+				return err
+			}
+			if info.Size() < offset {
+				offset = 0
+			}
+			if info.Size() > offset {
+				if _, err := file.Seek(offset, io.SeekStart); err == nil {
+					n, _ := io.Copy(out, file)
+					offset += n
+				}
+			}
+			_ = file.Close()
+		}
+	}
+}
+
 func StateDir() (string, error) {
 	return stateDir(true)
 }
@@ -390,6 +454,8 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=` + systemdQuote("HOME="+home) + `
+Environment=` + systemdQuote("AGENTMUX_WORKER_INSTALL_KIND=service") + `
+Environment=` + systemdQuote("AGENTMUX_WORKER_SERVICE_BACKEND=systemd-user") + `
 ExecStart=` + commandLine(binary, workerRunArgs()) + `
 Restart=always
 RestartSec=3
@@ -420,6 +486,11 @@ func startLaunchd(ctx context.Context, binary string) (Result, error) {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>` + launchdLabel + `</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENTMUX_WORKER_INSTALL_KIND</key><string>service</string>
+    <key>AGENTMUX_WORKER_SERVICE_BACKEND</key><string>launchd</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
     <string>` + html.EscapeString(binary) + `</string>
@@ -473,7 +544,7 @@ func startFallback(binary string, identity WorkerIdentity) (Result, error) {
 	cmd := exec.Command(binary, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), "AGENTMUX_WORKER_INSTALL_KIND=service", "AGENTMUX_WORKER_SERVICE_BACKEND=process")
 	if home, err := os.UserHomeDir(); err == nil {
 		cmd.Dir = home
 	}
@@ -604,6 +675,17 @@ func fallbackLogs(lines int) (string, error) {
 		parts = parts[len(parts)-lines:]
 	}
 	return strings.Join(parts, "\n"), nil
+}
+
+func tailLines(value string, lines int) string {
+	if lines <= 0 {
+		lines = 80
+	}
+	parts := strings.Split(value, "\n")
+	if len(parts) > lines {
+		parts = parts[len(parts)-lines:]
+	}
+	return strings.Join(parts, "\n")
 }
 
 func systemdServicePath() (string, error) {

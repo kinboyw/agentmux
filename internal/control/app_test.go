@@ -417,7 +417,7 @@ func TestRenderActiveUsesTerminalCanvasOnly(t *testing.T) {
 		},
 		status: "ready",
 	}
-	app.renderWithSize(20, 5)
+	app.renderWithSize(100, 5)
 	output := stripControl(app.Out.(*bytes.Buffer).String())
 	if !strings.Contains(output, "remote") || !strings.Contains(output, "shell") {
 		t.Fatalf("active terminal canvas missing remote output:\n%s", output)
@@ -425,8 +425,45 @@ func TestRenderActiveUsesTerminalCanvasOnly(t *testing.T) {
 	if strings.Contains(output, "Sessions") || strings.Contains(output, "Selected") || strings.Contains(output, "Ctrl-]") {
 		t.Fatalf("active render should not include TUI chrome:\n%s", output)
 	}
-	if got := app.streams["local/demo"].size; got != (protocol.TerminalSize{Cols: 20, Rows: 5}) {
+	if got := app.streams["local/demo"].size; got != (protocol.TerminalSize{Cols: 100, Rows: 5}) {
 		t.Fatalf("active stream size mismatch: %+v", got)
+	}
+}
+
+func TestRenderMobileActiveKeepsNavigationChrome(t *testing.T) {
+	view := terminalview.New(40, 5)
+	view.Write([]byte("remote\nshell"))
+	app := &App{
+		Out:    &bytes.Buffer{},
+		active: "local/demo#%1",
+		streams: map[string]*appSessionStream{
+			"local/demo#%1": {sessionID: "local/demo#%1", baseSessionID: "local/demo", view: view, size: protocol.TerminalSize{Cols: 40, Rows: 5}, seenOutput: true},
+		},
+		status: "ready",
+	}
+	app.renderWithSize(40, 8)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "AgentMux / local/demo#%1") || !strings.Contains(output, "remote") || !strings.Contains(output, "Ctrl-] detach") {
+		t.Fatalf("mobile active render missing chrome or remote output:\n%s", output)
+	}
+	if got := app.streams["local/demo#%1"].size; got != (protocol.TerminalSize{Cols: 40, Rows: 5}) {
+		t.Fatalf("mobile stream size mismatch: %+v", got)
+	}
+}
+
+func TestRenderMobileTargetsShowsPaneHierarchy(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.mobileView = appMobileTargets
+	app.targetFor = "local/demo"
+	app.targetSel = 1
+	app.targets["local/demo"] = []protocol.TerminalTarget{
+		{SessionName: "demo", WindowIndex: 0, WindowName: "main", PaneID: "%1", PaneIndex: 0, PaneActive: true, Command: "codex", Width: 40, Height: 20},
+		{SessionName: "demo", WindowIndex: 1, WindowName: "logs", PaneID: "%3", PaneIndex: 0, Command: "tail", Width: 80, Height: 10},
+	}
+	app.renderWithSize(44, 10)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "AgentMux / panes") || !strings.Contains(output, "main") || !strings.Contains(output, "%1") || !strings.Contains(output, "logs") || !strings.Contains(output, "%3") {
+		t.Fatalf("mobile target render missing pane hierarchy:\n%s", output)
 	}
 }
 

@@ -86,6 +86,31 @@ func TestHandleControlPage(t *testing.T) {
 	}
 }
 
+func TestHandleVersion(t *testing.T) {
+	server, err := NewWithOptions(ServerOptions{Addr: ":0", ReleaseRepo: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/version", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleVersion(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["role"] != "hub" || payload["version"] == "" || payload["release_repo"] != "owner/repo" || payload["protocol_version"] != protocol.ProtocolVersion {
+		t.Fatalf("unexpected version payload: %#v", payload)
+	}
+	if _, ok := payload["compatibility"].(map[string]any); !ok {
+		t.Fatalf("compatibility payload missing: %#v", payload)
+	}
+}
+
 func TestLandingPageIncludesOpenSourceIdentityAndBilingualVisuals(t *testing.T) {
 	server := New(":0", "", nil)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -156,6 +181,156 @@ func TestSignalIncludesWorkerJoinCommand(t *testing.T) {
 	if got := payload["control_command"].(string); got != "agentmux-tui --hub 'http://agentmux.test'" {
 		t.Fatalf("unexpected control command: %s", got)
 	}
+	directToken, ok := payload["direct_token"].(string)
+	if !ok || !strings.HasPrefix(directToken, "amx_cred_") {
+		t.Fatalf("unexpected direct token: %#v", payload["direct_token"])
+	}
+	shareURL, ok := payload["control_share_url"].(string)
+	if !ok || !strings.HasPrefix(shareURL, "http://agentmux.test/control?token=amx_cred_") {
+		t.Fatalf("unexpected control share URL: %#v", payload["control_share_url"])
+	}
+	if got := payload["control_direct_command"].(string); !strings.Contains(got, "agentmux-tui --hub 'http://agentmux.test' --token 'amx_cred_") {
+		t.Fatalf("unexpected direct control command: %s", got)
+	}
+	controlReq := httptest.NewRequest(http.MethodGet, "/api/workers", nil)
+	controlReq.Header.Set("Authorization", "Bearer "+directToken)
+	if !server.authorizedRole(controlReq, "control") {
+		t.Fatal("direct token should authorize control routes")
+	}
+}
+
+func TestAnonymousSignalIncludesDirectToken(t *testing.T) {
+	server := New(":0", "secret", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	req.Host = "agentmux.test"
+	rec := httptest.NewRecorder()
+
+	server.handleSignals(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	tenantID, ok := payload["tenant_id"].(string)
+	if !ok || !strings.HasPrefix(tenantID, "anon_") {
+		t.Fatalf("expected anonymous tenant, got %#v", payload["tenant_id"])
+	}
+	signal, ok := payload["signal"].(string)
+	if !ok || !strings.HasPrefix(signal, "amx_sig_") {
+		t.Fatalf("unexpected signal: %#v", payload["signal"])
+	}
+	directToken, ok := payload["direct_token"].(string)
+	if !ok || !strings.HasPrefix(directToken, "amx_cred_") {
+		t.Fatalf("unexpected direct token: %#v", payload["direct_token"])
+	}
+	shareURL, ok := payload["control_share_url"].(string)
+	if !ok || !strings.Contains(shareURL, "/control?token=amx_cred_") {
+		t.Fatalf("unexpected control share URL: %#v", payload["control_share_url"])
+	}
+
+	workerCredential, err := server.auth.Exchange(exchangeRequest{Signal: signal, Role: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workerCredential.TenantID != tenantID {
+		t.Fatalf("expected worker tenant %s, got %s", tenantID, workerCredential.TenantID)
+	}
+	directReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	directReq.Header.Set("Authorization", "Bearer "+directToken)
+	directRec := httptest.NewRecorder()
+	server.requireAuth(server.handleAuthMe)(directRec, directReq)
+	if directRec.Code != http.StatusOK {
+		t.Fatalf("direct token should authorize auth/me: %d body=%s", directRec.Code, directRec.Body.String())
+	}
+}
+
+func TestInvalidSignalCredentialDoesNotFallBackToAnonymous(t *testing.T) {
+	server := New(":0", "secret", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	req.Header.Set("Authorization", "Bearer not-a-valid-token")
+	rec := httptest.NewRecorder()
+
+	server.handleSignals(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDirectTokenIsLimitedControlAccess(t *testing.T) {
+	server := New(":0", "secret", nil)
+	signalReq := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	signalReq.Host = "agentmux.test"
+	signalReq.Header.Set("Authorization", "Bearer secret")
+	signalRec := httptest.NewRecorder()
+	server.handleSignals(signalRec, signalReq)
+	if signalRec.Code != http.StatusCreated {
+		t.Fatalf("unexpected signal status: %d body=%s", signalRec.Code, signalRec.Body.String())
+	}
+	var signalPayload map[string]any
+	if err := json.NewDecoder(signalRec.Body).Decode(&signalPayload); err != nil {
+		t.Fatal(err)
+	}
+	directToken := signalPayload["direct_token"].(string)
+	server.sessions["local/demo"] = protocol.SessionView{ID: "local/demo", TenantID: signalPayload["tenant_id"].(string), WorkerID: "local", Name: "demo"}
+
+	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	meReq.Header.Set("Authorization", "Bearer "+directToken)
+	meRec := httptest.NewRecorder()
+	server.requireAuth(server.handleAuthMe)(meRec, meReq)
+	if meRec.Code != http.StatusOK {
+		t.Fatalf("unexpected me status: %d body=%s", meRec.Code, meRec.Body.String())
+	}
+	var me map[string]any
+	if err := json.NewDecoder(meRec.Body).Decode(&me); err != nil {
+		t.Fatal(err)
+	}
+	if me["access_mode"] != "direct" {
+		t.Fatalf("expected direct access mode, got %#v", me["access_mode"])
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	listReq.Header.Set("Authorization", "Bearer "+directToken)
+	listRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleSessions)(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("direct token should list sessions: %d body=%s", listRec.Code, listRec.Body.String())
+	}
+
+	workersReq := httptest.NewRequest(http.MethodGet, "/api/workers", nil)
+	workersReq.Header.Set("Authorization", "Bearer "+directToken)
+	workersRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkers)(workersRec, workersReq)
+	if workersRec.Code != http.StatusForbidden {
+		t.Fatalf("direct token should not list workers: %d body=%s", workersRec.Code, workersRec.Body.String())
+	}
+
+	updateReq := httptest.NewRequest(http.MethodPost, "/api/workers/local/updates", bytes.NewReader([]byte(`{"version":"latest"}`)))
+	updateReq.Header.Set("Authorization", "Bearer "+directToken)
+	updateRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkerAction)(updateRec, updateReq)
+	if updateRec.Code != http.StatusForbidden {
+		t.Fatalf("direct token should not update workers: %d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/sessions", bytes.NewReader([]byte(`{"worker_id":"local","name":"new","cwd":".","command":"bash"}`)))
+	createReq.Header.Set("Authorization", "Bearer "+directToken)
+	createRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleSessions)(createRec, createReq)
+	if createRec.Code != http.StatusForbidden {
+		t.Fatalf("direct token should not create sessions: %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	joinReq := httptest.NewRequest(http.MethodPost, "/api/signals", nil)
+	joinReq.Header.Set("Authorization", "Bearer "+directToken)
+	joinRec := httptest.NewRecorder()
+	server.handleSignals(joinRec, joinReq)
+	if joinRec.Code != http.StatusForbidden {
+		t.Fatalf("direct token should not generate join signals: %d body=%s", joinRec.Code, joinRec.Body.String())
+	}
 }
 
 func TestSignalUsesConfiguredPublicURL(t *testing.T) {
@@ -208,6 +383,48 @@ func TestInstallScriptEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(body, "releases/latest/download") {
 		t.Fatalf("release download path missing from install script:\n%s", body)
+	}
+	for _, want := range []string{
+		"agentmux-${ASSET_ROLE}-${os}-${arch}",
+		"asset=\"${asset_base}.tar.gz\"",
+		"legacy_base=\"agentmux-${os}-${arch}\"",
+		"agentmux-hub",
+		"usage: install.sh worker|control|hub",
+		"verify_sha256",
+		"checksum_url=\"${url}.sha256\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("install script missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestRunScriptEndpoint(t *testing.T) {
+	server, err := NewWithOptions(ServerOptions{Addr: ":0", ReleaseRepo: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/run.sh", nil)
+	req.Host = "agentmux.test"
+	rec := httptest.NewRecorder()
+
+	server.handleRunScript(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"usage: run.sh worker|control|hub[@version]",
+		"AGENTMUX_CACHE_DIR",
+		"agentmux-${asset_role}-${os}-${arch}",
+		"verify_sha256",
+		"control app --hub \"$HUB_HTTP\"",
+		"worker --hub \"$HUB_WS\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("run script missing %q:\n%s", want, body)
+		}
 	}
 }
 
@@ -357,6 +574,11 @@ func TestWorkerDisconnectKeepsRegisteredWorkerView(t *testing.T) {
 		tenantID: "tenant_test",
 		name:     "Laptop",
 		addr:     "127.0.0.1",
+		backend:  "tmux",
+		software: protocol.WorkerSoftware{
+			Version: "v1.2.3", ProtocolVersion: protocol.ProtocolVersion,
+			OS: "linux", Arch: "amd64", Capabilities: []string{"session.targets"},
+		},
 		lastSeen: time.Now().UTC().Add(-time.Minute),
 		send:     make(chan protocol.Envelope, 1),
 	}
@@ -382,6 +604,9 @@ func TestWorkerDisconnectKeepsRegisteredWorkerView(t *testing.T) {
 	}
 	if payload.Workers[0].ID != "local" || payload.Workers[0].Online || payload.Workers[0].Status != "offline" {
 		t.Fatalf("unexpected worker view: %+v", payload.Workers[0])
+	}
+	if payload.Workers[0].Backend != "tmux" || payload.Workers[0].Software.Version != "v1.2.3" || payload.Workers[0].Software.OS != "linux" {
+		t.Fatalf("expected offline worker software inventory to remain visible: %+v", payload.Workers[0])
 	}
 }
 
@@ -412,6 +637,161 @@ func TestWorkerActionUpdatesManagementFlags(t *testing.T) {
 	}
 	if payload.Worker.Enabled || !payload.Worker.TraceEnabled || !payload.Worker.DebugEnabled || payload.Worker.Backend != "tmux" {
 		t.Fatalf("unexpected worker payload: %+v", payload.Worker)
+	}
+}
+
+func TestWorkerUpdateQueuesApplyRequest(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id: "local", tenantID: "tenant_test", name: "Laptop", backend: "tmux",
+		software: protocol.WorkerSoftware{
+			Version: "v0.0.1", ProtocolVersion: protocol.ProtocolVersion,
+			Capabilities: []string{"worker.update.apply"},
+		},
+		send: make(chan protocol.Envelope, 1), done: make(chan struct{}),
+	}
+	server.registerWorker(worker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/workers/local/updates", bytes.NewReader([]byte(`{"version":"v9.0.0"}`)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkerAction)(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Job workerUpdateJob `json:"job"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Job.ID == "" || payload.Job.Status != "sent" || payload.Job.TargetVersion != "v9.0.0" {
+		t.Fatalf("unexpected update job: %+v", payload.Job)
+	}
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeWorkerUpdateApply || env.ID != payload.Job.ID {
+			t.Fatalf("unexpected worker message: %+v", env)
+		}
+		var apply protocol.WorkerUpdateApply
+		if err := env.DecodePayload(&apply); err != nil {
+			t.Fatal(err)
+		}
+		if apply.JobID != payload.Job.ID || apply.Version != "v9.0.0" || !apply.Restart {
+			t.Fatalf("unexpected apply payload: %+v", apply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive update apply")
+	}
+}
+
+func TestWorkerUpdateRejectsPtyWithoutDisruptiveConfirmation(t *testing.T) {
+	server := New(":0", "secret", nil)
+	server.registerWorker(&workerConn{
+		id: "local", backend: "pty",
+		software: protocol.WorkerSoftware{Capabilities: []string{"worker.update.apply"}},
+		send:     make(chan protocol.Envelope, 1),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/workers/local/updates", bytes.NewReader([]byte(`{"version":"v9.0.0"}`)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkerAction)(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerUpdateResultAndReconnectMarksSucceeded(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id: "local", backend: "tmux",
+		software: protocol.WorkerSoftware{
+			Version: "v0.0.1", ProtocolVersion: protocol.ProtocolVersion,
+			Capabilities: []string{"worker.update.apply"},
+		},
+		send: make(chan protocol.Envelope, 1), done: make(chan struct{}),
+	}
+	server.registerWorker(worker)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/workers/local/updates", bytes.NewReader([]byte(`{"version":"v9.0.0"}`)))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkerAction)(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Job workerUpdateJob `json:"job"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	<-worker.send
+	result, err := protocol.NewEnvelope(protocol.TypeWorkerUpdateResult, protocol.WorkerUpdateResult{JobID: payload.Job.ID, Status: "restarting", Version: "v9.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.ID = payload.Job.ID
+	server.handleWorkerMessage(worker, result)
+
+	server.mu.RLock()
+	if got := server.updateJobs[payload.Job.ID].Status; got != "restarting" {
+		t.Fatalf("expected restarting, got %s", got)
+	}
+	server.mu.RUnlock()
+
+	server.registerWorker(&workerConn{
+		id: "local", backend: "tmux",
+		software: protocol.WorkerSoftware{
+			Version: "v9.0.0", ProtocolVersion: protocol.ProtocolVersion,
+			Capabilities: []string{"worker.update.apply"},
+		},
+		send: make(chan protocol.Envelope, 1), done: make(chan struct{}),
+	})
+	server.mu.RLock()
+	job := server.updateJobs[payload.Job.ID]
+	server.mu.RUnlock()
+	if job.Status != "succeeded" || job.FinishedAt.IsZero() {
+		t.Fatalf("expected succeeded job after reconnect: %+v", job)
+	}
+}
+
+func TestWorkerEvictDisconnectsAndDisablesWorker(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id: "local", tenantID: "admin", name: "Local", addr: "127.0.0.1",
+		send: make(chan protocol.Envelope, 1), done: make(chan struct{}),
+		lastSeen: time.Now().UTC(),
+	}
+	server.registerWorker(worker)
+	server.sessions["local/demo"] = protocol.SessionView{ID: "local/demo", WorkerID: "local", Name: "demo"}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/workers/local", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkerAction)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-worker.done:
+	default:
+		t.Fatal("expected worker connection to be closed")
+	}
+	server.mu.RLock()
+	record := server.workerViews["local"]
+	_, connected := server.workers["local"]
+	_, sessionExists := server.sessions["local/demo"]
+	server.mu.RUnlock()
+	if connected || sessionExists || !record.disabled || record.connected {
+		t.Fatalf("worker was not evicted: connected=%v session=%v record=%+v", connected, sessionExists, record)
+	}
+	if server.workerAllowedToConnect(&workerConn{id: "local"}) {
+		t.Fatal("evicted worker should not be allowed to reconnect")
 	}
 }
 
@@ -784,6 +1164,57 @@ func TestSessionPreviewRequestForwardsToWorker(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), `"data":"preview"`) {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestSessionTargetsRequestForwardsToWorker(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 1),
+	}
+	server.registerWorker(worker)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/local/demo/targets", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.requireRole("control", server.handleSessionAction)(rec, req)
+		close(done)
+	}()
+
+	var requestID string
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeSessionTargets {
+			t.Fatalf("unexpected type: %s", env.Type)
+		}
+		requestID = env.ID
+		if env.SessionID != "local/demo" {
+			t.Fatalf("unexpected session id: %s", env.SessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive targets request")
+	}
+
+	reply, err := protocol.NewEnvelope(protocol.TypeSessionTargets, protocol.SessionTargets{Targets: []protocol.TerminalTarget{{SessionName: "demo", WindowName: "main", PaneID: "%1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply.ID = requestID
+	server.handleWorkerMessage(worker, reply)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("targets request did not complete")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"pane_id":"%1"`) {
 		t.Fatalf("unexpected body: %s", rec.Body.String())
 	}
 }

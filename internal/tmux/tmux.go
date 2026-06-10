@@ -1,17 +1,22 @@
 package tmux
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"private/agentmux/internal/pty"
 	"private/agentmux/internal/sessionbackend"
+
+	"golang.org/x/sys/unix"
 )
 
 type Runner interface {
@@ -31,6 +36,7 @@ type Adapter struct {
 }
 
 const tmuxPaneGeometryFormat = "#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{window_width}\t#{window_height}"
+const tmuxTargetFormat = "#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}"
 
 type paneGeometry struct {
 	id     string
@@ -160,6 +166,10 @@ func (a Adapter) SendTerminalInput(ctx context.Context, name, data string) error
 	if err := sessionbackend.ValidateSessionName(name); err != nil {
 		return err
 	}
+	return a.sendTerminalInput(ctx, name, data)
+}
+
+func (a Adapter) sendTerminalInput(ctx context.Context, target, data string) error {
 	if data == "" {
 		return nil
 	}
@@ -170,7 +180,7 @@ func (a Adapter) SendTerminalInput(ctx context.Context, name, data string) error
 		}
 		text := literal.String()
 		literal.Reset()
-		if _, err := a.Runner.Run(ctx, "tmux", "send-keys", "-t", name, "-l", text); err != nil {
+		if _, err := a.Runner.Run(ctx, "tmux", "send-keys", "-t", target, "-l", text); err != nil {
 			return fmt.Errorf("tmux send-keys literal: %w", err)
 		}
 		return nil
@@ -183,7 +193,7 @@ func (a Adapter) SendTerminalInput(ctx context.Context, name, data string) error
 		if err := flush(); err != nil {
 			return err
 		}
-		if _, err := a.Runner.Run(ctx, "tmux", "send-keys", "-t", name, token); err != nil {
+		if _, err := a.Runner.Run(ctx, "tmux", "send-keys", "-t", target, token); err != nil {
 			return fmt.Errorf("tmux send-keys %s: %w", token, err)
 		}
 	}
@@ -515,6 +525,182 @@ func (a Adapter) Open(ctx context.Context, name string, cols int, rows int) (ses
 		return nil, err
 	}
 	return pty.StartTmuxAttach(ctx, name, cols, rows)
+}
+
+func (a Adapter) Targets(ctx context.Context, name string) ([]sessionbackend.TerminalTarget, error) {
+	if err := sessionbackend.ValidateSessionName(name); err != nil {
+		return nil, err
+	}
+	output, err := a.Runner.Run(ctx, "tmux", "list-panes", "-s", "-t", name, "-F", tmuxTargetFormat)
+	if err != nil {
+		return nil, fmt.Errorf("tmux list-panes: %w", err)
+	}
+	return parseTargets(output)
+}
+
+func parseTargets(output string) ([]sessionbackend.TerminalTarget, error) {
+	targets := []sessionbackend.TerminalTarget(nil)
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 14 {
+			return nil, fmt.Errorf("tmux list-panes returned malformed target metadata")
+		}
+		target := sessionbackend.TerminalTarget{
+			SessionName:  parts[0],
+			WindowID:     parts[1],
+			WindowIndex:  safeInt(parts[2]),
+			WindowName:   parts[3],
+			WindowActive: safeInt(parts[4]) > 0,
+			PaneID:       parts[5],
+			PaneIndex:    safeInt(parts[6]),
+			PaneActive:   safeInt(parts[7]) > 0,
+			CWD:          parts[8],
+			Command:      parts[9],
+			Left:         safeInt(parts[10]),
+			Top:          safeInt(parts[11]),
+			Width:        safeInt(parts[12]),
+			Height:       safeInt(parts[13]),
+		}
+		if target.SessionName == "" || target.PaneID == "" {
+			continue
+		}
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("tmux list-panes returned no targets")
+	}
+	slices.SortFunc(targets, func(a, b sessionbackend.TerminalTarget) int {
+		if a.WindowIndex != b.WindowIndex {
+			return a.WindowIndex - b.WindowIndex
+		}
+		return a.PaneIndex - b.PaneIndex
+	})
+	return targets, nil
+}
+
+func (a Adapter) OpenTarget(ctx context.Context, target sessionbackend.TerminalTarget, cols int, rows int) (sessionbackend.Stream, error) {
+	if target.PaneID == "" {
+		return a.Open(ctx, target.SessionName, cols, rows)
+	}
+	if err := validateTmuxPaneID(target.PaneID); err != nil {
+		return nil, err
+	}
+	initial, err := a.capturePaneScrollback(ctx, target.PaneID, rows)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := a.openPanePipe(ctx, target.PaneID, initial)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
+}
+
+func validateTmuxPaneID(value string) error {
+	if !strings.HasPrefix(value, "%") || len(value) < 2 {
+		return fmt.Errorf("invalid tmux pane id %q", value)
+	}
+	for _, r := range value[1:] {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("invalid tmux pane id %q", value)
+		}
+	}
+	return nil
+}
+
+func (a Adapter) openPanePipe(ctx context.Context, paneID, initial string) (sessionbackend.Stream, error) {
+	dir, err := os.MkdirTemp("", "agentmux-tmux-pane-*")
+	if err != nil {
+		return nil, err
+	}
+	fifo := filepath.Join(dir, "output")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("tmux pane fifo: %w", err)
+	}
+	command := "cat > " + shellQuote(fifo)
+	if _, err := a.Runner.Run(ctx, "tmux", "pipe-pane", "-o", "-t", paneID, command); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("tmux pipe-pane: %w", err)
+	}
+	file, err := os.OpenFile(fifo, os.O_RDWR, 0)
+	if err != nil {
+		_, _ = a.Runner.Run(context.Background(), "tmux", "pipe-pane", "-t", paneID)
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("tmux pane fifo open: %w", err)
+	}
+	prefix := "\x1b[2J\x1b[H" + initial
+	if prefix != "" && !strings.HasSuffix(prefix, "\n") {
+		prefix += "\n"
+	}
+	return &panePipeStream{
+		ctx:     ctx,
+		runner:  a.Runner,
+		paneID:  paneID,
+		dir:     dir,
+		file:    file,
+		initial: bytes.NewReader([]byte(prefix)),
+	}, nil
+}
+
+type panePipeStream struct {
+	ctx       context.Context
+	runner    Runner
+	paneID    string
+	dir       string
+	file      *os.File
+	initial   *bytes.Reader
+	closeOnce sync.Once
+}
+
+func (s *panePipeStream) Read(p []byte) (int, error) {
+	if s.initial != nil && s.initial.Len() > 0 {
+		return s.initial.Read(p)
+	}
+	if s.file == nil {
+		return 0, os.ErrClosed
+	}
+	return s.file.Read(p)
+}
+
+func (s *panePipeStream) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := New(s.runner).sendTerminalInput(s.ctx, s.paneID, string(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (s *panePipeStream) Resize(cols int, rows int) error {
+	return nil
+}
+
+func (s *panePipeStream) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		if s.runner != nil && s.paneID != "" {
+			_, _ = s.runner.Run(context.Background(), "tmux", "pipe-pane", "-t", s.paneID)
+		}
+		if s.file != nil {
+			err = s.file.Close()
+		}
+		if s.dir != "" {
+			_ = os.RemoveAll(s.dir)
+		}
+	})
+	return err
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func safeInt(value string) int {
