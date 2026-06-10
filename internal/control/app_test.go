@@ -331,6 +331,17 @@ func TestPreviewLineCanBeTruncatedToWidth(t *testing.T) {
 	}
 }
 
+func TestVisibleWidthTreatsBoxDrawingAsSingleCells(t *testing.T) {
+	line := "├" + strings.Repeat("─", 10) + "┤"
+	if got, want := visibleLen(line), 12; got != want {
+		t.Fatalf("unexpected box drawing width: got %d want %d", got, want)
+	}
+	got := stripControl(truncateVisible(line, 6))
+	if got != "├─────" {
+		t.Fatalf("box drawing truncation split cells: %q", got)
+	}
+}
+
 func TestRenderIncludesSessionListWhenPreviewExists(t *testing.T) {
 	app := &App{
 		Out: &bytes.Buffer{},
@@ -642,6 +653,101 @@ func TestProcessPendingStreamOutputIsBounded(t *testing.T) {
 	}
 }
 
+func TestResizeSettleSuppressesIntermediateStreamRepaint(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	size := app.streamSizeFor("local/a")
+	stream := &appSessionStream{
+		sessionID: "local/a",
+		view:      terminalview.New(size.Cols, size.Rows),
+		size:      size,
+	}
+	app.streams["local/a"] = stream
+	app.startResizeSettle(stream, time.Now())
+
+	app.events <- appStreamEvent{sessionID: "local/a", data: []byte("resize repaint")}
+	if app.drainStreamEvents(16) {
+		t.Fatalf("resize repaint output should not request an immediate render")
+	}
+	if !stream.resizeSawOutput {
+		t.Fatalf("expected resize settle to observe stream output")
+	}
+	if app.processPendingStreamOutput(1024) {
+		t.Fatalf("processed resize repaint should not request an immediate render")
+	}
+	if !stream.viewDirty {
+		t.Fatalf("expected terminal view to keep final repaint dirty")
+	}
+	if app.refreshDirtyTerminalViews() {
+		t.Fatalf("dirty resize repaint should not refresh while settling")
+	}
+	if strings.Contains(app.buffers["local/a"], "resize repaint") {
+		t.Fatalf("resize repaint leaked into visible buffer before settle")
+	}
+	if app.finishResizeSettles(stream.resizeQuiet.Add(-time.Millisecond)) {
+		t.Fatalf("resize settle should wait for quiet window")
+	}
+	if !app.finishResizeSettles(stream.resizeQuiet.Add(time.Millisecond)) {
+		t.Fatalf("resize settle should finish after quiet window")
+	}
+	if !app.refreshDirtyTerminalViews() {
+		t.Fatalf("expected final repaint to refresh after settle")
+	}
+	if !strings.Contains(stripControl(app.buffers["local/a"]), "resize repaint") {
+		t.Fatalf("final repaint missing after settle: %q", app.buffers["local/a"])
+	}
+}
+
+func TestResizeSettleWaitsForResizeWriteBeforeQuietWindow(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	stream := &appSessionStream{
+		sessionID: "local/a",
+		stream:    &Stream{},
+		view:      terminalview.New(40, 4),
+		size:      protocol.TerminalSize{Cols: 40, Rows: 4},
+	}
+	app.streams["local/a"] = stream
+	now := time.Now()
+	app.beginResizeSettle(stream, now)
+	if !stream.resizeSettling || !stream.resizeAwaitingWrite {
+		t.Fatalf("expected resize settle to wait for websocket write")
+	}
+	if app.finishResizeSettles(now.Add(appStreamResizeSettleMax - time.Millisecond)) {
+		t.Fatalf("resize settle should not finish before queued write or max")
+	}
+	app.events <- appStreamEvent{sessionID: "local/a", stream: stream.stream, resizeSent: true}
+	if app.drainStreamEvents(16) {
+		t.Fatalf("resizeSent should not request an immediate render")
+	}
+	if stream.resizeAwaitingWrite {
+		t.Fatalf("resizeSent should leave awaiting-write state")
+	}
+	if stream.resizeMax.Before(now.Add(appStreamResizeSettleMax)) || stream.resizeMax.Equal(now.Add(appStreamResizeSettleMax)) {
+		t.Fatalf("resizeSent should restart settle max window")
+	}
+}
+
+func TestResizeSettleFinishesWithoutOutputAfterMaxWait(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	stream := &appSessionStream{
+		sessionID: "local/a",
+		view:      terminalview.New(40, 4),
+		size:      protocol.TerminalSize{Cols: 40, Rows: 4},
+	}
+	app.streams["local/a"] = stream
+	now := time.Now()
+	app.startResizeSettle(stream, now)
+	if app.finishResizeSettles(now.Add(appStreamResizeSettleMax - time.Millisecond)) {
+		t.Fatalf("resize settle should wait for max window when no output arrives")
+	}
+	if !app.finishResizeSettles(now.Add(appStreamResizeSettleMax + time.Millisecond)) {
+		t.Fatalf("resize settle should finish after max window without output")
+	}
+	if stream.resizeSettling {
+		t.Fatalf("expected resize settle to clear")
+	}
+}
+
 func TestForwardActiveKeyQueuesInputWithoutBlockingOnStreamWrite(t *testing.T) {
 	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
 	writes := make(chan appStreamWrite, 1)
@@ -725,6 +831,63 @@ func TestHandleMouseDragUpdatesSplitWidth(t *testing.T) {
 	}
 	if app.dragSplit {
 		t.Fatalf("expected split dragging to stop")
+	}
+}
+
+func TestHandleMouseDragDebouncesRemoteResizeUntilAfterRelease(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	writes := make(chan appStreamWrite, 2)
+	app.active = "local/a"
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	app.streams["local/a"] = &appSessionStream{
+		sessionID:  "local/a",
+		stream:     &Stream{},
+		view:       terminalview.New(80, 17),
+		size:       protocol.TerminalSize{Cols: 80, Rows: 17},
+		writes:     writes,
+		seenOutput: true,
+	}
+	if app.handleMouse(t.Context(), appMouseEvent{kind: appMouseClick, x: 31, y: 4, button: terminalview.MouseLeft}) {
+		t.Fatalf("split drag start should not force render by itself")
+	}
+	if !app.handleMouse(t.Context(), appMouseEvent{kind: appMouseMotion, x: 44, y: 4, button: terminalview.MouseLeft}) {
+		t.Fatalf("expected split drag motion to update layout")
+	}
+	stream := app.streams["local/a"]
+	if !stream.resizePending {
+		t.Fatalf("expected resize to be pending during drag")
+	}
+	select {
+	case write := <-writes:
+		t.Fatalf("resize should not be sent during drag: %+v", write)
+	default:
+	}
+	app.flushDueStreamResizes(time.Now().Add(appStreamResizeDebounce + time.Second))
+	select {
+	case write := <-writes:
+		t.Fatalf("resize should not flush while mouse is dragging: %+v", write)
+	default:
+	}
+	if !app.handleMouse(t.Context(), appMouseEvent{kind: appMouseRelease, x: 44, y: 4, button: terminalview.MouseNone}) {
+		t.Fatalf("expected split release to update UI")
+	}
+	app.flushDueStreamResizes(time.Now())
+	select {
+	case write := <-writes:
+		t.Fatalf("resize should wait for debounce after release: %+v", write)
+	default:
+	}
+	app.flushDueStreamResizes(time.Now().Add(appStreamResizeDebounce + time.Millisecond))
+	select {
+	case write := <-writes:
+		if !write.resize {
+			t.Fatalf("expected resize write, got %+v", write)
+		}
+		if write.size != (protocol.TerminalSize{Cols: 74, Rows: 29}) {
+			t.Fatalf("unexpected resize size: %+v", write.size)
+		}
+	default:
+		t.Fatalf("expected debounced resize write")
 	}
 }
 

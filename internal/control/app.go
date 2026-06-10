@@ -13,6 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mattn/go-runewidth"
+
 	"private/agentmux/internal/protocol"
 	"private/agentmux/internal/term"
 	"private/agentmux/internal/terminalview"
@@ -54,37 +56,49 @@ const (
 	appStreamWarmupMin           = 450 * time.Millisecond
 	appStreamWarmupQuiet         = 180 * time.Millisecond
 	appStreamWarmupMax           = 1500 * time.Millisecond
-	appRenderMinInterval         = 50 * time.Millisecond
+	appStreamResizeDebounce      = 500 * time.Millisecond
+	appStreamResizeSettleQuiet   = 280 * time.Millisecond
+	appStreamResizeSettleMax     = 1600 * time.Millisecond
+	appRenderMinInterval         = 120 * time.Millisecond
 )
 
 type appSessionStream struct {
-	sessionID     string
-	stream        *Stream
-	view          *terminalview.View
-	viewDirty     bool
-	size          protocol.TerminalSize
-	pending       []byte
-	writes        chan appStreamWrite
-	cancel        context.CancelFunc
-	connecting    bool
-	closing       bool
-	keepUntil     time.Time
-	warming       bool
-	warmUntil     time.Time
-	quietUntil    time.Time
-	maxWarm       time.Time
-	seenOutput    bool
-	visibleOutput bool
-	prefilled     bool
+	sessionID           string
+	stream              *Stream
+	view                *terminalview.View
+	viewDirty           bool
+	size                protocol.TerminalSize
+	pending             []byte
+	writes              chan appStreamWrite
+	cancel              context.CancelFunc
+	connecting          bool
+	closing             bool
+	keepUntil           time.Time
+	warming             bool
+	warmUntil           time.Time
+	quietUntil          time.Time
+	maxWarm             time.Time
+	resizeDue           time.Time
+	resizeQuiet         time.Time
+	resizeMax           time.Time
+	seenOutput          bool
+	visibleOutput       bool
+	prefilled           bool
+	resizePending       bool
+	resizeSettling      bool
+	resizeAwaitingWrite bool
+	resizeSawOutput     bool
+	pendingResize       protocol.TerminalSize
 }
 
 type appStreamEvent struct {
-	sessionID string
-	stream    *Stream
-	connected bool
-	data      []byte
-	err       error
-	closed    bool
+	sessionID  string
+	stream     *Stream
+	connected  bool
+	data       []byte
+	err        error
+	closed     bool
+	resizeSent bool
 }
 
 type appStreamWrite struct {
@@ -191,6 +205,8 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		changed = a.drainStreamEvents(16) || changed
 		changed = a.processPendingStreamOutput(appStreamProcessBytesPerLoop) || changed
+		changed = a.flushDueStreamResizes(time.Now()) || changed
+		changed = a.finishResizeSettles(time.Now()) || changed
 		if time.Since(lastCleanup) >= time.Second {
 			lastCleanup = time.Now()
 			changed = a.cleanupStreams(time.Now()) || changed
@@ -199,7 +215,7 @@ func (a *App) Run(ctx context.Context) error {
 		if changed {
 			pendingRender = true
 		}
-		if pendingRender && (ok || time.Since(lastRender) >= appRenderMinInterval) {
+		if pendingRender && time.Since(lastRender) >= appRenderMinInterval {
 			a.refreshDirtyTerminalViews()
 			a.render()
 			lastRender = time.Now()
@@ -317,6 +333,9 @@ func (a *App) handleMouse(ctx context.Context, event appMouseEvent) bool {
 	}
 	if event.kind == appMouseRelease && a.dragSplit {
 		a.dragSplit = false
+		if stream := a.streams[a.active]; stream != nil {
+			a.delayPendingStreamResize(stream, time.Now())
+		}
 		return true
 	}
 	if event.kind == appMouseClick && event.button == terminalview.MouseLeft && event.y >= bodyStart && event.y <= bodyEnd && event.x <= listWidth {
@@ -832,6 +851,9 @@ func (a *App) writeStreamLoop(ctx context.Context, sessionID string, stream *Str
 			if write.resize {
 				a.debugf("stream write resize session=%q stream_id=%q cols=%d rows=%d", sessionID, stream.StreamID, write.size.Cols, write.size.Rows)
 				err = stream.Resize(write.size)
+				if err == nil {
+					a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, resizeSent: true})
+				}
 			} else if write.data != "" {
 				a.debugf("stream write input session=%q stream_id=%q bytes=%d", sessionID, stream.StreamID, len(write.data))
 				err = stream.Input(write.data)
@@ -877,12 +899,25 @@ func (a *App) drainStreamEvents(limit int) bool {
 		select {
 		case event := <-a.events:
 			a.applyStreamEvent(event)
-			changed = true
+			if a.streamEventNeedsRender(event) {
+				changed = true
+			}
 		default:
 			return changed
 		}
 	}
 	return changed
+}
+
+func (a *App) streamEventNeedsRender(event appStreamEvent) bool {
+	if event.resizeSent {
+		return false
+	}
+	if len(event.data) == 0 || event.connected || event.err != nil || event.closed {
+		return true
+	}
+	stream := a.streams[event.sessionID]
+	return stream == nil || !stream.resizeSettling
 }
 
 func (a *App) applyStreamEvent(event appStreamEvent) {
@@ -913,6 +948,11 @@ func (a *App) applyStreamEvent(event appStreamEvent) {
 			a.debugf("stream connected applied session=%q stream_id=%q size=%dx%d", event.sessionID, event.stream.StreamID, stream.size.Cols, stream.size.Rows)
 		}
 	}
+	if event.resizeSent {
+		if event.stream == nil || stream.stream == nil || stream.stream == event.stream {
+			a.startResizeSettle(stream, time.Now())
+		}
+	}
 	if len(event.data) > 0 {
 		if stream.prefilled {
 			oldView := stream.view
@@ -924,6 +964,10 @@ func (a *App) applyStreamEvent(event appStreamEvent) {
 			}
 		}
 		stream.seenOutput = true
+		if stream.resizeSettling {
+			stream.resizeSawOutput = true
+			stream.resizeQuiet = time.Now().Add(appStreamResizeSettleQuiet)
+		}
 		if event.stream != nil {
 			a.debugf("stream output applied session=%q stream_id=%q bytes=%d pending_before=%d", event.sessionID, event.stream.StreamID, len(event.data), len(stream.pending))
 		}
@@ -1016,7 +1060,9 @@ func (a *App) processPendingStreamOutput(limit int) bool {
 		a.debugf("stream pending processed session=%q bytes=%d remaining=%d", stream.sessionID, n, len(stream.pending))
 		stream.viewDirty = true
 		remaining -= n
-		changed = true
+		if !stream.resizeSettling {
+			changed = true
+		}
 	}
 	return changed
 }
@@ -1045,29 +1091,136 @@ func (a *App) resizeStreamViewTo(stream *appSessionStream, size protocol.Termina
 	stream.size = size
 	stream.viewDirty = true
 	a.recordDebugResize(stream.sessionID, size)
-	a.queueStreamResize(stream, size)
+	a.scheduleStreamResize(stream, size, time.Now())
 }
 
-func (a *App) queueStreamResize(stream *appSessionStream, size protocol.TerminalSize) {
-	if stream == nil || stream.stream == nil {
+func (a *App) scheduleStreamResize(stream *appSessionStream, size protocol.TerminalSize, now time.Time) {
+	if stream == nil {
 		return
 	}
-	if stream.writes == nil {
-		_ = stream.stream.Resize(size)
+	stream.pendingResize = size
+	stream.resizePending = true
+	stream.resizeDue = now.Add(appStreamResizeDebounce)
+	a.debugf("resize scheduled session=%q cols=%d rows=%d due=%s", stream.sessionID, size.Cols, size.Rows, stream.resizeDue.Format(time.RFC3339Nano))
+}
+
+func (a *App) delayPendingStreamResize(stream *appSessionStream, now time.Time) {
+	if stream == nil || !stream.resizePending {
 		return
+	}
+	stream.resizeDue = now.Add(appStreamResizeDebounce)
+	a.debugf("resize delayed session=%q cols=%d rows=%d due=%s", stream.sessionID, stream.pendingResize.Cols, stream.pendingResize.Rows, stream.resizeDue.Format(time.RFC3339Nano))
+}
+
+func (a *App) flushDueStreamResizes(now time.Time) bool {
+	if a == nil || a.dragSplit {
+		return false
+	}
+	a.ensureAppState()
+	for _, stream := range a.streams {
+		if stream == nil || stream.stream == nil || !stream.resizePending || now.Before(stream.resizeDue) {
+			continue
+		}
+		size := stream.pendingResize
+		if a.queueStreamResizeNow(stream, size, now) {
+			stream.resizePending = false
+			stream.pendingResize = protocol.TerminalSize{}
+			stream.resizeDue = time.Time{}
+		} else {
+			stream.resizeDue = now.Add(appStreamResizeDebounce)
+		}
+	}
+	return false
+}
+
+func (a *App) queueStreamResizeNow(stream *appSessionStream, size protocol.TerminalSize, now time.Time) bool {
+	if stream == nil || stream.stream == nil {
+		return false
+	}
+	if stream.writes == nil {
+		if err := stream.stream.Resize(size); err != nil {
+			a.debugf("resize failed session=%q cols=%d rows=%d error=%q", stream.sessionID, size.Cols, size.Rows, err.Error())
+			return false
+		}
+		a.startResizeSettle(stream, now)
+		return true
 	}
 	select {
 	case stream.writes <- appStreamWrite{size: size, resize: true}:
+		a.beginResizeSettle(stream, now)
+		return true
 	default:
 		a.debugf("resize dropped session=%q cols=%d rows=%d", stream.sessionID, size.Cols, size.Rows)
+		return false
 	}
+}
+
+func (a *App) beginResizeSettle(stream *appSessionStream, now time.Time) {
+	if stream == nil {
+		return
+	}
+	stream.resizeSettling = true
+	stream.resizeAwaitingWrite = true
+	stream.resizeSawOutput = false
+	stream.resizeQuiet = time.Time{}
+	stream.resizeMax = now.Add(appStreamResizeSettleMax)
+	a.debugf("resize settle pending session=%q max=%s", stream.sessionID, stream.resizeMax.Format(time.RFC3339Nano))
+}
+
+func (a *App) startResizeSettle(stream *appSessionStream, now time.Time) {
+	if stream == nil {
+		return
+	}
+	sawOutput := stream.resizeSawOutput
+	stream.resizeSettling = true
+	stream.resizeAwaitingWrite = false
+	stream.resizeSawOutput = sawOutput
+	stream.resizeQuiet = now.Add(appStreamResizeSettleQuiet)
+	stream.resizeMax = now.Add(appStreamResizeSettleMax)
+	a.debugf("resize settle start session=%q quiet=%s max=%s", stream.sessionID, stream.resizeQuiet.Format(time.RFC3339Nano), stream.resizeMax.Format(time.RFC3339Nano))
+}
+
+func (a *App) finishResizeSettles(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	a.ensureAppState()
+	changed := false
+	for _, stream := range a.streams {
+		if stream == nil || !stream.resizeSettling {
+			continue
+		}
+		if len(stream.pending) > 0 {
+			continue
+		}
+		if stream.resizeAwaitingWrite {
+			if now.Before(stream.resizeMax) {
+				continue
+			}
+		} else if stream.resizeSawOutput {
+			if now.Before(stream.resizeMax) && now.Before(stream.resizeQuiet) {
+				continue
+			}
+		} else if now.Before(stream.resizeMax) {
+			continue
+		}
+		stream.resizeSettling = false
+		stream.resizeAwaitingWrite = false
+		stream.resizeSawOutput = false
+		stream.resizeQuiet = time.Time{}
+		stream.resizeMax = time.Time{}
+		stream.viewDirty = true
+		a.debugf("resize settle complete session=%q pending=%d", stream.sessionID, len(stream.pending))
+		changed = true
+	}
+	return changed
 }
 
 func (a *App) refreshDirtyTerminalViews() bool {
 	a.ensureAppState()
 	changed := false
 	for _, stream := range a.streams {
-		if stream == nil || !stream.viewDirty {
+		if stream == nil || !stream.viewDirty || stream.resizeSettling {
 			continue
 		}
 		a.updateStreamBuffer(stream)
@@ -2270,13 +2423,21 @@ func styleStatus(status string) string {
 
 func visibleLen(value string) int {
 	n := 0
-	for i := 0; i < len(value); i++ {
+	for i := 0; i < len(value); {
 		b := value[i]
 		if b == 0x1b {
 			i = skipEscape(value, i)
+			i++
 			continue
 		}
-		n++
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			n++
+			i++
+			continue
+		}
+		n += runewidth.RuneWidth(r)
+		i += size
 	}
 	return n
 }
@@ -2287,19 +2448,31 @@ func truncateVisible(value string, limit int) string {
 	}
 	var out strings.Builder
 	visible := 0
-	for i := 0; i < len(value); i++ {
+	for i := 0; i < len(value); {
 		b := value[i]
 		if b == 0x1b {
 			end := skipEscape(value, i)
 			out.WriteString(value[i : end+1])
-			i = end
+			i = end + 1
 			continue
 		}
-		out.WriteByte(b)
-		visible++
-		if visible >= limit {
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			if visible+1 > limit {
+				break
+			}
+			out.WriteByte(value[i])
+			visible++
+			i++
+			continue
+		}
+		width := runewidth.RuneWidth(r)
+		if visible+width > limit {
 			break
 		}
+		out.WriteString(value[i : i+size])
+		visible += width
+		i += size
 	}
 	out.WriteString("\x1b[0m")
 	return out.String()
