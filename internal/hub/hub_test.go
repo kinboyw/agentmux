@@ -385,6 +385,86 @@ func TestWorkerDisconnectKeepsRegisteredWorkerView(t *testing.T) {
 	}
 }
 
+func TestWorkerActionUpdatesManagementFlags(t *testing.T) {
+	server := New(":0", "secret", nil)
+	server.registerWorker(&workerConn{
+		id:       "local",
+		tenantID: "tenant_test",
+		name:     "Laptop",
+		backend:  "tmux",
+		send:     make(chan protocol.Envelope, 1),
+	})
+
+	body := bytes.NewReader([]byte(`{"enabled":false,"trace_enabled":true,"debug_enabled":true}`))
+	req := httptest.NewRequest(http.MethodPatch, "/api/workers/local", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.requireRole("control", server.handleWorkerAction)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Worker protocol.WorkerView `json:"worker"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Worker.Enabled || !payload.Worker.TraceEnabled || !payload.Worker.DebugEnabled || payload.Worker.Backend != "tmux" {
+		t.Fatalf("unexpected worker payload: %+v", payload.Worker)
+	}
+}
+
+func TestDisabledWorkerRejectsCreateAndAttach(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 1),
+	}
+	server.registerWorker(worker)
+	enabled := false
+	server.mu.Lock()
+	record := server.workerViews["local"]
+	record.disabled = !enabled
+	server.workerViews["local"] = record
+	server.mu.Unlock()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/sessions", bytes.NewReader([]byte(`{"worker_id":"local","name":"demo","cwd":".","command":"bash"}`)))
+	createReq.Header.Set("Authorization", "Bearer secret")
+	createRec := httptest.NewRecorder()
+	server.requireRole("control", server.handleSessions)(createRec, createReq)
+	if createRec.Code != http.StatusForbidden {
+		t.Fatalf("expected create forbidden, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	control := &controlConn{send: make(chan protocol.Envelope, 1)}
+	payload, err := protocol.MarshalPayload(protocol.TerminalSize{Cols: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleControlMessage(control, protocol.Envelope{
+		Type:      protocol.TypeControlOpen,
+		StreamID:  "stream-1",
+		SessionID: "local/demo",
+		Payload:   payload,
+	})
+
+	select {
+	case env := <-control.send:
+		if env.Type != protocol.TypeError {
+			t.Fatalf("expected error envelope, got %s", env.Type)
+		}
+		if !strings.Contains(string(env.Payload), "worker is disabled") {
+			t.Fatalf("unexpected error payload: %s", string(env.Payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control did not receive disabled worker error")
+	}
+	if len(worker.send) != 0 {
+		t.Fatal("disabled worker should not receive terminal.open")
+	}
+}
+
 func TestControlCredentialMintsSignalForOwnTenant(t *testing.T) {
 	server := New(":0", "", nil)
 	body := []byte(`{"email":"user@example.com","password":"password123","name":"User","device_name":"browser"}`)

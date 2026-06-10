@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -21,6 +22,12 @@ type fakeRunner struct {
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
 	f.calls = append(f.calls, call{name: name, args: append([]string(nil), args...)})
 	return f.output, nil
+}
+
+type fakeRunnerFunc func(context.Context, string, ...string) (string, error)
+
+func (f fakeRunnerFunc) Run(ctx context.Context, name string, args ...string) (string, error) {
+	return f(ctx, name, args...)
 }
 
 func TestListParsesTmuxPanes(t *testing.T) {
@@ -87,6 +94,25 @@ func TestSendTerminalInputTranslatesControlKeys(t *testing.T) {
 	}
 }
 
+func TestSendTerminalInputPreservesUTF8Literal(t *testing.T) {
+	runner := &fakeRunner{}
+	adapter := New(runner)
+	if err := adapter.SendTerminalInput(context.Background(), "demo", "echo 中文\r"); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(runner.calls))
+	for _, call := range runner.calls {
+		got = append(got, strings.Join(call.args, " "))
+	}
+	want := []string{
+		"send-keys -t demo -l echo 中文",
+		"send-keys -t demo C-m",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("unexpected calls:\n%s", strings.Join(got, "\n"))
+	}
+}
+
 func TestCreateRejectsBadName(t *testing.T) {
 	adapter := New(&fakeRunner{})
 	if err := adapter.Create(context.Background(), "bad name", ".", "bash"); err == nil {
@@ -95,21 +121,91 @@ func TestCreateRejectsBadName(t *testing.T) {
 }
 
 func TestCapturePreservesEscapeSequences(t *testing.T) {
-	runner := &fakeRunner{output: "\x1b[31mred\x1b[0m"}
+	runner := fakeRunnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
+		got := strings.Join(args, " ")
+		switch got {
+		case "list-panes -t demo -F " + tmuxPaneGeometryFormat:
+			return "%1\t0\t0\t80\t24\t80\t24\n", nil
+		case "capture-pane -t demo -p -e -S -12":
+			return "\x1b[31mred\x1b[0m", nil
+		default:
+			return "", fmt.Errorf("unexpected call: %s %s", name, got)
+		}
+	})
 	adapter := New(runner)
 	output, err := adapter.Capture(context.Background(), "demo", 12)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output != runner.output {
+	if output != "\x1b[31mred\x1b[0m" {
 		t.Fatalf("unexpected output: %q", output)
 	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("expected one call, got %d", len(runner.calls))
+}
+
+func TestCaptureComposesSplitWindowPanes(t *testing.T) {
+	calls := []string(nil)
+	runner := fakeRunnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
+		got := strings.Join(args, " ")
+		calls = append(calls, got)
+		switch got {
+		case "list-panes -t demo -F " + tmuxPaneGeometryFormat:
+			return "%1\t0\t0\t14\t4\t28\t4\n%2\t14\t0\t14\t4\t28\t4\n", nil
+		case "capture-pane -t %1 -p -e":
+			return "left one\nleft two\n", nil
+		case "capture-pane -t %2 -p -e":
+			return "\x1b[31mright one\x1b[0m\nright two\n", nil
+		default:
+			return "", fmt.Errorf("unexpected call: %s %s", name, got)
+		}
+	})
+	adapter := New(runner)
+	output, err := adapter.Capture(context.Background(), "demo", 12)
+	if err != nil {
+		t.Fatal(err)
 	}
-	got := strings.Join(runner.calls[0].args, " ")
-	want := "capture-pane -t demo -p -e -S -12"
-	if got != want {
-		t.Fatalf("unexpected capture call:\n got: %s\nwant: %s", got, want)
+	plain := stripEscapeSequences(output)
+	if !strings.Contains(plain, "left one") || !strings.Contains(plain, "right one") {
+		t.Fatalf("expected both pane outputs in composed preview:\n%s", plain)
+	}
+	if !strings.Contains(plain, "+------------++------------+") {
+		t.Fatalf("expected pane borders in composed preview:\n%s", plain)
+	}
+	if strings.Contains(plain, "\x1b") {
+		t.Fatalf("expected composed preview to strip escape sequences:\n%q", plain)
+	}
+	wantCalls := []string{
+		"list-panes -t demo -F " + tmuxPaneGeometryFormat,
+		"capture-pane -t %1 -p -e",
+		"capture-pane -t %2 -p -e",
+	}
+	if strings.Join(calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("unexpected calls:\n%s", strings.Join(calls, "\n"))
+	}
+}
+
+func TestCaptureFallsBackToPaneScrollbackWhenGeometryFails(t *testing.T) {
+	calls := []string(nil)
+	runner := fakeRunnerFunc(func(_ context.Context, _ string, args ...string) (string, error) {
+		got := strings.Join(args, " ")
+		calls = append(calls, got)
+		switch got {
+		case "list-panes -t demo -F " + tmuxPaneGeometryFormat:
+			return "", fmt.Errorf("tmux missing")
+		case "capture-pane -t demo -p -e -S -12":
+			return "fallback", nil
+		default:
+			return "", fmt.Errorf("unexpected call: %s", got)
+		}
+	})
+	adapter := New(runner)
+	output, err := adapter.Capture(context.Background(), "demo", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != "fallback" {
+		t.Fatalf("unexpected output: %q", output)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected geometry then fallback calls, got %d: %v", len(calls), calls)
 	}
 }

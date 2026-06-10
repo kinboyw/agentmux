@@ -70,6 +70,7 @@ func (e Envelope) Validate() error {
 type WorkerHello struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
+	Backend string `json:"backend,omitempty"`
 }
 
 type Session struct {
@@ -77,6 +78,7 @@ type Session struct {
 	CWD     string `json:"cwd"`
 	Command string `json:"command"`
 	Status  string `json:"status"`
+	Backend string `json:"backend,omitempty"`
 }
 
 type SessionView struct {
@@ -87,6 +89,7 @@ type SessionView struct {
 	CWD      string `json:"cwd"`
 	Command  string `json:"command"`
 	Status   string `json:"status"`
+	Backend  string `json:"backend,omitempty"`
 }
 
 type SessionSnapshot struct {
@@ -94,11 +97,13 @@ type SessionSnapshot struct {
 }
 
 type SessionPreviewRequest struct {
-	Lines int `json:"lines"`
+	Lines int    `json:"lines"`
+	Scope string `json:"scope,omitempty"`
 }
 
 type SessionPreview struct {
-	Data string `json:"data"`
+	Data  string `json:"data"`
+	Scope string `json:"scope,omitempty"`
 }
 
 type CreateSession struct {
@@ -123,13 +128,17 @@ type TerminalOutput struct {
 }
 
 type WorkerView struct {
-	ID       string    `json:"id"`
-	TenantID string    `json:"tenant_id,omitempty"`
-	Name     string    `json:"name"`
-	Addr     string    `json:"addr"`
-	LastSeen time.Time `json:"last_seen"`
-	Status   string    `json:"status,omitempty"`
-	Online   bool      `json:"online"`
+	ID           string    `json:"id"`
+	TenantID     string    `json:"tenant_id,omitempty"`
+	Name         string    `json:"name"`
+	Addr         string    `json:"addr"`
+	Backend      string    `json:"backend,omitempty"`
+	LastSeen     time.Time `json:"last_seen"`
+	Status       string    `json:"status,omitempty"`
+	Online       bool      `json:"online"`
+	Enabled      bool      `json:"enabled"`
+	TraceEnabled bool      `json:"trace_enabled"`
+	DebugEnabled bool      `json:"debug_enabled"`
 }
 
 type ErrorPayload struct {

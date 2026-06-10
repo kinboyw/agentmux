@@ -10,9 +10,11 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"private/agentmux/internal/protocol"
 	"private/agentmux/internal/term"
+	"private/agentmux/internal/terminalview"
 )
 
 type App struct {
@@ -21,43 +23,56 @@ type App struct {
 	In     *os.File
 	Out    io.Writer
 
-	workers  []protocol.WorkerView
-	sessions []protocol.SessionView
-	selected int
-	status   string
-	err      error
-	preview  string
-	previews map[string]string
-	loggedIn bool
-	streams  map[string]*appSessionStream
-	buffers  map[string]string
-	active   string
-	events   chan appStreamEvent
+	workers    []protocol.WorkerView
+	sessions   []protocol.SessionView
+	selected   int
+	status     string
+	err        error
+	preview    string
+	previews   map[string]string
+	loggedIn   bool
+	streams    map[string]*appSessionStream
+	buffers    map[string]string
+	active     string
+	fullscreen bool
+	events     chan appStreamEvent
 
 	rawRestore func()
 	keys       appKeyReader
+	debug      appDebugState
 }
 
 const (
-	appStreamBufferLimit = 256 * 1024
-	appStreamDetachTTL   = 90 * time.Second
-	appStreamWarmupMin   = 450 * time.Millisecond
-	appStreamWarmupQuiet = 180 * time.Millisecond
-	appStreamWarmupMax   = 1500 * time.Millisecond
-	appRenderMinInterval = 50 * time.Millisecond
+	appStreamBufferLimit         = 256 * 1024
+	appStreamPendingLimit        = 4 * 1024 * 1024
+	appStreamProcessBytesPerLoop = 32 * 1024
+	appStreamWriteQueueLimit     = 256
+	appStreamDetachTTL           = 90 * time.Second
+	appStreamWarmupMin           = 450 * time.Millisecond
+	appStreamWarmupQuiet         = 180 * time.Millisecond
+	appStreamWarmupMax           = 1500 * time.Millisecond
+	appRenderMinInterval         = 50 * time.Millisecond
 )
 
 type appSessionStream struct {
-	sessionID  string
-	stream     *Stream
-	cancel     context.CancelFunc
-	connecting bool
-	closing    bool
-	keepUntil  time.Time
-	warming    bool
-	warmUntil  time.Time
-	quietUntil time.Time
-	maxWarm    time.Time
+	sessionID     string
+	stream        *Stream
+	view          *terminalview.View
+	viewDirty     bool
+	size          protocol.TerminalSize
+	pending       []byte
+	writes        chan appStreamWrite
+	cancel        context.CancelFunc
+	connecting    bool
+	closing       bool
+	keepUntil     time.Time
+	warming       bool
+	warmUntil     time.Time
+	quietUntil    time.Time
+	maxWarm       time.Time
+	seenOutput    bool
+	visibleOutput bool
+	prefilled     bool
 }
 
 type appStreamEvent struct {
@@ -67,6 +82,12 @@ type appStreamEvent struct {
 	data      []byte
 	err       error
 	closed    bool
+}
+
+type appStreamWrite struct {
+	data   string
+	size   protocol.TerminalSize
+	resize bool
 }
 
 func NewApp(client Client, auth AppAuthResult, in *os.File, out io.Writer) *App {
@@ -92,6 +113,9 @@ func NewUnauthApp(in *os.File, out io.Writer, err error) *App {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	defer a.closeDebug()
+	a.debugf("run start logged_in=%t hub=%q source=%q", a.loggedIn, debugSafeURL(a.Client.HubURL), a.Auth.Source)
+	defer a.debugf("run stop")
 	if a.In == nil {
 		a.In = os.Stdin
 	}
@@ -119,17 +143,13 @@ func (a *App) Run(ctx context.Context) error {
 	lastRender := time.Now()
 	pendingRender := false
 	for {
-		changed := a.drainStreamEvents(64)
-		if time.Since(lastCleanup) >= time.Second {
-			lastCleanup = time.Now()
-			changed = a.cleanupStreams(time.Now()) || changed
-		}
-		changed = a.finishWarmStreams(time.Now()) || changed
 		key, ok, err := a.keys.ReadAvailable(a.In)
 		if err != nil {
 			return err
 		}
+		changed := false
 		if ok {
+			a.recordDebugKey(key, a.active != "")
 			quit := a.handleKey(ctx, key)
 			a.clampSelection()
 			changed = true
@@ -137,10 +157,18 @@ func (a *App) Run(ctx context.Context) error {
 				return nil
 			}
 		}
+		changed = a.drainStreamEvents(16) || changed
+		changed = a.processPendingStreamOutput(appStreamProcessBytesPerLoop) || changed
+		if time.Since(lastCleanup) >= time.Second {
+			lastCleanup = time.Now()
+			changed = a.cleanupStreams(time.Now()) || changed
+		}
+		changed = a.finishWarmStreams(time.Now()) || changed
 		if changed {
 			pendingRender = true
 		}
 		if pendingRender && (ok || time.Since(lastRender) >= appRenderMinInterval) {
+			a.refreshDirtyTerminalViews()
 			a.render()
 			lastRender = time.Now()
 			pendingRender = false
@@ -149,10 +177,32 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) handleKey(ctx context.Context, key string) bool {
+	if key == "ctrl-q" {
+		a.closeAllStreams()
+		return true
+	}
+	if a.debugEnabled() && (key == "ctrl-g" || (a.active == "" && key == "D")) {
+		a.writeDebugSnapshotStatus("manual")
+		return false
+	}
 	if a.active != "" {
+		if key == "ctrl-f" {
+			a.toggleFullscreen()
+			return false
+		}
 		if key == "detach" {
 			a.detachActive()
 			return false
+		}
+		if a.activeWaitingForStreamOutput() {
+			switch key {
+			case "unknown":
+				a.detachActive()
+				return false
+			case "q", "Q", "ctrl-c":
+				a.closeAllStreams()
+				return true
+			}
 		}
 		if err := a.forwardActiveKey(key); err != nil {
 			a.err = err
@@ -168,13 +218,11 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 		if a.selected > 0 {
 			a.selected--
 			a.loadSelectedPreview()
-			a.warmSelectedStream(ctx)
 		}
 	case "down", "j":
 		if a.selected < len(a.sessions)-1 {
 			a.selected++
 			a.loadSelectedPreview()
-			a.warmSelectedStream(ctx)
 		}
 	case "/":
 		a.promptSlash(ctx)
@@ -191,27 +239,51 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 			a.err = err
 			a.status = "attach failed"
 		}
+	case "ctrl-f":
+		if err := a.attach(ctx); err != nil {
+			a.err = err
+			a.status = "attach failed"
+			return false
+		}
+		a.enterFullscreen()
 	case "?":
-		a.status = "keys: up/down select, enter attach, Ctrl-] detach, / commands, c create, s send, x stop, r refresh, q quit"
+		a.status = "keys: up/down select, enter attach, Ctrl-F fullscreen, Ctrl-] detach, / commands, c create, s send, x stop, r refresh, q quit"
+		if a.debugEnabled() {
+			a.status = "keys: up/down select, enter attach, Ctrl-F fullscreen, Ctrl-] detach, / commands, c create, s send, x stop, r refresh, D debug, Ctrl-G debug attached, q quit"
+		}
 	}
 	return false
+}
+
+func (a *App) writeDebugSnapshotStatus(reason string) {
+	path, err := a.writeDebugSnapshot(reason)
+	if err != nil {
+		a.err = err
+		a.status = "debug snapshot failed"
+		return
+	}
+	a.err = nil
+	a.status = "debug snapshot " + path
 }
 
 func (a *App) refresh(ctx context.Context) {
 	if !a.ensureLoggedIn() {
 		return
 	}
+	a.debugf("refresh start")
 	a.ensureAppState()
 	workers, err := a.Client.Workers(ctx)
 	if err != nil {
 		a.err = err
 		a.status = "refresh workers failed"
+		a.debugf("refresh workers failed error=%q", err.Error())
 		return
 	}
 	sessions, err := a.Client.Sessions(ctx)
 	if err != nil {
 		a.err = err
 		a.status = "refresh sessions failed"
+		a.debugf("refresh sessions failed error=%q", err.Error())
 		return
 	}
 	a.workers = dedupeWorkers(workers)
@@ -222,11 +294,12 @@ func (a *App) refresh(ctx context.Context) {
 	a.closeMissingSessionStreams()
 	a.refreshPreviewCache(ctx)
 	a.loadSelectedPreview()
-	a.warmSelectedStream(ctx)
+	a.debugf("refresh complete workers=%d sessions=%d selected=%d", len(a.workers), len(a.sessions), a.selected)
 }
 
 func (a *App) refreshPreviewCache(ctx context.Context) {
 	a.previews = map[string]string{}
+	previewLines := a.previewCaptureLines()
 	type result struct {
 		id   string
 		data string
@@ -240,7 +313,7 @@ func (a *App) refreshPreviewCache(ctx context.Context) {
 				if session.ID == "" {
 					continue
 				}
-				data, err := a.Client.SessionPreview(ctx, session.ID, 80)
+				data, err := a.Client.SessionPreview(ctx, session.ID, previewLines)
 				if err != nil {
 					results <- result{id: session.ID}
 					continue
@@ -262,6 +335,17 @@ func (a *App) refreshPreviewCache(ctx context.Context) {
 		item := <-results
 		a.previews[item.id] = item.data
 	}
+}
+
+func (a *App) previewCaptureLines() int {
+	cols, rows := 120, 36
+	if a != nil && a.In != nil {
+		if c, r, err := term.Size(a.In); err == nil {
+			cols, rows = c, r
+		}
+	}
+	_, _, limit := appLayout(cols, rows)
+	return max(4, limit)
 }
 
 func (a *App) loadSelectedPreview() {
@@ -296,14 +380,6 @@ func (a *App) ensureAppState() {
 	}
 }
 
-func (a *App) warmSelectedStream(ctx context.Context) {
-	session := a.selectedSession()
-	if session.ID == "" {
-		return
-	}
-	_ = a.ensureStream(ctx, session.ID)
-}
-
 func (a *App) closeMissingSessionStreams() {
 	a.ensureAppState()
 	current := map[string]bool{}
@@ -317,6 +393,7 @@ func (a *App) closeMissingSessionStreams() {
 		a.closeSessionStream(sessionID)
 		if a.active == sessionID {
 			a.active = ""
+			a.fullscreen = false
 		}
 	}
 }
@@ -409,16 +486,57 @@ func (a *App) attach(ctx context.Context) error {
 		return nil
 	}
 	a.ensureAppState()
+	previousActive := a.active
+	previousFullscreen := a.fullscreen
+	a.active = session.ID
+	a.fullscreen = false
 	if err := a.ensureStream(ctx, session.ID); err != nil {
+		a.active = previousActive
+		a.fullscreen = previousFullscreen
 		return err
 	}
 	if stream := a.streams[session.ID]; stream != nil {
 		stream.keepUntil = time.Time{}
+		a.resizeStreamView(stream)
 	}
-	a.active = session.ID
-	a.status = "attached " + session.ID + "  Ctrl-] detach"
+	a.status = attachedPreviewStatus(session.ID)
 	a.loadSelectedPreview()
+	a.debugf("attach session=%q", session.ID)
 	return nil
+}
+
+func (a *App) enterFullscreen() {
+	if a.active == "" {
+		return
+	}
+	a.fullscreen = true
+	if stream := a.streams[a.active]; stream != nil {
+		a.resizeStreamView(stream)
+	}
+	a.status = attachedFullscreenStatus(a.active)
+	a.debugf("fullscreen enter session=%q", a.active)
+}
+
+func (a *App) exitFullscreen() {
+	if a.active == "" {
+		a.fullscreen = false
+		return
+	}
+	a.fullscreen = false
+	if stream := a.streams[a.active]; stream != nil {
+		a.resizeStreamView(stream)
+	}
+	a.status = attachedPreviewStatus(a.active)
+	a.loadSelectedPreview()
+	a.debugf("fullscreen exit session=%q", a.active)
+}
+
+func (a *App) toggleFullscreen() {
+	if a.fullscreen {
+		a.exitFullscreen()
+		return
+	}
+	a.enterFullscreen()
 }
 
 func (a *App) detachActive() {
@@ -427,11 +545,14 @@ func (a *App) detachActive() {
 	}
 	sessionID := a.active
 	a.active = ""
+	a.fullscreen = false
 	if stream := a.streams[sessionID]; stream != nil {
 		stream.keepUntil = time.Now().Add(appStreamDetachTTL)
+		a.resizeStreamView(stream)
 	}
 	a.status = "detached " + sessionID + "  stream kept " + appStreamDetachTTL.String()
 	a.loadSelectedPreview()
+	a.debugf("detach session=%q keep_until=%s", sessionID, streamKeepUntil(a.streams[sessionID]))
 }
 
 func (a *App) forwardActiveKey(key string) error {
@@ -440,12 +561,25 @@ func (a *App) forwardActiveKey(key string) error {
 		return nil
 	}
 	stream := a.streams[sessionID]
-	if stream == nil || stream.stream == nil {
+	if stream == nil {
 		a.status = "stream connecting " + sessionID
 		return nil
 	}
 	data := appKeyInputData(key)
 	if data == "" {
+		return nil
+	}
+	if stream.writes != nil {
+		select {
+		case stream.writes <- appStreamWrite{data: data}:
+			return nil
+		default:
+			a.status = "input queue full " + sessionID
+			return nil
+		}
+	}
+	if stream.stream == nil {
+		a.status = "stream connecting " + sessionID
 		return nil
 	}
 	return stream.stream.Input(data)
@@ -473,12 +607,22 @@ func appKeyInputData(key string) string {
 		return "\x1b"
 	case "detach":
 		return ""
+	case "ctrl-g":
+		return "\x07"
 	default:
-		if len(key) == 1 {
+		if appKeyIsSingleRune(key) {
 			return key
 		}
 		return ""
 	}
+}
+
+func appKeyIsSingleRune(key string) bool {
+	if key == "" || !utf8.ValidString(key) {
+		return false
+	}
+	_, size := utf8.DecodeRuneInString(key)
+	return size == len(key)
 }
 
 func (a *App) ensureStream(ctx context.Context, sessionID string) error {
@@ -489,40 +633,86 @@ func (a *App) ensureStream(ctx context.Context, sessionID string) error {
 	if existing := a.streams[sessionID]; existing != nil {
 		return nil
 	}
+	a.debugf("stream ensure session=%q", sessionID)
 	streamCtx, cancel := context.WithCancel(ctx)
 	now := time.Now()
 	state := &appSessionStream{
 		sessionID: sessionID, cancel: cancel, connecting: true, warming: true,
+		writes:    make(chan appStreamWrite, appStreamWriteQueueLimit),
 		warmUntil: now.Add(appStreamWarmupMin), quietUntil: now.Add(appStreamWarmupQuiet), maxWarm: now.Add(appStreamWarmupMax),
 	}
 	a.streams[sessionID] = state
-	size := a.streamSize()
-	go a.openStream(streamCtx, sessionID, size)
+	size := a.streamSizeFor(sessionID)
+	state.view = terminalview.New(size.Cols, size.Rows)
+	state.size = size
+	if capture := a.previews[sessionID]; capture != "" && a.active != sessionID {
+		state.view.Write([]byte(capture))
+		state.viewDirty = true
+		state.prefilled = true
+		a.updateStreamBuffer(state)
+	}
+	go a.openStream(streamCtx, sessionID, size, state.writes)
 	return nil
 }
 
-func (a *App) openStream(ctx context.Context, sessionID string, size protocol.TerminalSize) {
+func (a *App) openStream(ctx context.Context, sessionID string, size protocol.TerminalSize, writes <-chan appStreamWrite) {
+	a.debugf("stream open start session=%q cols=%d rows=%d", sessionID, size.Cols, size.Rows)
 	stream, err := a.Client.OpenStream(ctx, sessionID, size)
 	if err != nil {
+		a.debugf("stream open failed session=%q error=%q", sessionID, err.Error())
 		a.sendStreamEvent(appStreamEvent{sessionID: sessionID, err: err, closed: true})
 		return
 	}
+	a.debugf("stream open complete session=%q stream_id=%q", sessionID, stream.StreamID)
+	done := make(chan struct{})
+	defer close(done)
+	go a.writeStreamLoop(ctx, sessionID, stream, writes, done)
 	a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, connected: true})
 	for {
 		event, err := stream.ReadEvent()
 		if len(event.Data) > 0 {
+			a.debugf("stream read output session=%q stream_id=%q bytes=%d", sessionID, stream.StreamID, len(event.Data))
 			a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, data: event.Data})
 		}
 		if event.Err != nil {
+			a.debugf("stream read event error session=%q stream_id=%q error=%q", sessionID, stream.StreamID, event.Err.Error())
 			a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, err: event.Err})
 		}
 		if err != nil {
+			a.debugf("stream read ended session=%q stream_id=%q error=%q", sessionID, stream.StreamID, err.Error())
 			if !errors.Is(err, context.Canceled) {
 				a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, err: err, closed: true})
 			} else {
 				a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, closed: true})
 			}
 			return
+		}
+	}
+}
+
+func (a *App) writeStreamLoop(ctx context.Context, sessionID string, stream *Stream, writes <-chan appStreamWrite, done <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			a.debugf("stream write loop context done session=%q stream_id=%q", sessionID, stream.StreamID)
+			return
+		case <-done:
+			a.debugf("stream write loop done session=%q stream_id=%q", sessionID, stream.StreamID)
+			return
+		case write := <-writes:
+			var err error
+			if write.resize {
+				a.debugf("stream write resize session=%q stream_id=%q cols=%d rows=%d", sessionID, stream.StreamID, write.size.Cols, write.size.Rows)
+				err = stream.Resize(write.size)
+			} else if write.data != "" {
+				a.debugf("stream write input session=%q stream_id=%q bytes=%d", sessionID, stream.StreamID, len(write.data))
+				err = stream.Input(write.data)
+			}
+			if err != nil {
+				a.debugf("stream write failed session=%q stream_id=%q error=%q", sessionID, stream.StreamID, err.Error())
+				a.sendStreamEvent(appStreamEvent{sessionID: sessionID, stream: stream, err: err, closed: true})
+				return
+			}
 		}
 	}
 }
@@ -536,15 +726,18 @@ func (a *App) sendStreamEvent(event appStreamEvent) {
 	case events <- event:
 	default:
 		if len(event.data) > 0 && !event.connected && !event.closed && event.err == nil {
+			a.debugf("stream event dropped data session=%q bytes=%d", event.sessionID, len(event.data))
 			return
 		}
 		select {
 		case <-events:
+			a.debugf("stream event queue dropped oldest")
 		default:
 		}
 		select {
 		case events <- event:
 		default:
+			a.debugf("stream event dropped session=%q connected=%t closed=%t err=%t", event.sessionID, event.connected, event.closed, event.err != nil)
 		}
 	}
 }
@@ -566,16 +759,20 @@ func (a *App) drainStreamEvents(limit int) bool {
 
 func (a *App) applyStreamEvent(event appStreamEvent) {
 	a.ensureAppState()
+	a.recordDebugStreamEvent(event)
 	stream := a.streams[event.sessionID]
 	if stream == nil {
 		if event.stream != nil {
-			_ = event.stream.Close()
+			go func(stream *Stream) {
+				_ = stream.Close()
+			}(event.stream)
 		}
 		return
 	}
 	if event.connected {
 		stream.stream = event.stream
 		stream.connecting = false
+		a.resizeStreamView(stream)
 		now := time.Now()
 		stream.warming = true
 		stream.warmUntil = now.Add(appStreamWarmupMin)
@@ -584,9 +781,25 @@ func (a *App) applyStreamEvent(event appStreamEvent) {
 		if a.active == event.sessionID {
 			a.status = "attached " + event.sessionID + "  warming stream"
 		}
+		if event.stream != nil {
+			a.debugf("stream connected applied session=%q stream_id=%q size=%dx%d", event.sessionID, event.stream.StreamID, stream.size.Cols, stream.size.Rows)
+		}
 	}
 	if len(event.data) > 0 {
-		a.appendSessionBuffer(event.sessionID, string(event.data))
+		if stream.prefilled {
+			oldView := stream.view
+			stream.view = terminalview.New(stream.size.Cols, stream.size.Rows)
+			stream.viewDirty = true
+			stream.prefilled = false
+			if oldView != nil {
+				oldView.Close()
+			}
+		}
+		stream.seenOutput = true
+		if event.stream != nil {
+			a.debugf("stream output applied session=%q stream_id=%q bytes=%d pending_before=%d", event.sessionID, event.stream.StreamID, len(event.data), len(stream.pending))
+		}
+		a.queueSessionOutput(event.sessionID, event.data)
 		if stream.warming {
 			stream.quietUntil = time.Now().Add(appStreamWarmupQuiet)
 		} else if a.selectedSession().ID == event.sessionID {
@@ -607,24 +820,143 @@ func (a *App) applyStreamEvent(event appStreamEvent) {
 		}
 		if event.stream == nil || stream.stream == nil || stream.stream == event.stream {
 			delete(a.streams, event.sessionID)
+			if stream.view != nil {
+				stream.view.Close()
+			}
 			if a.active == event.sessionID {
 				a.active = ""
+				a.fullscreen = false
 				a.status = "stream closed " + event.sessionID
 			}
+			a.debugf("stream closed session=%q", event.sessionID)
 		}
 	}
 }
 
-func (a *App) appendSessionBuffer(sessionID, data string) {
-	if data == "" {
+func (a *App) queueSessionOutput(sessionID string, data []byte) {
+	if len(data) == 0 {
 		return
 	}
 	a.ensureAppState()
-	value := a.buffers[sessionID] + data
+	stream := a.streams[sessionID]
+	if stream != nil {
+		stream.seenOutput = true
+		stream.pending = append(stream.pending, data...)
+		if len(stream.pending) > appStreamPendingLimit {
+			dropped := len(stream.pending) - appStreamPendingLimit
+			stream.pending = append([]byte(nil), stream.pending[len(stream.pending)-appStreamPendingLimit:]...)
+			a.recordDebugPendingDropped(sessionID, dropped)
+		}
+		return
+	}
+	value := a.buffers[sessionID] + string(data)
 	if len(value) > appStreamBufferLimit {
 		value = value[len(value)-appStreamBufferLimit:]
 	}
 	a.buffers[sessionID] = value
+}
+
+func (a *App) processPendingStreamOutput(limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+	a.ensureAppState()
+	changed := false
+	remaining := limit
+	for _, stream := range a.streams {
+		if stream == nil || len(stream.pending) == 0 || remaining <= 0 {
+			continue
+		}
+		a.resizeStreamView(stream)
+		if stream.view == nil {
+			size := a.streamSizeFor(stream.sessionID)
+			stream.view = terminalview.New(size.Cols, size.Rows)
+			stream.size = size
+		}
+		n := min(len(stream.pending), remaining)
+		stream.view.Write(stream.pending[:n])
+		if !stream.visibleOutput && terminalLinesHaveVisibleContent(terminalScreenLines(stream.view.Screen())) {
+			stream.visibleOutput = true
+			a.debugf("stream visible output session=%q processed=%d", stream.sessionID, n)
+		}
+		if n == len(stream.pending) {
+			stream.pending = nil
+		} else {
+			stream.pending = stream.pending[n:]
+		}
+		a.recordDebugPendingProcessed(stream.sessionID, n, len(stream.pending))
+		a.debugf("stream pending processed session=%q bytes=%d remaining=%d", stream.sessionID, n, len(stream.pending))
+		stream.viewDirty = true
+		remaining -= n
+		changed = true
+	}
+	return changed
+}
+
+func (a *App) resizeStreamView(stream *appSessionStream) {
+	if stream == nil || stream.view == nil {
+		return
+	}
+	a.resizeStreamViewTo(stream, a.streamSizeFor(stream.sessionID))
+}
+
+func (a *App) resizeStreamViewTo(stream *appSessionStream, size protocol.TerminalSize) {
+	if stream == nil || stream.view == nil {
+		return
+	}
+	if size.Cols < 1 {
+		size.Cols = 80
+	}
+	if size.Rows < 1 {
+		size.Rows = 24
+	}
+	if stream.size == size {
+		return
+	}
+	stream.view.Resize(size.Cols, size.Rows)
+	stream.size = size
+	stream.viewDirty = true
+	a.recordDebugResize(stream.sessionID, size)
+	a.queueStreamResize(stream, size)
+}
+
+func (a *App) queueStreamResize(stream *appSessionStream, size protocol.TerminalSize) {
+	if stream == nil || stream.stream == nil {
+		return
+	}
+	if stream.writes == nil {
+		_ = stream.stream.Resize(size)
+		return
+	}
+	select {
+	case stream.writes <- appStreamWrite{size: size, resize: true}:
+	default:
+		a.debugf("resize dropped session=%q cols=%d rows=%d", stream.sessionID, size.Cols, size.Rows)
+	}
+}
+
+func (a *App) refreshDirtyTerminalViews() bool {
+	a.ensureAppState()
+	changed := false
+	for _, stream := range a.streams {
+		if stream == nil || !stream.viewDirty {
+			continue
+		}
+		a.updateStreamBuffer(stream)
+		changed = true
+	}
+	return changed
+}
+
+func (a *App) updateStreamBuffer(stream *appSessionStream) {
+	if stream == nil || stream.view == nil || stream.sessionID == "" {
+		return
+	}
+	a.buffers[stream.sessionID] = stream.view.Render()
+	stream.viewDirty = false
+	if !stream.warming && a.selectedSession().ID == stream.sessionID {
+		a.loadSelectedPreview()
+	}
 }
 
 func (a *App) finishWarmStreams(now time.Time) bool {
@@ -643,7 +975,11 @@ func (a *App) finishWarmStreams(now time.Time) bool {
 			changed = true
 		}
 		if a.active == sessionID {
-			a.status = "attached " + sessionID + "  Ctrl-] detach"
+			if a.fullscreen {
+				a.status = attachedFullscreenStatus(sessionID)
+			} else {
+				a.status = attachedPreviewStatus(sessionID)
+			}
 			changed = true
 		}
 	}
@@ -670,11 +1006,17 @@ func (a *App) closeSessionStream(sessionID string) {
 	}
 	stream.closing = true
 	delete(a.streams, sessionID)
+	a.debugf("stream close requested session=%q", sessionID)
 	if stream.cancel != nil {
 		stream.cancel()
 	}
 	if stream.stream != nil {
-		_ = stream.stream.Close()
+		go func(stream *Stream) {
+			_ = stream.Close()
+		}(stream.stream)
+	}
+	if stream.view != nil {
+		stream.view.Close()
 	}
 }
 
@@ -688,14 +1030,22 @@ func (a *App) closeAllStreams() {
 		a.closeSessionStream(sessionID)
 	}
 	a.active = ""
+	a.fullscreen = false
 }
 
 func (a *App) streamSize() protocol.TerminalSize {
+	return a.streamSizeFor("")
+}
+
+func (a *App) streamSizeFor(sessionID string) protocol.TerminalSize {
 	cols, rows := 120, 36
 	if a.In != nil {
 		if c, r, err := term.Size(a.In); err == nil {
 			cols, rows = c, r
 		}
+	}
+	if a.fullscreen && a.active != "" && (sessionID == "" || sessionID == a.active) {
+		return appActiveStreamSize(cols, rows)
 	}
 	_, previewWidth, limit := appLayout(cols, rows)
 	if previewWidth <= 0 {
@@ -707,6 +1057,16 @@ func (a *App) streamSize() protocol.TerminalSize {
 	return protocol.TerminalSize{Cols: previewWidth, Rows: limit}
 }
 
+func appActiveStreamSize(cols, rows int) protocol.TerminalSize {
+	if rows < 1 {
+		rows = 24
+	}
+	if cols < 1 {
+		cols = 80
+	}
+	return protocol.TerminalSize{Cols: cols, Rows: rows}
+}
+
 func (a *App) promptSlash(ctx context.Context) {
 	value := a.promptInline("/")
 	switch strings.TrimSpace(value) {
@@ -714,8 +1074,15 @@ func (a *App) promptSlash(ctx context.Context) {
 		a.promptLogin(ctx)
 	case "refresh", "r":
 		a.refresh(ctx)
+	case "fullscreen", "fs":
+		if err := a.attach(ctx); err != nil {
+			a.err = err
+			a.status = "attach failed"
+			return
+		}
+		a.enterFullscreen()
 	case "help", "?":
-		a.status = "commands: /login /refresh /help"
+		a.status = "commands: /login /refresh /fullscreen /help"
 	case "":
 		a.status = "command canceled"
 	default:
@@ -772,9 +1139,14 @@ func (a *App) render() {
 }
 
 func (a *App) renderWithSize(cols, rows int) {
+	a.recordDebugRender(cols, rows)
 	moveCursor(a.Out, 1, 1)
 	hideCursor(a.Out)
 	defer showCursor(a.Out)
+	if a.fullscreen && a.active != "" {
+		a.renderFullscreenWithSize(cols, rows)
+		return
+	}
 	source := a.Auth.Source
 	if source == "" {
 		if a.loggedIn {
@@ -825,13 +1197,128 @@ func (a *App) renderWithSize(cols, rows int) {
 	if a.err != nil {
 		footer += styleMuted("  |  ") + styleError(a.err.Error())
 	}
+	if a.debugEnabled() {
+		footer += styleMuted("  |  ") + a.debugHUD()
+	}
 	writeLine(a.Out, cols, footer)
 	if a.active != "" {
-		writeLine(a.Out, cols, styleMuted("Ctrl-] detach  input is sent to session"))
+		if a.debugEnabled() {
+			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  Ctrl-G debug  input is sent to right pane"))
+		} else {
+			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  input is sent to right pane"))
+		}
+	} else if a.debugEnabled() {
+		writeLine(a.Out, cols, styleMuted("Enter/a attach  Ctrl-F fullscreen  / commands  c create  s send  x stop  r refresh  D debug  ? help  q quit"))
 	} else {
-		writeLine(a.Out, cols, styleMuted("Enter/a attach  / commands  c create  s send  x stop  r refresh  ? help  q quit"))
+		writeLine(a.Out, cols, styleMuted("Enter/a attach  Ctrl-F fullscreen  / commands  c create  s send  x stop  r refresh  ? help  q quit"))
 	}
 	clearToEnd(a.Out)
+}
+
+func (a *App) renderFullscreenWithSize(cols, rows int) {
+	size := appActiveStreamSize(cols, rows)
+	stream := a.streams[a.active]
+	if stream != nil {
+		a.resizeStreamViewTo(stream, size)
+	}
+	lines := []string(nil)
+	cursorX, cursorY, cursorOK := 0, 0, false
+	if stream != nil && stream.view != nil {
+		lines = terminalScreenLines(stream.view.Screen())
+		cursorX, cursorY, cursorOK = stream.view.Cursor()
+	}
+	if stream == nil || !stream.seenOutput {
+		if fallback := a.activeFallbackLines(stream, size); len(fallback) > 0 {
+			lines = fallback
+			cursorOK = false
+		}
+	}
+	for row := 0; row < size.Rows; row++ {
+		line := ""
+		if row < len(lines) {
+			line = lines[row]
+		}
+		writeCanvasLine(a.Out, row+1, cols, line)
+	}
+	if cursorOK {
+		if cursorX < 0 {
+			cursorX = 0
+		}
+		if cursorY < 0 {
+			cursorY = 0
+		}
+		if cursorX >= cols {
+			cursorX = cols - 1
+		}
+		if cursorY >= size.Rows {
+			cursorY = size.Rows - 1
+		}
+		moveCursor(a.Out, cursorY+1, cursorX+1)
+	}
+}
+
+func (a *App) activeFallbackLines(stream *appSessionStream, size protocol.TerminalSize) []string {
+	if a.active == "" {
+		return nil
+	}
+	if stream != nil && stream.seenOutput {
+		return nil
+	}
+	status := "attached " + a.active + "  waiting for terminal output  Ctrl-F split  Ctrl-]/Esc detach  q/Ctrl-C/Ctrl-Q quit"
+	if stream == nil || stream.connecting || stream.stream == nil {
+		status = "connecting " + a.active + "  Ctrl-F split  Ctrl-]/Esc detach  q/Ctrl-C/Ctrl-Q quit"
+	}
+	if a.debugEnabled() {
+		status += "  Ctrl-G debug"
+	}
+	lines := []string(nil)
+	if capture := a.activeFallbackCapture(); capture != "" {
+		raw := splitPreviewLines(capture, size.Rows)
+		lines = make([]string, 0, len(raw))
+		for i := range raw {
+			lines = append(lines, previewLine(raw, i))
+		}
+	}
+	if len(lines) == 0 {
+		lines = []string{styleMuted(status)}
+	} else if size.Rows > 0 {
+		if len(lines) < size.Rows {
+			for len(lines) < size.Rows-1 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, styleMuted(status))
+		} else {
+			lines[size.Rows-1] = styleMuted(status)
+		}
+	}
+	return lines
+}
+
+func (a *App) activeFallbackCapture() string {
+	if a == nil || a.active == "" {
+		return ""
+	}
+	if a.buffers != nil && a.buffers[a.active] != "" {
+		return a.buffers[a.active]
+	}
+	if a.previews != nil {
+		return a.previews[a.active]
+	}
+	return ""
+}
+
+func (a *App) activeWaitingForStreamOutput() bool {
+	if a == nil || a.active == "" {
+		return false
+	}
+	stream := a.streams[a.active]
+	if stream == nil {
+		return true
+	}
+	if stream.seenOutput {
+		return false
+	}
+	return true
 }
 
 func (a *App) renderSplitRows(bodyStart, limit, listWidth, previewWidth, start int, previewLines []string) {
@@ -840,13 +1327,38 @@ func (a *App) renderSplitRows(bodyStart, limit, listWidth, previewWidth, start i
 		sessionIndex := start + row
 		left := a.sessionListLine(row, sessionIndex, true)
 		right := previewLine(previewLines, row)
-		if len(a.preview) == 0 && row == 0 && len(a.sessions) > 0 {
+		if len(a.preview) == 0 && row == 0 && a.selectedStreamWarming() {
 			right = styleMuted("stream warming")
 		}
 		writeAt(a.Out, screenRow, listWidth+4, padVisible(truncateVisible(right, previewWidth), previewWidth))
 		writeAt(a.Out, screenRow, listWidth+1, " | ")
 		writeAt(a.Out, screenRow, 1, padVisible(left, listWidth))
 	}
+}
+
+func terminalScreenLines(screen string) []string {
+	if screen == "" {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(screen, "\n"), "\n")
+}
+
+func terminalLinesHaveVisibleContent(lines []string) bool {
+	for _, line := range lines {
+		if strings.TrimSpace(stripControl(line)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) selectedStreamWarming() bool {
+	session := a.selectedSession()
+	if session.ID == "" || a.streams == nil {
+		return false
+	}
+	stream := a.streams[session.ID]
+	return stream != nil && stream.warming
 }
 
 func (a *App) sessionListLine(row, sessionIndex int, compact bool) string {
@@ -999,6 +1511,7 @@ func readAppKey(in io.Reader) (string, error) {
 
 type appKeyReader struct {
 	pending []byte
+	utf8Buf []byte
 }
 
 func (r *appKeyReader) Read(in io.Reader) (string, error) {
@@ -1014,7 +1527,7 @@ func (r *appKeyReader) ReadAvailable(in io.Reader) (string, bool, error) {
 	if len(r.pending) > 0 {
 		b := r.pending[0]
 		r.pending = r.pending[1:]
-		return keyFromByte(b), true, nil
+		return r.keyFromInputByte(b)
 	}
 	var b [1]byte
 	n, err := in.Read(b[:])
@@ -1026,6 +1539,7 @@ func (r *appKeyReader) ReadAvailable(in io.Reader) (string, bool, error) {
 	}
 	switch b[0] {
 	case 0x1b:
+		r.utf8Buf = nil
 		seq := make([]byte, 0, 3)
 		var next [1]byte
 		for len(seq) < 3 {
@@ -1059,12 +1573,34 @@ func (r *appKeyReader) ReadAvailable(in io.Reader) (string, bool, error) {
 		}
 		return "unknown", true, nil
 	default:
-		return keyFromByte(b[0]), true, nil
+		return r.keyFromInputByte(b[0])
 	}
+}
+
+func (r *appKeyReader) keyFromInputByte(b byte) (string, bool, error) {
+	if len(r.utf8Buf) == 0 && b < utf8.RuneSelf {
+		return keyFromByte(b), true, nil
+	}
+	r.utf8Buf = append(r.utf8Buf, b)
+	if !utf8.FullRune(r.utf8Buf) {
+		return "", false, nil
+	}
+	if !utf8.Valid(r.utf8Buf) {
+		first := r.utf8Buf[0]
+		if len(r.utf8Buf) > 1 {
+			r.pending = append(append([]byte(nil), r.utf8Buf[1:]...), r.pending...)
+		}
+		r.utf8Buf = nil
+		return keyFromByte(first), true, nil
+	}
+	key := string(r.utf8Buf)
+	r.utf8Buf = nil
+	return key, true, nil
 }
 
 func (r *appKeyReader) Reset() {
 	r.pending = nil
+	r.utf8Buf = nil
 }
 
 func keyFromByte(b byte) string {
@@ -1073,6 +1609,12 @@ func keyFromByte(b byte) string {
 		return "enter"
 	case 0x03:
 		return "ctrl-c"
+	case 0x06:
+		return "ctrl-f"
+	case 0x11:
+		return "ctrl-q"
+	case 0x07:
+		return "ctrl-g"
 	case 0x1d:
 		return "detach"
 	case '\t':
@@ -1080,8 +1622,16 @@ func keyFromByte(b byte) string {
 	case 0x7f, '\b':
 		return string([]byte{b})
 	default:
-		return string(b)
+		return string([]byte{b})
 	}
+}
+
+func attachedPreviewStatus(sessionID string) string {
+	return "attached " + sessionID + " in preview  Ctrl-F fullscreen  Ctrl-] detach"
+}
+
+func attachedFullscreenStatus(sessionID string) string {
+	return "fullscreen " + sessionID + "  Ctrl-F split  Ctrl-] detach"
 }
 
 func clear(out io.Writer) {
@@ -1127,11 +1677,20 @@ func writeLine(out io.Writer, cols int, line string) {
 	_, _ = io.WriteString(out, line+"\r\n")
 }
 
+func writeCanvasLine(out io.Writer, row, cols int, line string) {
+	moveCursor(out, row, 1)
+	clearLine(out)
+	if cols > 0 && visibleLen(line) > cols {
+		line = truncateVisible(line, cols)
+	}
+	_, _ = io.WriteString(out, line+"\x1b[0m")
+}
+
 func appLayout(cols, rows int) (listWidth, previewWidth, limit int) {
 	listWidth = cols
 	previewWidth = 0
-	if cols >= 100 {
-		listWidth = min(max(28, cols/4), 34)
+	if cols >= 72 {
+		listWidth = min(max(24, cols/4), 34)
 		previewWidth = cols - listWidth - 3
 	}
 	limit = rows - 7
@@ -1145,7 +1704,7 @@ func previewTitle(listWidth, previewWidth int, active string) string {
 	if previewWidth <= 0 {
 		return ""
 	}
-	title := styleHeader("Session")
+	title := styleHeader("Preview")
 	if active != "" {
 		title = styleOK("Session " + active)
 	}

@@ -72,6 +72,7 @@ func runDefault(ctx context.Context) {
 			RefreshExpiresAt: entry.RefreshExpiresAt, Source: "cache",
 		}
 		app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
+		enableControlDebug(app, defaultControlDebugFlags())
 		if err := app.Run(ctx); err != nil && err != context.Canceled {
 			fatal(err)
 		}
@@ -90,7 +91,7 @@ func runTUI(ctx context.Context, args []string) {
 		deviceName := fs.String("device-name", hostname(), "control device display name")
 		_ = fs.Parse(args[1:])
 		if common.hub == "" {
-			common.hub = "http://127.0.0.1:8080"
+			common.hub = defaultControlHubURL()
 		}
 		if common.join == "" {
 			fatal(fmt.Errorf("--join is required"))
@@ -114,6 +115,7 @@ func runTUI(ctx context.Context, args []string) {
 	} else {
 		app = control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
 	}
+	enableControlAppDebug(app, args)
 	if err := app.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
 	}
@@ -126,7 +128,10 @@ func runHub(ctx context.Context, args []string) {
 	data := fs.String("data", os.Getenv("AGENTMUX_DATA"), "SQLite database path for persistent hub state")
 	publicURL := fs.String("public-url", os.Getenv("AGENTMUX_PUBLIC_URL"), "external hub URL used for generated HTTPS/WSS commands")
 	releaseRepo := fs.String("release-repo", getenv("AGENTMUX_RELEASE_REPO", "kinboyw/agentmux"), "GitHub owner/repo used by generated install.sh")
+	debug := addRuntimeDebug(fs, "hub")
 	_ = fs.Parse(args)
+	closeDebug := configureRuntimeDebug("hub", *debug)
+	defer closeDebug()
 	var authStore hub.AuthStore
 	if *data != "" {
 		store, err := hub.OpenSQLiteAuthStore(*data)
@@ -195,7 +200,10 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	name := fs.String("name", hostname(), "worker display name")
 	interval := fs.Duration("interval", time.Second, "terminal capture interval")
 	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
+	debug := addRuntimeDebug(fs, "worker")
 	_ = fs.Parse(args)
+	closeDebug := configureRuntimeDebug("worker", *debug)
+	defer closeDebug()
 	cfg, _ := appconfig.Load()
 	if *hubURL == "" && *token == "" && *join == "" {
 		*hubURL = cfg.WorkerHubURL
@@ -486,6 +494,7 @@ func runControl(ctx context.Context, args []string) {
 			fatal(err)
 		}
 		app := control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
+		enableControlAppDebug(app, args[1:])
 		if err := app.Run(ctx); err != nil && err != context.Canceled {
 			fatal(err)
 		}
@@ -555,33 +564,40 @@ func resolveControlAppAuth(ctx context.Context, args []string) (control.AppAuthR
 }
 
 func resolveControlAppAuthWithLogin(ctx context.Context, args []string, login bool) (control.AppAuthResult, error) {
+	flags := parseControlAppFlags(args)
+	return control.ResolveAppAuth(ctx, control.AppAuthOptions{
+		HubURL: flags.common.hub, Token: flags.common.token, Join: flags.common.join,
+		DeviceID: flags.deviceID, DeviceName: flags.deviceName, Login: login,
+	})
+}
+
+type parsedControlAppFlags struct {
+	common     commonControlFlags
+	debug      controlDebugFlags
+	deviceID   string
+	deviceName string
+}
+
+func parseControlAppFlags(args []string) parsedControlAppFlags {
 	fs := flag.NewFlagSet("app", flag.ExitOnError)
 	common := addControlCommon(fs)
+	debug := addControlDebug(fs)
 	deviceID := fs.String("device-id", "", "stable control device id")
 	deviceName := fs.String("device-name", hostname(), "control device display name")
 	_ = fs.Parse(args)
 	if common.hub == "" && (common.token != "" || common.join != "") {
-		common.hub = "http://127.0.0.1:8080"
+		common.hub = defaultControlHubURL()
 	}
-	return control.ResolveAppAuth(ctx, control.AppAuthOptions{
-		HubURL: common.hub, Token: common.token, Join: common.join,
-		DeviceID: *deviceID, DeviceName: *deviceName, Login: login,
-	})
+	return parsedControlAppFlags{common: *common, debug: *debug, deviceID: *deviceID, deviceName: *deviceName}
 }
 
 func controlHubArg(args []string) string {
-	fs := flag.NewFlagSet("app", flag.ExitOnError)
-	common := addControlCommon(fs)
-	_ = fs.Parse(args)
-	if common.hub == "" && (common.token != "" || common.join != "") {
-		common.hub = "http://127.0.0.1:8080"
-	}
-	return common.hub
+	return parseControlAppFlags(args).common.hub
 }
 
 func runControlLogin(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	hubURL := fs.String("hub", "http://127.0.0.1:8080", "hub URL")
+	hubURL := fs.String("hub", defaultControlHubURL(), "hub URL")
 	deviceID := fs.String("device-id", "", "stable control device id")
 	deviceName := fs.String("device-name", hostname(), "control device display name")
 	_ = fs.Parse(args)
@@ -605,6 +621,16 @@ type commonControlFlags struct {
 	join  string
 }
 
+type controlDebugFlags struct {
+	enabled bool
+	logPath string
+}
+
+type runtimeDebugFlags struct {
+	enabled bool
+	logPath string
+}
+
 func controlFlags(name string, args []string) commonControlFlags {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	common := addControlCommon(fs)
@@ -620,9 +646,71 @@ func addControlCommon(fs *flag.FlagSet) *commonControlFlags {
 	return common
 }
 
+func addControlDebug(fs *flag.FlagSet) *controlDebugFlags {
+	debug := &controlDebugFlags{}
+	fs.BoolVar(&debug.enabled, "debug", envBool("AGENTMUX_TUI_DEBUG") || envBool("AGENTMUX_DEBUG"), "enable TUI debug HUD and log")
+	fs.StringVar(&debug.logPath, "debug-log", firstNonEmptyEnv("AGENTMUX_TUI_DEBUG_LOG", "AGENTMUX_DEBUG_LOG"), "TUI debug log path")
+	return debug
+}
+
+func defaultControlDebugFlags() controlDebugFlags {
+	return controlDebugFlags{
+		enabled: envBool("AGENTMUX_TUI_DEBUG") || envBool("AGENTMUX_DEBUG"),
+		logPath: firstNonEmptyEnv("AGENTMUX_TUI_DEBUG_LOG", "AGENTMUX_DEBUG_LOG"),
+	}
+}
+
+func addRuntimeDebug(fs *flag.FlagSet, component string) *runtimeDebugFlags {
+	debug := &runtimeDebugFlags{}
+	envPrefix := "AGENTMUX_" + strings.ToUpper(component)
+	fs.BoolVar(&debug.enabled, "debug", envBool(envPrefix+"_DEBUG") || envBool("AGENTMUX_DEBUG"), "enable debug logging")
+	fs.StringVar(&debug.logPath, "debug-log", firstNonEmptyEnv(envPrefix+"_DEBUG_LOG", "AGENTMUX_DEBUG_LOG"), "debug log path")
+	return debug
+}
+
+func configureRuntimeDebug(component string, flags runtimeDebugFlags) func() {
+	if !flags.enabled && strings.TrimSpace(flags.logPath) == "" {
+		return func() {}
+	}
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelDebug)
+	var output *os.File
+	if strings.TrimSpace(flags.logPath) == "" {
+		output = os.Stderr
+	} else {
+		file, err := os.OpenFile(strings.TrimSpace(flags.logPath), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			fatal(err)
+		}
+		output = file
+	}
+	logger := slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level})).With("component", component)
+	slog.SetDefault(logger)
+	slog.Default().Debug("debug logging enabled", "log", strings.TrimSpace(flags.logPath))
+	return func() {
+		if output != nil && output != os.Stderr {
+			_ = output.Close()
+		}
+	}
+}
+
+func enableControlAppDebug(app *control.App, args []string) {
+	flags := parseControlAppFlags(args).debug
+	enableControlDebug(app, flags)
+}
+
+func enableControlDebug(app *control.App, flags controlDebugFlags) {
+	if app == nil {
+		return
+	}
+	if err := app.EnableDebug(control.AppDebugOptions{Enabled: flags.enabled, LogPath: flags.logPath}); err != nil {
+		fatal(err)
+	}
+}
+
 func newControlClient(ctx context.Context, flags commonControlFlags) control.Client {
 	if flags.hub == "" && (flags.token != "" || flags.join != "") {
-		flags.hub = "http://127.0.0.1:8080"
+		flags.hub = defaultControlHubURL()
 	}
 	auth, err := control.ResolveAppAuth(ctx, control.AppAuthOptions{
 		HubURL: flags.hub, Token: flags.token, Join: flags.join,
@@ -648,6 +736,43 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func defaultControlHubURL() string {
+	if value := strings.TrimSpace(os.Getenv("AGENTMUX_CONTROL_HUB")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(os.Getenv("AGENTMUX_HUB")); value != "" {
+		return value
+	}
+	if entry, ok := credentialcache.LoadLatest("control", ""); ok && strings.TrimSpace(entry.HubURL) != "" {
+		return entry.HubURL
+	}
+	if cfg, err := appconfig.Load(); err == nil && strings.TrimSpace(cfg.WorkerHubURL) != "" {
+		return cfg.WorkerHubURL
+	}
+	if entry, ok := credentialcache.LoadLatest("worker", ""); ok && strings.TrimSpace(entry.HubURL) != "" {
+		return entry.HubURL
+	}
+	return "http://127.0.0.1:8080"
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasJoinArg(args []string) bool {

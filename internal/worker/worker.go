@@ -163,7 +163,7 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 		return err
 	}
 	defer conn.Close()
-	hello, _ := protocol.NewEnvelope(protocol.TypeWorkerHello, protocol.WorkerHello{Name: w.Name, Version: w.Version})
+	hello, _ := protocol.NewEnvelope(protocol.TypeWorkerHello, protocol.WorkerHello{Name: w.Name, Version: w.Version, Backend: w.Backend.Name()})
 	hello.WorkerID = w.ID
 	if err := writeEnvelope(conn, hello); err != nil {
 		return err
@@ -206,8 +206,10 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 	for {
 		env, err := readEnvelope(conn)
 		if err != nil {
+			w.Logger.Debug("worker websocket read ended", "error", err)
 			return err
 		}
+		w.Logger.Debug("worker message received", "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "request_id", env.ID, "payload_bytes", len(env.Payload))
 		switch env.Type {
 		case protocol.TypeSessionSync:
 			_ = w.sendSnapshot(ctx, conn)
@@ -240,12 +242,15 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			}
 			var req protocol.SessionPreviewRequest
 			_ = env.DecodePayload(&req)
+			w.Logger.Debug("preview capture start", "session_id", env.SessionID, "name", name, "request_id", env.ID, "lines", req.Lines)
 			data, err := w.Backend.Capture(ctx, name, req.Lines)
 			if err != nil {
+				w.Logger.Debug("preview capture failed", "session_id", env.SessionID, "name", name, "request_id", env.ID, "error", err)
 				w.sendRequestError(conn, env.ID, env.SessionID, err.Error())
 				continue
 			}
-			reply, _ := protocol.NewEnvelope(protocol.TypeSessionPreview, protocol.SessionPreview{Data: data})
+			w.Logger.Debug("preview capture complete", "session_id", env.SessionID, "name", name, "request_id", env.ID, "bytes", len(data))
+			reply, _ := protocol.NewEnvelope(protocol.TypeSessionPreview, protocol.SessionPreview{Data: data, Scope: "active_pane"})
 			reply.ID = env.ID
 			reply.WorkerID = w.ID
 			reply.SessionID = env.SessionID
@@ -257,10 +262,13 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			}
 			var input protocol.TerminalInput
 			_ = env.DecodePayload(&input)
+			w.Logger.Debug("terminal input received", "session_id", env.SessionID, "stream_id", env.StreamID, "name", name, "bytes", len(input.Data))
 			if w.writeTerminal(env.StreamID, input.Data) {
 				continue
 			}
+			w.Logger.Debug("terminal input fallback to backend", "session_id", env.SessionID, "stream_id", env.StreamID, "name", name, "bytes", len(input.Data))
 			if err := w.Backend.SendTerminalInput(ctx, name, input.Data); err != nil {
+				w.Logger.Debug("terminal input failed", "session_id", env.SessionID, "stream_id", env.StreamID, "name", name, "error", err)
 				w.sendError(conn, env.SessionID, err.Error())
 			}
 		case protocol.TypeTerminalOpen:
@@ -270,6 +278,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			}
 			var size protocol.TerminalSize
 			_ = env.DecodePayload(&size)
+			w.Logger.Debug("terminal open received", "session_id", env.SessionID, "stream_id", env.StreamID, "name", name, "cols", size.Cols, "rows", size.Rows)
 			w.startStream(ctx, conn, env.StreamID, protocol.SessionID(w.ID, name), name, size)
 		case protocol.TypeTerminalResize:
 			var size protocol.TerminalSize
@@ -277,10 +286,13 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 				w.sendStreamError(conn, env.StreamID, env.SessionID, err.Error())
 				continue
 			}
+			w.Logger.Debug("terminal resize received", "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows)
 			if err := w.resizeTerminal(env.StreamID, size); err != nil {
+				w.Logger.Debug("terminal resize failed", "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 				w.sendStreamError(conn, env.StreamID, env.SessionID, err.Error())
 			}
 		case protocol.TypeTerminalClose:
+			w.Logger.Debug("terminal close received", "session_id", env.SessionID, "stream_id", env.StreamID)
 			w.stopStream(env.StreamID)
 		}
 	}
@@ -294,7 +306,7 @@ func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
 	payload := protocol.SessionSnapshot{Sessions: make([]protocol.Session, 0, len(sessions))}
 	for _, session := range sessions {
 		payload.Sessions = append(payload.Sessions, protocol.Session{
-			Name: session.Name, CWD: session.CWD, Command: session.Command, Status: session.Status,
+			Name: session.Name, CWD: session.CWD, Command: session.Command, Status: session.Status, Backend: w.Backend.Name(),
 		})
 	}
 	env, err := protocol.NewEnvelope(protocol.TypeSessionSnapshot, payload)
@@ -302,16 +314,20 @@ func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
 		return err
 	}
 	env.WorkerID = w.ID
+	w.Logger.Debug("session snapshot sent", "sessions", len(payload.Sessions))
 	return writeEnvelope(conn, env)
 }
 
 func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, sessionID, name string, size protocol.TerminalSize) {
 	if name == "" || streamID == "" {
+		w.Logger.Debug("terminal open ignored", "session_id", sessionID, "stream_id", streamID, "name", name)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
+	w.Logger.Debug("terminal backend open start", "session_id", sessionID, "stream_id", streamID, "name", name, "cols", size.Cols, "rows", size.Rows)
 	terminal, err := w.Backend.Open(ctx, name, size.Cols, size.Rows)
 	if err != nil {
+		w.Logger.Debug("terminal backend open failed", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
 		w.sendStreamError(conn, streamID, sessionID, err.Error())
 		cancel()
 		return
@@ -319,9 +335,14 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 	w.mu.Lock()
 	w.streams[streamID] = cancel
 	w.terms[streamID] = terminal
+	activeStreams := len(w.streams)
 	w.mu.Unlock()
+	w.Logger.Debug("terminal backend open complete", "session_id", sessionID, "stream_id", streamID, "name", name, "streams", activeStreams)
 	go func() {
-		defer w.removeStream(streamID)
+		defer func() {
+			w.Logger.Debug("terminal read loop ended", "session_id", sessionID, "stream_id", streamID, "name", name)
+			w.removeStream(streamID)
+		}()
 		buffer := make([]byte, 8192)
 		for {
 			n, err := terminal.Read(buffer)
@@ -333,10 +354,15 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 				env.WorkerID = w.ID
 				env.SessionID = sessionID
 				env.StreamID = streamID
-				_ = writeEnvelope(conn, env)
+				if writeErr := writeEnvelope(conn, env); writeErr != nil {
+					w.Logger.Debug("terminal output write failed", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", n, "error", writeErr)
+					return
+				}
+				w.Logger.Debug("terminal output sent", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", n)
 			}
 			if err != nil {
 				if err != io.EOF && ctx.Err() == nil && !strings.Contains(err.Error(), "input/output error") {
+					w.Logger.Debug("terminal read error", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
 					w.sendStreamError(conn, streamID, sessionID, err.Error())
 				}
 				return
@@ -351,7 +377,9 @@ func (w *Worker) removeStream(streamID string) {
 	delete(w.streams, streamID)
 	terminal := w.terms[streamID]
 	delete(w.terms, streamID)
+	activeStreams := len(w.streams)
 	w.mu.Unlock()
+	w.Logger.Debug("terminal stream removed", "stream_id", streamID, "streams", activeStreams, "had_terminal", terminal != nil)
 	if cancel != nil {
 		cancel()
 	}
@@ -365,9 +393,15 @@ func (w *Worker) writeTerminal(streamID, data string) bool {
 	terminal := w.terms[streamID]
 	w.mu.Unlock()
 	if terminal == nil {
+		w.Logger.Debug("terminal write missed stream", "stream_id", streamID, "bytes", len(data))
 		return false
 	}
 	_, err := terminal.Write([]byte(data))
+	if err != nil {
+		w.Logger.Debug("terminal write failed", "stream_id", streamID, "bytes", len(data), "error", err)
+		return false
+	}
+	w.Logger.Debug("terminal write complete", "stream_id", streamID, "bytes", len(data))
 	return err == nil
 }
 
@@ -376,12 +410,20 @@ func (w *Worker) resizeTerminal(streamID string, size protocol.TerminalSize) err
 	terminal := w.terms[streamID]
 	w.mu.Unlock()
 	if terminal == nil {
+		w.Logger.Debug("terminal resize missed stream", "stream_id", streamID, "cols", size.Cols, "rows", size.Rows)
 		return nil
 	}
-	return terminal.Resize(size.Cols, size.Rows)
+	err := terminal.Resize(size.Cols, size.Rows)
+	if err != nil {
+		w.Logger.Debug("terminal resize failed", "stream_id", streamID, "cols", size.Cols, "rows", size.Rows, "error", err)
+		return err
+	}
+	w.Logger.Debug("terminal resize complete", "stream_id", streamID, "cols", size.Cols, "rows", size.Rows)
+	return nil
 }
 
 func (w *Worker) stopStream(streamID string) {
+	w.Logger.Debug("terminal stream stop requested", "stream_id", streamID)
 	w.removeStream(streamID)
 }
 

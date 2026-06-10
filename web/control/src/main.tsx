@@ -2,19 +2,27 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
+  Activity,
+  Bug,
   ChevronLeft,
   ChevronRight,
   Github,
   Globe,
+  Keyboard,
   LayoutGrid,
   LogIn,
   LogOut,
+  Monitor,
   Plus,
   Power,
   RefreshCw,
   Search,
+  Server,
+  Settings,
+  ShieldCheck,
   SplitSquareHorizontal,
   SplitSquareVertical,
+  Unplug,
   UserPlus,
   UserRound,
   X,
@@ -34,9 +42,13 @@ type WorkerView = {
   tenant_id?: string;
   name: string;
   addr: string;
+  backend?: string;
   last_seen: string;
   status?: string;
   online?: boolean;
+  enabled?: boolean;
+  trace_enabled?: boolean;
+  debug_enabled?: boolean;
 };
 
 type SessionView = {
@@ -47,8 +59,10 @@ type SessionView = {
   cwd: string;
   command: string;
   status: string;
+  backend?: string;
 };
 
+type MainView = "overview" | "workspace";
 type SplitDirection = "horizontal" | "vertical";
 type DropZone = "left" | "right" | "top" | "bottom" | "center";
 
@@ -66,6 +80,25 @@ type SplitNode = {
 };
 
 type LayoutNode = PaneNode | SplitNode;
+
+type WorkspaceTab = {
+  id: string;
+  title: string;
+  layout: LayoutNode;
+  activePane: string;
+};
+
+type TerminalSettings = {
+  tmuxPrefix: string;
+};
+
+type PreviewState = {
+  loading?: boolean;
+  data?: string;
+  error?: string;
+  scope?: string;
+  loadedAt?: number;
+};
 
 type Status = {
   tone: "idle" | "ok" | "warn" | "err";
@@ -135,8 +168,10 @@ const initialToken = queryToken || localStorage.getItem("agentmux.token") || "";
 const initialTokenExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.token_expires_at") || "";
 const initialRefreshToken = queryToken ? "" : localStorage.getItem("agentmux.refresh_token") || "";
 const initialRefreshExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.refresh_expires_at") || "";
-const initialPaneId = crypto.randomUUID();
+const initialPaneId: string = crypto.randomUUID();
+const initialTabId: string = crypto.randomUUID();
 const initialUser = readStoredUser();
+const initialTerminalSettings = readTerminalSettings();
 
 function App() {
   const [token, setToken] = React.useState(initialToken);
@@ -157,9 +192,15 @@ function App() {
   const [joinOpen, setJoinOpen] = React.useState(false);
   const [joinLoading, setJoinLoading] = React.useState(false);
   const [workerSearch, setWorkerSearch] = React.useState("");
+  const [sessionSearch, setSessionSearch] = React.useState("");
+  const [mainView, setMainView] = React.useState<MainView>("overview");
+  const [terminalSettings, setTerminalSettings] = React.useState<TerminalSettings>(initialTerminalSettings);
+  const [tabs, setTabs] = React.useState<WorkspaceTab[]>([
+    { id: initialTabId, title: "Workspace 1", layout: { type: "pane", id: initialPaneId }, activePane: initialPaneId },
+  ]);
+  const [activeTabId, setActiveTabId] = React.useState(initialTabId);
+  const [previewStates, setPreviewStates] = React.useState<Record<string, PreviewState>>({});
   const [pendingFocusSessionId, setPendingFocusSessionId] = React.useState<string | null>(null);
-  const [layout, setLayout] = React.useState<LayoutNode>({ type: "pane", id: initialPaneId });
-  const [activePane, setActivePane] = React.useState<string>(initialPaneId);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
   const sessionButtonRefs = React.useRef<Record<string, HTMLButtonElement | null>>({});
   const authRef = React.useRef({
@@ -193,9 +234,20 @@ function App() {
   );
 
   const filteredCreateWorkers = React.useMemo(
-    () => filterWorkers(workerOptions, workerSearch),
+    () => filterWorkers(workerOptions.filter(workerCanStartSession), workerSearch),
     [workerOptions, workerSearch],
   );
+
+  const visibleSessions = React.useMemo(
+    () => filterSessions(sessions, workerOptions, workerFilter, sessionSearch),
+    [sessions, workerOptions, workerFilter, sessionSearch],
+  );
+
+  const sessionByID = React.useMemo(() => new Map(sessions.map((session) => [session.id, session])), [sessions]);
+  const workerByID = React.useMemo(() => new Map(workerOptions.map((worker) => [worker.id, worker])), [workerOptions]);
+  const activeTab = React.useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0], [tabs, activeTabId]);
+  const activePane = activeTab.activePane;
+  const layout = activeTab.layout;
 
   React.useEffect(() => {
     authRef.current = { token, tokenExpiresAt, refreshToken, refreshExpiresAt };
@@ -228,7 +280,7 @@ function App() {
 
   React.useEffect(() => {
     if (!createForm.worker_id && workers[0]) {
-      const preferred = workers.find(workerIsOnline) || workers[0];
+      const preferred = workers.find(workerCanStartSession) || workers.find(workerIsOnline) || workers[0];
       setCreateForm((form) => ({ ...form, worker_id: preferred.id }));
     }
   }, [workers, createForm.worker_id]);
@@ -308,7 +360,7 @@ function App() {
       return;
     }
     setStatus({ tone: "warn", title: "Exit queued", detail: `${session.worker_id}/${session.name}` });
-    setLayout((node) => clearSessionFromLayout(node, session.id));
+    setTabs((items) => items.map((tab) => ({ ...tab, layout: clearSessionFromLayout(tab.layout, session.id) })));
     window.setTimeout(() => void refreshAll(), 700);
   }
 
@@ -510,9 +562,92 @@ function App() {
     if (data.url) window.location.href = data.url;
   }
 
-  async function attach(sessionId: string) {
+  function setActivePane(paneId: string) {
+    setTabs((items) => items.map((tab) => (tab.id === activeTabId ? { ...tab, activePane: paneId } : tab)));
+  }
+
+  function setLayout(update: React.SetStateAction<LayoutNode>) {
+    setTabs((items) =>
+      items.map((tab) => {
+        if (tab.id !== activeTabId) return tab;
+        const nextLayout = typeof update === "function" ? (update as (node: LayoutNode) => LayoutNode)(tab.layout) : update;
+        const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
+        return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab.title, nextLayout) };
+      }),
+    );
+  }
+
+  async function attach(sessionId: string, target: "current" | "new-tab" = "current") {
     await ensureFreshAccessToken();
+    setMainView("workspace");
+    if (target === "new-tab") {
+      const tab = newWorkspaceTab(sessionId, tabTitleForSession(sessionId));
+      setTabs((items) => [...items, tab]);
+      setActiveTabId(tab.id);
+      return;
+    }
     setLayout((node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
+  }
+
+  function createWorkspaceTab(sessionId?: string) {
+    const tab = newWorkspaceTab(sessionId, sessionId ? tabTitleForSession(sessionId) : `Workspace ${tabs.length + 1}`);
+    setTabs((items) => [...items, tab]);
+    setActiveTabId(tab.id);
+    setMainView("workspace");
+  }
+
+  function closeWorkspaceTab(tabId: string) {
+    setTabs((items) => {
+      if (items.length <= 1) {
+        const pane = newPane();
+        return [{ ...items[0], title: "Workspace 1", layout: pane, activePane: pane.id }];
+      }
+      const closingIndex = items.findIndex((tab) => tab.id === tabId);
+      const nextItems = items.filter((tab) => tab.id !== tabId);
+      if (tabId === activeTabId) {
+        const nextIndex = Math.max(0, closingIndex - 1);
+        setActiveTabId(nextItems[nextIndex]?.id || nextItems[0].id);
+      }
+      return nextItems;
+    });
+  }
+
+  async function loadSessionPreview(session: SessionView, force = false) {
+    const current = previewStates[session.id];
+    if (!force && (current?.loading || (current?.loadedAt && Date.now() - current.loadedAt < 45_000))) return;
+    setPreviewStates((items) => ({ ...items, [session.id]: { ...items[session.id], loading: true, error: "" } }));
+    const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}/preview?lines=22`);
+    if (!res.ok) {
+      const detail = errorDetailFromResponseText(res.status, await res.text());
+      setPreviewStates((items) => ({
+        ...items,
+        [session.id]: { loading: false, error: detail, loadedAt: Date.now() },
+      }));
+      setStatus({ tone: "warn", title: "Preview failed", detail: `${session.id} · ${detail}` });
+      return;
+    }
+    const payload = (await res.json()) as { data?: string; scope?: string };
+    setPreviewStates((items) => ({
+      ...items,
+      [session.id]: {
+        loading: false,
+        data: stripAnsi(payload.data || ""),
+        scope: payload.scope || "active_pane",
+        loadedAt: Date.now(),
+      },
+    }));
+  }
+
+  async function updateWorker(worker: WorkerView, patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) {
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) {
+      setStatus({ tone: "err", title: "Worker update failed", detail: await res.text() });
+      return;
+    }
+    await refreshAll();
   }
 
   function splitPaneById(paneId: string, direction: SplitDirection) {
@@ -558,7 +693,9 @@ function App() {
     });
   }
 
-  const activeSessionIds = new Set(collectPanes(layout).map((pane) => pane.sessionId).filter(Boolean));
+  const activeSessionIds = new Set(
+    tabs.flatMap((tab) => collectPanes(tab.layout).map((pane) => pane.sessionId).filter((id): id is string => Boolean(id))),
+  );
 
   return (
     <div className="flex h-screen bg-background text-foreground">
@@ -621,7 +758,10 @@ function App() {
                         onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
                         onDragEnd={() => setDropTarget(null)}
                       >
-                        <div className="truncate text-sm font-medium">{session.name || session.id}</div>
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <div className="truncate text-sm font-medium">{session.name || session.id}</div>
+                          <BackendBadge value={sessionBackendLabel(session, group.worker)} />
+                        </div>
                         <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
                         <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
                       </button>
@@ -661,7 +801,16 @@ function App() {
                 <ChevronRight className="h-4 w-4" />
               </Button>
             ) : null}
-            <LayoutGrid className="h-4 w-4 text-muted-foreground" />
+            <div className="flex items-center gap-1 rounded-md border border-border bg-background p-0.5">
+              <Button variant={mainView === "overview" ? "secondary" : "ghost"} size="xs" onClick={() => setMainView("overview")}>
+                <Server className="h-3.5 w-3.5" />
+                Overview
+              </Button>
+              <Button variant={mainView === "workspace" ? "secondary" : "ghost"} size="xs" onClick={() => setMainView("workspace")}>
+                <LayoutGrid className="h-3.5 w-3.5" />
+                Workspace
+              </Button>
+            </div>
             <div className="min-w-0">
               <div className="truncate text-sm font-medium">{status.title}</div>
               <div className="truncate text-xs text-muted-foreground">{status.detail}</div>
@@ -685,18 +834,42 @@ function App() {
           </div>
         </header>
         <div className="min-h-0 flex-1">
-          <LayoutRenderer
-            node={layout}
-            activePane={activePane}
-            token={token}
-            onFocusPane={setActivePane}
-            onSplitPane={splitPaneById}
-            onClosePane={closePane}
-            dropTarget={dropTarget}
-            onDropTarget={setDropTarget}
-            onDropPayload={dropOnPane}
-            setStatus={setStatus}
-          />
+          {mainView === "overview" ? (
+            <OverviewPage
+              workers={workerOptions}
+              sessions={visibleSessions}
+              allSessions={sessions}
+              workerFilter={workerFilter}
+              sessionSearch={sessionSearch}
+              activeSessionIds={activeSessionIds}
+              previewStates={previewStates}
+              onWorkerFilterChange={setWorkerFilter}
+              onSessionSearchChange={setSessionSearch}
+              onAttach={(session) => void attach(session.id)}
+              onAttachNewTab={(session) => void attach(session.id, "new-tab")}
+              onLoadPreview={(session, force) => void loadSessionPreview(session, force)}
+              onKillSession={(session) => void killSession(session)}
+              onUpdateWorker={(worker, patch) => void updateWorker(worker, patch)}
+            />
+          ) : (
+            <WorkspaceView
+              tabs={tabs}
+              activeTabId={activeTabId}
+              layout={layout}
+              activePane={activePane}
+              token={token}
+              dropTarget={dropTarget}
+              onActiveTabChange={setActiveTabId}
+              onCreateTab={() => createWorkspaceTab()}
+              onCloseTab={closeWorkspaceTab}
+              onFocusPane={setActivePane}
+              onSplitPane={splitPaneById}
+              onClosePane={closePane}
+              onDropTarget={setDropTarget}
+              onDropPayload={dropOnPane}
+              setStatus={setStatus}
+            />
+          )}
         </div>
       </main>
       <AuthModal
@@ -732,6 +905,383 @@ function App() {
         onClose={() => setJoinOpen(false)}
         onGenerate={() => void generateJoinSignal()}
       />
+    </div>
+  );
+}
+
+function OverviewPage({
+  workers,
+  sessions,
+  allSessions,
+  workerFilter,
+  sessionSearch,
+  activeSessionIds,
+  previewStates,
+  onWorkerFilterChange,
+  onSessionSearchChange,
+  onAttach,
+  onAttachNewTab,
+  onLoadPreview,
+  onKillSession,
+  onUpdateWorker,
+}: {
+  workers: WorkerView[];
+  sessions: SessionView[];
+  allSessions: SessionView[];
+  workerFilter: string;
+  sessionSearch: string;
+  activeSessionIds: Set<string>;
+  previewStates: Record<string, PreviewState>;
+  onWorkerFilterChange: (workerID: string) => void;
+  onSessionSearchChange: (query: string) => void;
+  onAttach: (session: SessionView) => void;
+  onAttachNewTab: (session: SessionView) => void;
+  onLoadPreview: (session: SessionView, force?: boolean) => void;
+  onKillSession: (session: SessionView) => void;
+  onUpdateWorker: (worker: WorkerView, patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
+}) {
+  const workerByID = React.useMemo(() => new Map(workers.map((worker) => [worker.id, worker])), [workers]);
+  const onlineWorkers = workers.filter(workerIsOnline).length;
+  const enabledWorkers = workers.filter(workerEnabled).length;
+  const previewSessions = sessions.slice(0, 80);
+
+  return (
+    <div className="h-full overflow-auto bg-background">
+      <div className="space-y-4 p-4">
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <MetricTile label="Workers" value={`${onlineWorkers}/${workers.length}`} detail={`${enabledWorkers} enabled`} />
+          <MetricTile label="Sessions" value={`${allSessions.length}`} detail={`${previewSessions.length} visible`} />
+          <MetricTile label="Attached" value={`${activeSessionIds.size}`} detail="workspace panes and tabs" />
+          <MetricTile label="Preview" value="active pane" detail="attach opens the whole session" />
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <section className="min-w-0 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-semibold">Workers</div>
+                <div className="text-xs text-muted-foreground">Status, access and diagnostics</div>
+              </div>
+              <Button variant="ghost" size="xs" onClick={() => onWorkerFilterChange("all")}>
+                All
+              </Button>
+            </div>
+            <div className="space-y-2">
+              {workers.length === 0 ? <EmptyState title="No workers" detail="Generate a join command from the sidebar." /> : null}
+              {workers.map((worker) => (
+                <WorkerCard
+                  key={worker.id}
+                  worker={worker}
+                  selected={workerFilter === worker.id}
+                  sessionCount={allSessions.filter((session) => session.worker_id === worker.id).length}
+                  onSelect={() => onWorkerFilterChange(worker.id)}
+                  onUpdate={(patch) => onUpdateWorker(worker, patch)}
+                />
+              ))}
+            </div>
+          </section>
+
+          <section className="min-w-0 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-semibold">Session Preview</div>
+                <div className="text-xs text-muted-foreground">Preview shows active pane output; attach opens the full session.</div>
+              </div>
+              <div className="flex min-w-[320px] flex-1 flex-wrap justify-end gap-2">
+                <Select value={workerFilter} onChange={(event) => onWorkerFilterChange(event.target.value)} className="h-8 max-w-[220px] text-xs">
+                  <option value="all">All workers</option>
+                  {workers.map((worker) => (
+                    <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)} · {workerStatusLabel(worker)}</option>
+                  ))}
+                </Select>
+                <div className="relative min-w-[220px] flex-1 sm:max-w-xs">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={sessionSearch}
+                    onChange={(event) => onSessionSearchChange(event.target.value)}
+                    placeholder="Filter sessions"
+                    className="h-8 pl-8 text-xs"
+                  />
+                </div>
+              </div>
+            </div>
+            {previewSessions.length === 0 ? (
+              <EmptyState title="No sessions" detail="Create a session or adjust the current filter." />
+            ) : (
+              <div className="grid gap-2 md:grid-cols-2 2xl:grid-cols-3">
+                {previewSessions.map((session) => (
+                  <SessionPreviewCard
+                    key={session.id}
+                    session={session}
+                    worker={workerByID.get(session.worker_id) || null}
+                    active={activeSessionIds.has(session.id)}
+                    preview={previewStates[session.id]}
+                    onAttach={() => onAttach(session)}
+                    onAttachNewTab={() => onAttachNewTab(session)}
+                    onLoadPreview={(force) => onLoadPreview(session, force)}
+                    onKill={() => onKillSession(session)}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MetricTile({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <div className="rounded-md border border-border bg-card px-3 py-2">
+      <div className="text-[11px] font-medium uppercase text-muted-foreground">{label}</div>
+      <div className="mt-1 text-lg font-semibold">{value}</div>
+      <div className="truncate text-xs text-muted-foreground">{detail}</div>
+    </div>
+  );
+}
+
+function WorkerCard({
+  worker,
+  selected,
+  sessionCount,
+  onSelect,
+  onUpdate,
+}: {
+  worker: WorkerView;
+  selected: boolean;
+  sessionCount: number;
+  onSelect: () => void;
+  onUpdate: (patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
+}) {
+  const enabled = workerEnabled(worker);
+  const online = workerIsOnline(worker);
+  return (
+    <Card className={cn("space-y-3 bg-card p-3 transition-colors", selected && "border-primary/50 bg-primary/10")}>
+      <button type="button" className="flex w-full min-w-0 items-start gap-2 text-left" onClick={onSelect}>
+        <div className={cn("grid h-8 w-8 shrink-0 place-items-center rounded-md", online ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300")}>
+          <Server className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div className="truncate text-sm font-semibold">{workerDisplayLabel(worker)}</div>
+            <BackendBadge value={worker.backend} />
+          </div>
+          <div className="truncate text-xs text-muted-foreground">{worker.addr || worker.id}</div>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            <StatusBadge tone={online ? "ok" : "warn"}>{workerStatusLabel(worker)}</StatusBadge>
+            <StatusBadge tone={enabled ? "ok" : "err"}>{enabled ? "enabled" : "disabled"}</StatusBadge>
+            <StatusBadge>{sessionCount} sessions</StatusBadge>
+          </div>
+        </div>
+      </button>
+      <div className="grid grid-cols-3 gap-1">
+        <Button variant={enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ enabled: !enabled })}>
+          <ShieldCheck className="h-3.5 w-3.5" />
+          {enabled ? "Disable" : "Enable"}
+        </Button>
+        <Button variant={worker.trace_enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ trace_enabled: !worker.trace_enabled })}>
+          <Activity className="h-3.5 w-3.5" />
+          Trace
+        </Button>
+        <Button variant={worker.debug_enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ debug_enabled: !worker.debug_enabled })}>
+          <Bug className="h-3.5 w-3.5" />
+          Debug
+        </Button>
+      </div>
+      <div className="text-[11px] text-muted-foreground">Last seen {formatRelativeTime(worker.last_seen)}</div>
+    </Card>
+  );
+}
+
+function SessionPreviewCard({
+  session,
+  worker,
+  active,
+  preview,
+  onAttach,
+  onAttachNewTab,
+  onLoadPreview,
+  onKill,
+}: {
+  session: SessionView;
+  worker: WorkerView | null;
+  active: boolean;
+  preview?: PreviewState;
+  onAttach: () => void;
+  onAttachNewTab: () => void;
+  onLoadPreview: (force?: boolean) => void;
+  onKill: () => void;
+}) {
+  React.useEffect(() => {
+    onLoadPreview(false);
+  }, [session.id]);
+
+  const previewText = preview?.data?.trimEnd() || "";
+  return (
+    <Card
+      className={cn("group flex min-h-[260px] flex-col overflow-hidden bg-card transition-colors", active && "border-primary/50 bg-primary/10")}
+      draggable
+      onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
+    >
+      <div className="space-y-2 border-b border-border px-3 py-2">
+        <div className="flex items-start justify-between gap-2">
+          <button type="button" className="min-w-0 text-left" onClick={onAttach}>
+            <div className="flex min-w-0 items-center gap-1.5">
+              <div className="truncate text-sm font-semibold">{session.name || session.id}</div>
+              <BackendBadge value={sessionBackendLabel(session, worker)} />
+            </div>
+            <div className="truncate text-xs text-muted-foreground">{worker ? workerDisplayLabel(worker) : session.worker_id}</div>
+          </button>
+          <StatusBadge tone={active ? "ok" : undefined}>{active ? "attached" : session.status || "idle"}</StatusBadge>
+        </div>
+        <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.cwd || "."}</div>
+      </div>
+      <button type="button" className="min-h-0 flex-1 bg-[#050607] p-3 text-left" onClick={onAttach}>
+        <div className="mb-2 flex items-center justify-between text-[11px] text-muted-foreground">
+          <span>{preview?.scope || "active_pane"}</span>
+          <span>{preview?.loadedAt ? formatRelativeTime(new Date(preview.loadedAt).toISOString()) : "not loaded"}</span>
+        </div>
+        <pre className="h-32 overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-4 text-[#d7e2df]">
+          {preview?.loading ? "Loading active pane preview..." : preview?.error ? `Preview unavailable: ${preview.error}` : previewText || "No active pane output yet."}
+        </pre>
+      </button>
+      <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-2">
+        <div className="flex items-center gap-1">
+          <Button variant="secondary" size="xs" type="button" onClick={onAttach}>
+            <Monitor className="h-3.5 w-3.5" />
+            Attach
+          </Button>
+          <Button variant="ghost" size="xs" type="button" onClick={onAttachNewTab}>
+            <Plus className="h-3.5 w-3.5" />
+            Tab
+          </Button>
+        </div>
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" size="icon-sm" type="button" onClick={() => onLoadPreview(true)} title="Refresh active pane preview">
+            <Eye className="h-4 w-4" />
+          </Button>
+          <Button variant="ghost" size="icon-sm" type="button" onClick={onKill} title="Exit session">
+            <Power className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function WorkspaceView({
+  tabs,
+  activeTabId,
+  layout,
+  activePane,
+  token,
+  dropTarget,
+  onActiveTabChange,
+  onCreateTab,
+  onCloseTab,
+  onFocusPane,
+  onSplitPane,
+  onClosePane,
+  onDropTarget,
+  onDropPayload,
+  setStatus,
+}: {
+  tabs: WorkspaceTab[];
+  activeTabId: string;
+  layout: LayoutNode;
+  activePane: string;
+  token: string;
+  dropTarget: DropTarget | null;
+  onActiveTabChange: (tabID: string) => void;
+  onCreateTab: () => void;
+  onCloseTab: (tabID: string) => void;
+  onFocusPane: (id: string) => void;
+  onSplitPane: (paneId: string, direction: SplitDirection) => void;
+  onClosePane: (id: string) => void;
+  onDropTarget: (target: DropTarget | null) => void;
+  onDropPayload: (paneId: string, zone: DropZone, payload: DragPayload) => void;
+  setStatus: React.Dispatch<React.SetStateAction<Status>>;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-background">
+      <div className="flex h-9 items-center gap-2 border-b border-border bg-card px-2">
+        <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={cn(
+                "flex h-7 max-w-[220px] shrink-0 items-center gap-1 rounded-md border px-2 text-xs transition-colors",
+                tab.id === activeTabId ? "border-primary/50 bg-primary/10 text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground",
+              )}
+              onClick={() => onActiveTabChange(tab.id)}
+            >
+              <span className="truncate">{tab.title}</span>
+              {tabs.length > 1 ? (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="grid h-4 w-4 place-items-center rounded hover:bg-secondary"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCloseTab(tab.id);
+                  }}
+                >
+                  <X className="h-3 w-3" />
+                </span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+        <Button variant="ghost" size="icon-sm" onClick={onCreateTab} title="New workspace tab">
+          <Plus className="h-4 w-4" />
+        </Button>
+      </div>
+      <div className="min-h-0 flex-1">
+        <LayoutRenderer
+          node={layout}
+          activePane={activePane}
+          token={token}
+          onFocusPane={onFocusPane}
+          onSplitPane={onSplitPane}
+          onClosePane={onClosePane}
+          dropTarget={dropTarget}
+          onDropTarget={onDropTarget}
+          onDropPayload={onDropPayload}
+          setStatus={setStatus}
+        />
+      </div>
+    </div>
+  );
+}
+
+function BackendBadge({ value }: { value?: string }) {
+  return <StatusBadge>{(value || "backend").toLowerCase()}</StatusBadge>;
+}
+
+function StatusBadge({ tone, children }: { tone?: "ok" | "warn" | "err"; children: React.ReactNode }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex h-5 shrink-0 items-center rounded border px-1.5 text-[10px] font-medium uppercase tracking-[0.04em]",
+        tone === "ok" && "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+        tone === "warn" && "border-amber-500/30 bg-amber-500/10 text-amber-300",
+        tone === "err" && "border-red-500/30 bg-red-500/10 text-red-300",
+        !tone && "border-border bg-secondary text-muted-foreground",
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+function EmptyState({ title, detail }: { title: string; detail: string }) {
+  return (
+    <div className="rounded-md border border-dashed border-border bg-card px-3 py-8 text-center">
+      <div className="text-sm font-medium">{title}</div>
+      <div className="mt-1 text-xs text-muted-foreground">{detail}</div>
     </div>
   );
 }
@@ -1354,6 +1904,29 @@ function newPane(sessionId?: string): PaneNode {
   return { type: "pane", id: crypto.randomUUID(), sessionId };
 }
 
+function newWorkspaceTab(sessionId?: string, title?: string): WorkspaceTab {
+  const pane = newPane(sessionId);
+  return {
+    id: crypto.randomUUID(),
+    title: title || tabTitleForSession(sessionId) || "Workspace",
+    layout: pane,
+    activePane: pane.id,
+  };
+}
+
+function titleForTab(currentTitle: string, layout: LayoutNode) {
+  const sessionIDs = collectPanes(layout).map((pane) => pane.sessionId).filter((id): id is string => Boolean(id));
+  if (sessionIDs.length === 1) return tabTitleForSession(sessionIDs[0]);
+  if (sessionIDs.length > 1) return `${sessionIDs.length} sessions`;
+  return currentTitle || "Workspace";
+}
+
+function tabTitleForSession(sessionId?: string) {
+  if (!sessionId) return "Workspace";
+  const parts = sessionId.split("/");
+  return parts[parts.length - 1] || sessionId;
+}
+
 function updatePane(node: LayoutNode, paneId: string, update: (pane: PaneNode) => PaneNode): LayoutNode {
   if (node.type === "pane") {
     return node.id === paneId ? update(node) : node;
@@ -1631,6 +2204,11 @@ function errorDetail(text: string) {
   }
 }
 
+function errorDetailFromResponseText(status: number, text: string) {
+  const detail = text ? errorDetail(text) : "";
+  return detail || `${status}`;
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -1674,6 +2252,14 @@ function workerIsOnline(worker: WorkerView) {
   return worker.online === true || !worker.status || worker.status === "online";
 }
 
+function workerEnabled(worker: WorkerView) {
+  return worker.enabled !== false;
+}
+
+function workerCanStartSession(worker: WorkerView) {
+  return workerIsOnline(worker) && workerEnabled(worker);
+}
+
 function workerStatusLabel(worker: WorkerView) {
   return workerIsOnline(worker) ? "online" : "offline";
 }
@@ -1682,9 +2268,59 @@ function filterWorkers(workers: WorkerView[], query: string) {
   const needle = query.trim().toLowerCase();
   if (!needle) return workers;
   return workers.filter((worker) => {
-    const haystacks = [worker.id, worker.name, worker.addr, workerDisplayLabel(worker)];
-    return haystacks.some((value) => value.toLowerCase().includes(needle));
+    const haystacks = [worker.id, worker.name, worker.addr, worker.backend, workerDisplayLabel(worker)];
+    return haystacks.some((value) => (value || "").toLowerCase().includes(needle));
   });
+}
+
+function filterSessions(sessions: SessionView[], workers: WorkerView[], workerFilter: string, query: string) {
+  const workerByID = new Map(workers.map((worker) => [worker.id, worker]));
+  const needle = query.trim().toLowerCase();
+  return sessions
+    .filter((session) => workerFilter === "all" || session.worker_id === workerFilter)
+    .filter((session) => {
+      if (!needle) return true;
+      const worker = workerByID.get(session.worker_id);
+      const haystacks = [
+        session.id,
+        session.name,
+        session.worker_id,
+        session.cwd,
+        session.command,
+        session.status,
+        session.backend,
+        worker?.name,
+        worker?.addr,
+        worker?.backend,
+        worker ? workerDisplayLabel(worker) : "",
+      ];
+      return haystacks.some((value) => (value || "").toLowerCase().includes(needle));
+    })
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function sessionBackendLabel(session: SessionView, worker?: WorkerView | null) {
+  return session.backend || worker?.backend || "unknown";
+}
+
+function stripAnsi(value: string) {
+  return value
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1B[PX^_].*?\x1B\\/gs, "")
+    .replace(/\x1B[@-_]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+}
+
+function formatRelativeTime(value: string) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "unknown";
+  const diff = Date.now() - timestamp;
+  if (diff < 5_000) return "just now";
+  if (diff < 60_000) return `${Math.round(diff / 1000)}s ago`;
+  if (diff < 60 * 60_000) return `${Math.round(diff / 60_000)}m ago`;
+  if (diff < 24 * 60 * 60_000) return `${Math.round(diff / (60 * 60_000))}h ago`;
+  return new Date(timestamp).toLocaleString();
 }
 
 function buildWorkerSessionGroups(workers: WorkerView[], sessions: SessionView[], workerFilter: string): WorkerSessionGroup[] {

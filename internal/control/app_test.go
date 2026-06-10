@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"private/agentmux/internal/protocol"
+	"private/agentmux/internal/terminalview"
 )
 
 func TestDedupeSessionsSortsByID(t *testing.T) {
@@ -93,6 +94,60 @@ func TestReadAppKeyDetach(t *testing.T) {
 	}
 	if key != "detach" {
 		t.Fatalf("expected detach, got %q", key)
+	}
+}
+
+func TestReadAppKeyCtrlGDebugSnapshot(t *testing.T) {
+	key, err := readAppKey(strings.NewReader("\x07"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "ctrl-g" {
+		t.Fatalf("expected ctrl-g, got %q", key)
+	}
+}
+
+func TestReadAppKeyCtrlQHardQuit(t *testing.T) {
+	key, err := readAppKey(strings.NewReader("\x11"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "ctrl-q" {
+		t.Fatalf("expected ctrl-q, got %q", key)
+	}
+}
+
+func TestReadAppKeyCtrlFTogglesFullscreen(t *testing.T) {
+	key, err := readAppKey(strings.NewReader("\x06"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "ctrl-f" {
+		t.Fatalf("expected ctrl-f, got %q", key)
+	}
+}
+
+func TestAppKeyReaderPreservesUTF8InputBytes(t *testing.T) {
+	input := "中文"
+	reader := strings.NewReader(input)
+	var keys appKeyReader
+	var got strings.Builder
+	for range input {
+		key, err := keys.Read(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got.WriteString(key)
+	}
+	if got.String() != input {
+		t.Fatalf("utf-8 input changed: got %q bytes=% x want %q bytes=% x", got.String(), []byte(got.String()), input, []byte(input))
+	}
+}
+
+func TestAppKeyInputDataAcceptsUTF8Rune(t *testing.T) {
+	input := "中"
+	if got := appKeyInputData(input); got != input {
+		t.Fatalf("utf-8 rune input changed: got %q bytes=% x want %q bytes=% x", got, []byte(got), input, []byte(input))
 	}
 }
 
@@ -214,6 +269,19 @@ func TestAppLayoutUsesNarrowSessionList(t *testing.T) {
 	}
 }
 
+func TestAppLayoutShowsPreviewAtStandardTerminalWidth(t *testing.T) {
+	listWidth, previewWidth, limit := appLayout(80, 24)
+	if listWidth != 24 {
+		t.Fatalf("unexpected compact list width: %d", listWidth)
+	}
+	if previewWidth <= 0 {
+		t.Fatalf("expected preview at 80 columns")
+	}
+	if limit != 17 {
+		t.Fatalf("unexpected body limit: %d", limit)
+	}
+}
+
 func TestPreviewLineCanBeTruncatedToWidth(t *testing.T) {
 	line := previewLine([]string{"\x1b[31m" + strings.Repeat("x", 80) + "\x1b[0m"}, 0)
 	got := truncateVisible(line, 20)
@@ -241,6 +309,39 @@ func TestRenderIncludesSessionListWhenPreviewExists(t *testing.T) {
 	}
 }
 
+func TestRenderDoesNotShowWarmingWithoutSelectedStream(t *testing.T) {
+	app := &App{
+		Out: &bytes.Buffer{},
+		sessions: []protocol.SessionView{{
+			ID: "local/demo", WorkerID: "local", Name: "demo", Status: "active", Command: "bash",
+		}},
+		status: "ready",
+	}
+	app.renderWithSize(120, 24)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if strings.Contains(output, "stream warming") {
+		t.Fatalf("unexpected warming placeholder without live stream:\n%s", output)
+	}
+}
+
+func TestRenderShowsWarmingForSelectedWarmingStream(t *testing.T) {
+	app := &App{
+		Out: &bytes.Buffer{},
+		sessions: []protocol.SessionView{{
+			ID: "local/demo", WorkerID: "local", Name: "demo", Status: "active", Command: "bash",
+		}},
+		streams: map[string]*appSessionStream{
+			"local/demo": {sessionID: "local/demo", warming: true},
+		},
+		status: "ready",
+	}
+	app.renderWithSize(120, 24)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "stream warming") {
+		t.Fatalf("expected warming placeholder for warming stream:\n%s", output)
+	}
+}
+
 func TestRenderUnauthenticatedApp(t *testing.T) {
 	app := NewUnauthApp(nil, &bytes.Buffer{}, nil)
 	app.status = "not logged in; type /login"
@@ -248,6 +349,166 @@ func TestRenderUnauthenticatedApp(t *testing.T) {
 	output := stripControl(app.Out.(*bytes.Buffer).String())
 	if !strings.Contains(output, "auth=none") || !strings.Contains(output, "/login") {
 		t.Fatalf("unauthenticated render missing login prompt:\n%s", output)
+	}
+}
+
+func TestRenderActiveUsesTerminalCanvasOnly(t *testing.T) {
+	view := terminalview.New(20, 5)
+	view.Write([]byte("\x1b[31mremote\x1b[0m\nshell"))
+	app := &App{
+		Out:        &bytes.Buffer{},
+		active:     "local/demo",
+		fullscreen: true,
+		sessions:   []protocol.SessionView{{ID: "local/demo"}},
+		streams: map[string]*appSessionStream{
+			"local/demo": {sessionID: "local/demo", view: view, size: protocol.TerminalSize{Cols: 20, Rows: 5}, seenOutput: true, visibleOutput: true},
+		},
+		status: "ready",
+	}
+	app.renderWithSize(20, 5)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "remote") || !strings.Contains(output, "shell") {
+		t.Fatalf("active terminal canvas missing remote output:\n%s", output)
+	}
+	if strings.Contains(output, "Sessions") || strings.Contains(output, "Selected") || strings.Contains(output, "Ctrl-]") {
+		t.Fatalf("active render should not include TUI chrome:\n%s", output)
+	}
+	if got := app.streams["local/demo"].size; got != (protocol.TerminalSize{Cols: 20, Rows: 5}) {
+		t.Fatalf("active stream size mismatch: %+v", got)
+	}
+}
+
+func TestRenderAttachedUsesSplitPaneByDefault(t *testing.T) {
+	view := terminalview.New(80, 17)
+	view.Write([]byte("remote shell"))
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/demo"
+	app.status = attachedPreviewStatus("local/demo")
+	app.sessions = []protocol.SessionView{{ID: "local/demo", Status: "active", Command: "bash"}}
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID:  "local/demo",
+		view:       view,
+		size:       protocol.TerminalSize{Cols: 80, Rows: 17},
+		writes:     make(chan appStreamWrite, 1),
+		seenOutput: true,
+	}
+	app.updateStreamBuffer(app.streams["local/demo"])
+	app.loadSelectedPreview()
+	app.renderWithSize(120, 24)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "Sessions") || !strings.Contains(output, "Selected local/demo") {
+		t.Fatalf("attached split render should keep local chrome:\n%s", output)
+	}
+	if !strings.Contains(output, "Session local/demo") || !strings.Contains(output, "remote shell") {
+		t.Fatalf("attached split render should show live session pane:\n%s", output)
+	}
+	if !strings.Contains(output, "Ctrl-F fullscreen") {
+		t.Fatalf("attached split render missing fullscreen hint:\n%s", output)
+	}
+}
+
+func TestRenderActiveUsesPreviewFallbackBeforeFirstStreamOutput(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/demo"
+	app.fullscreen = true
+	app.previews["local/demo"] = "cached shell\n$ ready"
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID: "local/demo",
+		view:      terminalview.New(20, 5),
+		size:      protocol.TerminalSize{Cols: 20, Rows: 5},
+	}
+	app.renderWithSize(100, 5)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if !strings.Contains(output, "cached shell") || !strings.Contains(output, "$ ready") {
+		t.Fatalf("active fallback missing cached preview:\n%s", output)
+	}
+	if !strings.Contains(output, "Ctrl-]") || !strings.Contains(output, "q/Ctrl-C/Ctrl-Q quit") {
+		t.Fatalf("active fallback missing recovery shortcuts:\n%s", output)
+	}
+}
+
+func TestRenderActiveLeavesWaitingAfterAnyStreamOutput(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/demo"
+	app.fullscreen = true
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID: "local/demo",
+		stream:    &Stream{},
+		view:      terminalview.New(20, 5),
+		size:      protocol.TerminalSize{Cols: 20, Rows: 5},
+		writes:    make(chan appStreamWrite, 1),
+	}
+	app.queueSessionOutput("local/demo", []byte("\x1b[2J\x1b[H"))
+	if !app.processPendingStreamOutput(1024) {
+		t.Fatalf("expected pending output to process")
+	}
+	app.renderWithSize(100, 5)
+	output := stripControl(app.Out.(*bytes.Buffer).String())
+	if strings.Contains(output, "waiting for terminal output") {
+		t.Fatalf("active fallback should be removed after stream output:\n%s", output)
+	}
+}
+
+func TestActiveWaitingQQuitsUntilStreamOutput(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/demo"
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID: "local/demo",
+		view:      terminalview.New(20, 5),
+		writes:    make(chan appStreamWrite, 1),
+	}
+	if !app.handleKey(t.Context(), "q") {
+		t.Fatalf("expected q to quit while active terminal is still waiting for output")
+	}
+
+	writes := make(chan appStreamWrite, 1)
+	app.active = "local/demo"
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID:  "local/demo",
+		view:       terminalview.New(20, 5),
+		writes:     writes,
+		seenOutput: true,
+	}
+	if app.handleKey(t.Context(), "q") {
+		t.Fatalf("q should be forwarded after terminal stream output")
+	}
+	select {
+	case write := <-writes:
+		if write.data != "q" {
+			t.Fatalf("unexpected forwarded input: %+v", write)
+		}
+	default:
+		t.Fatalf("expected q to be forwarded to active stream")
+	}
+}
+
+func TestActiveWaitingEscapeDetaches(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "local/demo"}}
+	app.active = "local/demo"
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID: "local/demo",
+		view:      terminalview.New(20, 5),
+		writes:    make(chan appStreamWrite, 1),
+	}
+	if app.handleKey(t.Context(), "unknown") {
+		t.Fatalf("escape should detach instead of quitting")
+	}
+	if app.active != "" {
+		t.Fatalf("expected escape to detach while waiting for terminal output")
+	}
+}
+
+func TestActiveWaitingCtrlCQuits(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/demo"
+	app.streams["local/demo"] = &appSessionStream{
+		sessionID: "local/demo",
+		view:      terminalview.New(20, 5),
+		writes:    make(chan appStreamWrite, 1),
+	}
+	if !app.handleKey(t.Context(), "ctrl-c") {
+		t.Fatalf("expected ctrl-c to quit while waiting for terminal output")
 	}
 }
 
@@ -302,6 +563,140 @@ func TestLoadSelectedPreviewKeepsCaptureDuringWarmup(t *testing.T) {
 	}
 }
 
+func TestAppendSessionBufferUsesTerminalView(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.streams["local/a"] = &appSessionStream{
+		sessionID: "local/a",
+		view:      terminalview.New(40, 4),
+	}
+	app.queueSessionOutput("local/a", []byte("old line\n\x1b[2J\x1b[Hnew line"))
+	if !app.processPendingStreamOutput(1024) {
+		t.Fatalf("expected pending output to process")
+	}
+	if !app.refreshDirtyTerminalViews() {
+		t.Fatalf("expected dirty terminal view")
+	}
+	got := stripControl(app.buffers["local/a"])
+	if strings.Contains(got, "old line") {
+		t.Fatalf("expected terminal clear to remove old content, got %q", got)
+	}
+	if !strings.Contains(got, "new line") {
+		t.Fatalf("expected rendered terminal content, got %q", got)
+	}
+}
+
+func TestProcessPendingStreamOutputIsBounded(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.streams["local/a"] = &appSessionStream{
+		sessionID: "local/a",
+		view:      terminalview.New(40, 4),
+		size:      protocol.TerminalSize{Cols: 40, Rows: 4},
+	}
+	app.queueSessionOutput("local/a", []byte(strings.Repeat("x", 128)))
+	if !app.processPendingStreamOutput(32) {
+		t.Fatalf("expected pending output to process")
+	}
+	if got := len(app.streams["local/a"].pending); got != 96 {
+		t.Fatalf("expected bounded pending output, got %d bytes", got)
+	}
+}
+
+func TestForwardActiveKeyQueuesInputWithoutBlockingOnStreamWrite(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	writes := make(chan appStreamWrite, 1)
+	app.active = "local/a"
+	app.streams["local/a"] = &appSessionStream{
+		sessionID: "local/a",
+		writes:    writes,
+	}
+	if err := app.forwardActiveKey("x"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case write := <-writes:
+		if write.data != "x" || write.resize {
+			t.Fatalf("unexpected queued write: %+v", write)
+		}
+	default:
+		t.Fatalf("expected input to be queued")
+	}
+}
+
+func TestForwardActiveKeyPreservesUTF8InputBytes(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	writes := make(chan appStreamWrite, 8)
+	app.active = "local/a"
+	app.streams["local/a"] = &appSessionStream{
+		sessionID: "local/a",
+		writes:    writes,
+	}
+	input := "中文"
+	var wantWrites int
+	for _, r := range input {
+		wantWrites++
+		if err := app.forwardActiveKey(string(r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got strings.Builder
+	for i := 0; i < wantWrites; i++ {
+		select {
+		case write := <-writes:
+			got.WriteString(write.data)
+		default:
+			t.Fatalf("expected forwarded utf-8 rune %d", i)
+		}
+	}
+	if got.String() != input {
+		t.Fatalf("forwarded utf-8 changed: got %q bytes=% x want %q bytes=% x", got.String(), []byte(got.String()), input, []byte(input))
+	}
+}
+
+func TestCtrlQQuitsEvenWhenAttached(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/a"
+	if !app.handleKey(t.Context(), "ctrl-q") {
+		t.Fatalf("expected ctrl-q to quit from active mode")
+	}
+}
+
+func TestCtrlFTogglesFullscreenWhenAttached(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.active = "local/a"
+	app.streams["local/a"] = &appSessionStream{sessionID: "local/a", view: terminalview.New(80, 24)}
+	if app.handleKey(t.Context(), "ctrl-f") {
+		t.Fatalf("ctrl-f should not quit")
+	}
+	if !app.fullscreen {
+		t.Fatalf("expected ctrl-f to enter fullscreen")
+	}
+	if app.handleKey(t.Context(), "ctrl-f") {
+		t.Fatalf("second ctrl-f should not quit")
+	}
+	if app.fullscreen {
+		t.Fatalf("expected second ctrl-f to return to split pane")
+	}
+}
+
+func TestDrainStreamEventsIsBounded(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "local/a"}}
+	app.streams["local/a"] = &appSessionStream{
+		sessionID: "local/a",
+		view:      terminalview.New(40, 4),
+		size:      protocol.TerminalSize{Cols: 40, Rows: 4},
+	}
+	for i := 0; i < 40; i++ {
+		app.events <- appStreamEvent{sessionID: "local/a", data: []byte("x")}
+	}
+	if !app.drainStreamEvents(16) {
+		t.Fatalf("expected events to drain")
+	}
+	if len(app.events) != 24 {
+		t.Fatalf("expected bounded drain to leave events queued, got %d", len(app.events))
+	}
+}
+
 func TestRenderDoesNotClearWholeScreenEachFrame(t *testing.T) {
 	app := &App{
 		Out: &bytes.Buffer{},
@@ -326,9 +721,13 @@ func TestDetachMarksStreamForTTL(t *testing.T) {
 	app.streams["local/a"] = &appSessionStream{sessionID: "local/a"}
 	app.sessions = []protocol.SessionView{{ID: "local/a"}}
 	app.active = "local/a"
+	app.fullscreen = true
 	app.detachActive()
 	if app.active != "" {
 		t.Fatalf("expected active session to clear")
+	}
+	if app.fullscreen {
+		t.Fatalf("expected detach to leave fullscreen")
 	}
 	if app.streams["local/a"].keepUntil.IsZero() {
 		t.Fatalf("expected detach TTL")

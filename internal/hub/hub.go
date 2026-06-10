@@ -51,6 +51,7 @@ type workerConn struct {
 	tenantID string
 	name     string
 	addr     string
+	backend  string
 	lastSeen time.Time
 	conn     *ws.Conn
 	send     chan protocol.Envelope
@@ -59,15 +60,20 @@ type workerConn struct {
 }
 
 type workerRecord struct {
-	id        string
-	tenantID  string
-	name      string
-	addr      string
-	lastSeen  time.Time
-	connected bool
+	id           string
+	tenantID     string
+	name         string
+	addr         string
+	backend      string
+	lastSeen     time.Time
+	connected    bool
+	disabled     bool
+	traceEnabled bool
+	debugEnabled bool
 }
 
 type controlConn struct {
+	id       string
 	conn     *ws.Conn
 	send     chan protocol.Envelope
 	tenantID string
@@ -197,6 +203,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/auth/device/approve-current", s.handleDeviceApproveCurrent)
 	mux.HandleFunc("/api/auth/oauth/", s.handleAuthOAuth)
 	mux.HandleFunc("/api/workers", s.requireRole("control", s.handleWorkers))
+	mux.HandleFunc("/api/workers/", s.requireRole("control", s.handleWorkerAction))
 	mux.HandleFunc("/api/sessions", s.requireRole("control", s.handleSessions))
 	mux.HandleFunc("/api/sessions/", s.requireRole("control", s.handleSessionAction))
 	mux.HandleFunc("/ws/worker", s.handleWorkerWS)
@@ -552,22 +559,66 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		if !auth.Admin && worker.tenantID != auth.Credential.TenantID {
 			continue
 		}
-		status := "offline"
-		if worker.connected {
-			status = "online"
-		}
-		workers = append(workers, protocol.WorkerView{
-			ID:       worker.id,
-			TenantID: worker.tenantID,
-			Name:     worker.name,
-			Addr:     worker.addr,
-			LastSeen: worker.lastSeen,
-			Status:   status,
-			Online:   worker.connected,
-		})
+		workers = append(workers, workerView(worker))
 	}
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{"workers": workers})
+}
+
+type workerPatchRequest struct {
+	Enabled      *bool `json:"enabled"`
+	TraceEnabled *bool `json:"trace_enabled"`
+	DebugEnabled *bool `json:"debug_enabled"`
+}
+
+func (s *Server) handleWorkerAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	auth := requestAuth(r)
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/workers/"), "/")
+	if path == "" || strings.Contains(path, "/") {
+		writeError(w, http.StatusNotFound, "worker path must be /api/workers/{id}")
+		return
+	}
+	workerID, err := url.PathUnescape(path)
+	if err != nil || strings.TrimSpace(workerID) == "" || strings.Contains(workerID, "/") {
+		writeError(w, http.StatusBadRequest, "invalid worker id")
+		return
+	}
+	var req workerPatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	record := s.workerViews[workerID]
+	if record.id == "" {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "worker not found")
+		return
+	}
+	if !auth.Admin && record.tenantID != auth.Credential.TenantID {
+		s.mu.Unlock()
+		writeError(w, http.StatusForbidden, "worker is not in credential tenant")
+		return
+	}
+	if req.Enabled != nil {
+		record.disabled = !*req.Enabled
+	}
+	if req.TraceEnabled != nil {
+		record.traceEnabled = *req.TraceEnabled
+	}
+	if req.DebugEnabled != nil {
+		record.debugEnabled = *req.DebugEnabled
+	}
+	s.workerViews[workerID] = record
+	view := workerView(record)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"worker": view})
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -597,6 +648,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		if !auth.Admin && !s.workerInTenant(req.WorkerID, auth.Credential.TenantID) {
 			writeError(w, http.StatusForbidden, "worker is not in credential tenant")
+			return
+		}
+		if !s.workerEnabled(req.WorkerID) {
+			writeError(w, http.StatusForbidden, "worker is disabled")
 			return
 		}
 		if err := s.sendToWorker(req.WorkerID, protocol.TypeSessionCreate, protocol.Session{
@@ -645,6 +700,10 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "input" {
+		if !s.workerEnabled(workerID) {
+			writeError(w, http.StatusForbidden, "worker is disabled")
+			return
+		}
 		var input protocol.TerminalInput
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -684,6 +743,7 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		tenantID: authTenantID(auth),
 		name:     hello.Name,
 		addr:     addr,
+		backend:  hello.Backend,
 		lastSeen: time.Now().UTC(),
 		conn:     conn,
 		send:     make(chan protocol.Envelope, 64),
@@ -692,14 +752,16 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	s.registerWorker(worker)
 	defer s.unregisterWorker(worker)
 
-	go writeLoop(conn, worker.send, worker.done)
+	go s.writeLoop("worker", worker.id, conn, worker.send, worker.done)
 	go pingLoop(conn, worker.done, wsPingInterval)
 	_ = conn.SetReadTimeout(wsPongWait)
 	for {
 		env, err := readEnvelope(conn)
 		if err != nil {
+			s.logger.Debug("worker websocket read ended", "worker", worker.id, "error", err)
 			return
 		}
+		s.logger.Debug("worker message received", "worker", worker.id, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "request_id", env.ID, "payload_bytes", len(env.Payload))
 		s.handleWorkerMessage(worker, env)
 	}
 }
@@ -715,16 +777,19 @@ func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("control websocket upgrade failed", "error", err)
 		return
 	}
-	control := &controlConn{conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin, done: make(chan struct{})}
+	control := &controlConn{id: "ctrl_" + randomID(), conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin, done: make(chan struct{})}
+	s.logger.Debug("control websocket connected", "control", control.id, "tenant", control.tenantID, "admin", control.admin)
 	defer s.removeControl(control)
-	go writeLoop(conn, control.send, control.done)
+	go s.writeLoop("control", control.id, conn, control.send, control.done)
 	go pingLoop(conn, control.done, wsPingInterval)
 	_ = conn.SetReadTimeout(wsPongWait)
 	for {
 		env, err := readEnvelope(conn)
 		if err != nil {
+			s.logger.Debug("control websocket read ended", "control", control.id, "error", err)
 			return
 		}
+		s.logger.Debug("control message received", "control", control.id, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "payload_bytes", len(env.Payload))
 		s.handleControlMessage(control, env)
 	}
 }
@@ -747,9 +812,11 @@ func (s *Server) registerWorker(worker *workerConn) {
 		s.logger.Warn("worker connection replaced", "worker", worker.id)
 	}
 	s.workers[worker.id] = worker
+	previous := s.workerViews[worker.id]
 	s.workerViews[worker.id] = workerRecord{
 		id: worker.id, tenantID: worker.tenantID, name: worker.name, addr: worker.addr,
-		lastSeen: worker.lastSeen, connected: true,
+		backend: worker.backend, lastSeen: worker.lastSeen, connected: true,
+		disabled: previous.disabled, traceEnabled: previous.traceEnabled, debugEnabled: previous.debugEnabled,
 	}
 	s.mu.Unlock()
 	s.logger.Info("worker connected", "worker", worker.id)
@@ -783,6 +850,9 @@ func (s *Server) unregisterWorker(worker *workerConn) {
 	if worker.addr != "" {
 		record.addr = worker.addr
 	}
+	if worker.backend != "" {
+		record.backend = worker.backend
+	}
 	s.workerViews[worker.id] = record
 	s.mu.Unlock()
 	s.logger.Info("worker disconnected", "worker", worker.id)
@@ -794,6 +864,9 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 	if record := s.workerViews[worker.id]; record.id != "" {
 		record.lastSeen = worker.lastSeen
 		record.connected = true
+		if worker.backend != "" {
+			record.backend = worker.backend
+		}
 		s.workerViews[worker.id] = record
 	}
 	s.mu.Unlock()
@@ -805,8 +878,10 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 		if err := env.DecodePayload(&snapshot); err != nil {
 			return
 		}
+		s.logger.Debug("worker session snapshot", "worker", worker.id, "sessions", len(snapshot.Sessions))
 		s.updateSessions(worker.id, snapshot.Sessions)
 	case protocol.TypeTerminalOutput:
+		s.logger.Debug("terminal output from worker", "worker", worker.id, "session_id", env.SessionID, "stream_id", env.StreamID, "payload_bytes", len(env.Payload))
 		s.publish(env.StreamID, env)
 	case protocol.TypeSessionPreview:
 		s.completePreview(env)
@@ -830,10 +905,37 @@ func (s *Server) updateSessions(workerID string, sessions []protocol.Session) {
 		tenantID := s.workerTenantIDLocked(workerID)
 		s.sessions[id] = protocol.SessionView{
 			ID: id, TenantID: tenantID, WorkerID: workerID, Name: session.Name,
-			CWD: session.CWD, Command: session.Command, Status: session.Status,
+			CWD: session.CWD, Command: session.Command, Status: session.Status, Backend: sessionBackend(session, s.workerViews[workerID]),
 		}
 	}
 	s.mu.Unlock()
+}
+
+func sessionBackend(session protocol.Session, worker workerRecord) string {
+	if session.Backend != "" {
+		return session.Backend
+	}
+	return worker.backend
+}
+
+func workerView(worker workerRecord) protocol.WorkerView {
+	status := "offline"
+	if worker.connected {
+		status = "online"
+	}
+	return protocol.WorkerView{
+		ID:           worker.id,
+		TenantID:     worker.tenantID,
+		Name:         worker.name,
+		Addr:         worker.addr,
+		Backend:      worker.backend,
+		LastSeen:     worker.lastSeen,
+		Status:       status,
+		Online:       worker.connected,
+		Enabled:      !worker.disabled,
+		TraceEnabled: worker.traceEnabled,
+		DebugEnabled: worker.debugEnabled,
+	}
 }
 
 func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelope) {
@@ -856,13 +958,19 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, "worker is not in credential tenant")
 			return
 		}
+		if !s.workerEnabled(workerID) {
+			sendError(control.send, env.SessionID, "worker is disabled")
+			return
+		}
 		var size protocol.TerminalSize
 		if err := env.DecodePayload(&size); err != nil {
 			sendError(control.send, env.SessionID, err.Error())
 			return
 		}
+		s.logger.Debug("control open stream", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows)
 		s.addSubscriber(env.StreamID, control)
 		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, size, name, env.SessionID, env.StreamID); err != nil {
+			s.logger.Debug("control open forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
 		}
 	case protocol.TypeControlInput:
@@ -880,7 +988,9 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, err.Error())
 			return
 		}
+		s.logger.Debug("control input forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "bytes", len(input.Data))
 		if err := s.sendToWorker(workerID, protocol.TypeTerminalInput, input, name, env.SessionID, env.StreamID); err != nil {
+			s.logger.Debug("control input forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
 		}
 	case protocol.TypeTerminalResize:
@@ -898,7 +1008,9 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			sendError(control.send, env.SessionID, err.Error())
 			return
 		}
+		s.logger.Debug("control resize forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows)
 		if err := s.sendToWorker(workerID, protocol.TypeTerminalResize, size, name, env.SessionID, env.StreamID); err != nil {
+			s.logger.Debug("control resize forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
 		}
 	case protocol.TypeTerminalClose:
@@ -909,6 +1021,7 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 		if !ok {
 			return
 		}
+		s.logger.Debug("control close forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID)
 		_ = s.sendToWorker(workerID, protocol.TypeTerminalClose, map[string]string{"name": name}, name, env.SessionID, env.StreamID)
 	}
 }
@@ -917,6 +1030,7 @@ func (s *Server) addSubscriber(streamID string, control *controlConn) {
 	s.mu.Lock()
 	s.subscribers[streamID] = control
 	s.mu.Unlock()
+	s.logger.Debug("subscriber added", "control", control.id, "stream_id", streamID)
 }
 
 func (s *Server) removeControl(control *controlConn) {
@@ -929,10 +1043,12 @@ func (s *Server) removeControl(control *controlConn) {
 	for id, subscribed := range s.subscribers {
 		if subscribed == control {
 			delete(s.subscribers, id)
+			s.logger.Debug("subscriber removed", "control", control.id, "stream_id", id)
 		}
 	}
 	s.mu.Unlock()
 	_ = control.conn.Close()
+	s.logger.Debug("control websocket disconnected", "control", control.id)
 }
 
 func (s *Server) publish(streamID string, env protocol.Envelope) {
@@ -940,17 +1056,21 @@ func (s *Server) publish(streamID string, env protocol.Envelope) {
 	control := s.subscribers[streamID]
 	s.mu.RUnlock()
 	if control == nil {
+		s.logger.Debug("publish dropped without subscriber", "stream_id", streamID, "session_id", env.SessionID, "type", env.Type, "payload_bytes", len(env.Payload))
 		return
 	}
 	select {
 	case control.send <- env:
+		s.logger.Debug("published to control", "control", control.id, "stream_id", streamID, "session_id", env.SessionID, "type", env.Type, "payload_bytes", len(env.Payload))
 	default:
+		s.logger.Debug("publish dropped control queue full", "control", control.id, "stream_id", streamID, "session_id", env.SessionID, "type", env.Type)
 	}
 }
 
 func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sessionID string, lines int) (protocol.SessionPreview, error) {
 	requestID := "preview_" + randomID()
 	reply := make(chan protocol.Envelope, 1)
+	s.logger.Debug("preview request start", "worker", workerID, "session_id", sessionID, "request_id", requestID, "lines", lines)
 	s.mu.Lock()
 	s.previews[requestID] = reply
 	s.mu.Unlock()
@@ -960,7 +1080,8 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 		s.mu.Unlock()
 	}()
 
-	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionPreview, protocol.SessionPreviewRequest{Lines: lines}, name, sessionID, requestID); err != nil {
+	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionPreview, protocol.SessionPreviewRequest{Lines: lines, Scope: "active_pane"}, name, sessionID, requestID); err != nil {
+		s.logger.Debug("preview request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 		return protocol.SessionPreview{}, err
 	}
 	timer := time.NewTimer(2 * time.Second)
@@ -969,17 +1090,24 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 	case <-ctx.Done():
 		return protocol.SessionPreview{}, ctx.Err()
 	case <-timer.C:
+		s.logger.Debug("preview request timed out", "worker", workerID, "session_id", sessionID, "request_id", requestID)
 		return protocol.SessionPreview{}, fmt.Errorf("session preview timed out")
 	case env := <-reply:
 		if env.Type == protocol.TypeError {
 			var payload protocol.ErrorPayload
 			_ = env.DecodePayload(&payload)
+			s.logger.Debug("preview request error", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", payload.Message)
 			return protocol.SessionPreview{}, errors.New(payload.Message)
 		}
 		var preview protocol.SessionPreview
 		if err := env.DecodePayload(&preview); err != nil {
+			s.logger.Debug("preview response decode failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 			return protocol.SessionPreview{}, err
 		}
+		if preview.Scope == "" {
+			preview.Scope = "active_pane"
+		}
+		s.logger.Debug("preview request complete", "worker", workerID, "session_id", sessionID, "request_id", requestID, "bytes", len(preview.Data))
 		return preview, nil
 	}
 }
@@ -1030,8 +1158,10 @@ func (s *Server) sendToWorkerWithID(workerID, messageType string, payload any, n
 	}
 	select {
 	case worker.send <- env:
+		s.logger.Debug("queued message to worker", "worker", workerID, "type", messageType, "session_id", env.SessionID, "stream_id", env.StreamID, "request_id", requestID, "payload_bytes", len(raw))
 		return nil
 	default:
+		s.logger.Debug("worker send queue full", "worker", workerID, "type", messageType, "session_id", env.SessionID, "stream_id", env.StreamID)
 		return fmt.Errorf("worker send queue full: %s", workerID)
 	}
 }
@@ -1044,6 +1174,13 @@ func (s *Server) workerInTenant(workerID, tenantID string) bool {
 	}
 	record := s.workerViews[workerID]
 	return record.id != "" && record.tenantID == tenantID
+}
+
+func (s *Server) workerEnabled(workerID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	record := s.workerViews[workerID]
+	return record.id == "" || !record.disabled
 }
 
 func (s *Server) workerTenantIDLocked(workerID string) string {
@@ -1147,7 +1284,7 @@ func readEnvelope(conn *ws.Conn) (protocol.Envelope, error) {
 	return env, env.Validate()
 }
 
-func writeLoop(conn *ws.Conn, send <-chan protocol.Envelope, done <-chan struct{}) {
+func (s *Server) writeLoop(peerType, peerID string, conn *ws.Conn, send <-chan protocol.Envelope, done <-chan struct{}) {
 	for {
 		select {
 		case <-done:
@@ -1155,11 +1292,14 @@ func writeLoop(conn *ws.Conn, send <-chan protocol.Envelope, done <-chan struct{
 		case env := <-send:
 			raw, err := json.Marshal(env)
 			if err != nil {
+				s.logger.Debug("websocket marshal failed", "peer_type", peerType, "peer", peerID, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 				continue
 			}
 			if err := conn.WriteText(string(raw)); err != nil {
+				s.logger.Debug("websocket write failed", "peer_type", peerType, "peer", peerID, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 				return
 			}
+			s.logger.Debug("websocket message sent", "peer_type", peerType, "peer", peerID, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "request_id", env.ID, "bytes", len(raw))
 		}
 	}
 }

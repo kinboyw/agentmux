@@ -213,6 +213,14 @@ go run ./cmd/agentmux control attach --hub ws://127.0.0.1:8081 --token dev-token
 
 Inside `control attach`, press `Ctrl-]` to detach from the local control stream. The worker-side tmux session keeps running.
 
+For TUI development, enable the debug HUD and append-only log:
+
+```bash
+go run ./cmd/agentmux control app --hub http://127.0.0.1:8081 --token dev-token --debug --debug-log /tmp/agentmux-tui-debug.log
+```
+
+Inside the TUI, press `D` from the session list to append a JSON state snapshot to the debug log. Attached sessions run in the right-side terminal area by default; use `Ctrl-F` to toggle full-screen, `Ctrl-]` to detach, `Ctrl-Q` to quit the TUI, or `Ctrl-G` to write a debug snapshot. Normal keys are sent to the remote terminal. The snapshot records render counters, stream queue sizes, selected session metadata, and terminal view sizes, but not credentials or terminal output.
+
 ## Data And Backups
 
 SQLite persists:
