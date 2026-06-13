@@ -238,17 +238,52 @@ lets you switch between sessions. It does not allow session creation, Worker
 join signal generation, Worker management, previews, workspaces, version/update
 prompts, or registered-account features.
 
+Anonymous shares are lifecycle-bound to that Direct Token. After the Direct
+Token expires, Hub evicts Workers registered under the anonymous tenant and
+interrupts live anonymous Worker/Control connections so abandoned shares do not
+accumulate runtime state.
+
 Registered users should sign in from Web Control for the full management
 surface: create/stop sessions, join Workers, manage Workers, use previews,
 operate workspaces, and queue Worker updates.
 
 ## CLI Control
 
-Install or bootstrap the control client:
+Install or bootstrap the Control/TUI client from a Hub:
 
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- control
 ```
+
+The installer downloads the matching `agentmux-tui` binary and starts the TUI
+against that Hub. Newer releases publish real `agentmux-tui-*` artifacts; older
+`agentmux-control-*` and legacy `agentmux-*` artifacts are only fallback paths.
+
+With no local configuration, `agentmux-tui` uses the public AgentMux Hub:
+
+```bash
+agentmux-tui
+```
+
+Set or change the default Hub explicitly:
+
+```bash
+agentmux-tui --hub https://hub.example.com
+```
+
+The explicit `--hub` value is cached in the local AgentMux config. Later
+`agentmux-tui`, `agentmux control app`, and `agentmux control login` use the
+cached Hub unless `AGENTMUX_CONTROL_HUB`, `AGENTMUX_HUB`, or another `--hub`
+value overrides it.
+
+Inside the TUI:
+
+- `/login` starts device login for the current default Hub, tries to open the
+  local browser, and still shows the login URL and code for manual copy/open.
+- `/hub` switches the current Hub and stores it as the new default. If a cached
+  Control credential exists for that Hub, the TUI reconnects automatically;
+  otherwise run `/login`.
+- `/refresh` reloads the session list.
 
 Useful source-development commands:
 
@@ -309,7 +344,7 @@ For `npx`-style temporary Control usage, run from the verified cache instead of
 mutating the installed binary:
 
 ```bash
-agentmux run control@latest --hub https://hub.example.com
+agentmux run control@latest
 curl -fsSL https://hub.example.com/run.sh | sh -s -- control@latest
 agentmux cache prune
 ```
@@ -329,10 +364,12 @@ SQLite persists:
 - scoped credentials
 - registered users
 - browser/TUI device auth sessions
+- registered Worker records and software inventory
+- Worker update jobs and update events
 
 Runtime state is rebuilt as workers reconnect:
 
-- online workers
+- live Worker connections
 - active WebSocket streams
 - live session snapshots
 

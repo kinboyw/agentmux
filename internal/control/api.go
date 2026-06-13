@@ -90,6 +90,10 @@ func (c *Client) StopSession(ctx context.Context, sessionID string) error {
 }
 
 func (c *Client) SessionPreview(ctx context.Context, sessionID string, lines int) (string, error) {
+	return c.SessionTargetPreview(ctx, sessionID, lines, nil)
+}
+
+func (c *Client) SessionTargetPreview(ctx context.Context, sessionID string, lines int, target *protocol.TerminalTarget) (string, error) {
 	workerID, name, ok := protocol.SplitSessionID(sessionID)
 	if !ok {
 		return "", fmt.Errorf("invalid session id %q; expected worker/name", sessionID)
@@ -97,7 +101,10 @@ func (c *Client) SessionPreview(ctx context.Context, sessionID string, lines int
 	if lines <= 0 {
 		lines = 80
 	}
-	path := fmt.Sprintf("/api/sessions/%s/%s/preview?lines=%d", url.PathEscape(workerID), url.PathEscape(name), lines)
+	values := url.Values{}
+	values.Set("lines", fmt.Sprint(lines))
+	setTerminalTargetQuery(values, target)
+	path := fmt.Sprintf("/api/sessions/%s/%s/preview?%s", url.PathEscape(workerID), url.PathEscape(name), values.Encode())
 	var payload protocol.SessionPreview
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &payload); err != nil {
 		return "", err
@@ -116,6 +123,44 @@ func (c *Client) SessionTargets(ctx context.Context, sessionID string) ([]protoc
 		return nil, err
 	}
 	return payload.Targets, nil
+}
+
+func setTerminalTargetQuery(values url.Values, target *protocol.TerminalTarget) {
+	if target == nil {
+		return
+	}
+	setQueryString(values, "session_name", target.SessionName)
+	setQueryString(values, "window_id", target.WindowID)
+	setQueryInt(values, "window_index", target.WindowIndex)
+	setQueryString(values, "window_name", target.WindowName)
+	setQueryBool(values, "window_active", target.WindowActive)
+	setQueryString(values, "pane_id", target.PaneID)
+	setQueryInt(values, "pane_index", target.PaneIndex)
+	setQueryBool(values, "pane_active", target.PaneActive)
+	setQueryString(values, "cwd", target.CWD)
+	setQueryString(values, "command", target.Command)
+	setQueryInt(values, "left", target.Left)
+	setQueryInt(values, "top", target.Top)
+	setQueryInt(values, "width", target.Width)
+	setQueryInt(values, "height", target.Height)
+}
+
+func setQueryString(values url.Values, key, value string) {
+	if strings.TrimSpace(value) != "" {
+		values.Set(key, value)
+	}
+}
+
+func setQueryInt(values url.Values, key string, value int) {
+	if value != 0 {
+		values.Set(key, fmt.Sprint(value))
+	}
+}
+
+func setQueryBool(values url.Values, key string, value bool) {
+	if value {
+		values.Set(key, "true")
+	}
 }
 
 func (c *Client) ExchangeSignal(ctx context.Context, signal, role, deviceID, deviceName string) (string, error) {
@@ -164,7 +209,11 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, targ
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.HTTP.Do(req)
+	httpClient := c.HTTP
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}

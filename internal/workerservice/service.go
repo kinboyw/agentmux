@@ -454,6 +454,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=` + systemdQuote("HOME="+home) + `
+Environment=` + systemdQuote("PATH="+workerServicePath()) + `
 Environment=` + systemdQuote("AGENTMUX_WORKER_INSTALL_KIND=service") + `
 Environment=` + systemdQuote("AGENTMUX_WORKER_SERVICE_BACKEND=systemd-user") + `
 ExecStart=` + commandLine(binary, workerRunArgs()) + `
@@ -481,6 +482,13 @@ func startLaunchd(ctx context.Context, binary string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	envXML := launchdEnvXML(map[string]string{
+		"PATH":                            workerServicePath(),
+		"AGENTMUX_WORKER_INSTALL_KIND":    "service",
+		"AGENTMUX_WORKER_SERVICE_BACKEND": "launchd",
+		"AGENTMUX_TMUX":                   os.Getenv("AGENTMUX_TMUX"),
+		"AGENTMUX_TMUX_PATH":              os.Getenv("AGENTMUX_TMUX_PATH"),
+	})
 	content := `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -488,8 +496,7 @@ func startLaunchd(ctx context.Context, binary string) (Result, error) {
   <key>Label</key><string>` + launchdLabel + `</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>AGENTMUX_WORKER_INSTALL_KIND</key><string>service</string>
-    <key>AGENTMUX_WORKER_SERVICE_BACKEND</key><string>launchd</string>
+` + envXML + `
   </dict>
   <key>ProgramArguments</key>
   <array>
@@ -516,6 +523,55 @@ func startLaunchd(ctx context.Context, binary string) (Result, error) {
 	} else {
 		return Result{Backend: "launchd", Detail: strings.TrimSpace(out)}, nil
 	}
+}
+
+func launchdEnvXML(values map[string]string) string {
+	keys := []string{
+		"PATH",
+		"AGENTMUX_WORKER_INSTALL_KIND",
+		"AGENTMUX_WORKER_SERVICE_BACKEND",
+		"AGENTMUX_TMUX",
+		"AGENTMUX_TMUX_PATH",
+	}
+	var b strings.Builder
+	for _, key := range keys {
+		value := strings.TrimSpace(values[key])
+		if value == "" {
+			continue
+		}
+		b.WriteString("    <key>")
+		b.WriteString(html.EscapeString(key))
+		b.WriteString("</key><string>")
+		b.WriteString(html.EscapeString(value))
+		b.WriteString("</string>\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func workerServicePath() string {
+	return joinUniquePathEntries(append(strings.Split(os.Getenv("PATH"), ":"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/opt/local/bin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	)...)
+}
+
+func joinUniquePathEntries(entries ...string) string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		result = append(result, entry)
+	}
+	return strings.Join(result, ":")
 }
 
 func startFallback(binary string, identity WorkerIdentity) (Result, error) {

@@ -19,7 +19,7 @@ func TestResolveReleaseFindsRoleAssetAndChecksum(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/owner/repo/releases/latest":
-			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":"agentmux-control-linux-amd64.tar.gz","browser_download_url":"%s/a.tgz"},{"name":"agentmux-control-linux-amd64.tar.gz.sha256","browser_download_url":"%s/a.tgz.sha256"}]}`, serverURL(r), serverURL(r))
+			fmt.Fprintf(w, `{"tag_name":"v1.2.3","assets":[{"name":"agentmux-control-linux-amd64.tar.gz","browser_download_url":"%s/control.tgz"},{"name":"agentmux-tui-linux-amd64.tar.gz","browser_download_url":"%s/tui.tgz"},{"name":"agentmux-tui-linux-amd64.tar.gz.sha256","browser_download_url":"%s/tui.tgz.sha256"}]}`, serverURL(r), serverURL(r), serverURL(r))
 		default:
 			http.NotFound(w, r)
 		}
@@ -32,7 +32,7 @@ func TestResolveReleaseFindsRoleAssetAndChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if release.Version != "v1.2.3" || release.AssetName != "agentmux-control-linux-amd64.tar.gz" || release.ChecksumURL == "" {
+	if release.Version != "v1.2.3" || release.AssetName != "agentmux-tui-linux-amd64.tar.gz" || release.ChecksumURL == "" || release.ExpectedEntry != "agentmux-tui-linux-amd64" {
 		t.Fatalf("unexpected release: %+v", release)
 	}
 }

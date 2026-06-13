@@ -23,7 +23,9 @@ HUB_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 help:
 	@printf "AgentMux targets:\n"
 	@printf "  make web              Build Web Control and sync embedded webdist\n"
-	@printf "  make build            Build local agentmux and agentmux-hub binaries\n"
+	@printf "  make build            Build local binaries and release-platform binaries into bin/\n"
+	@printf "  make build-local      Build current-platform agentmux, agentmux-tui, and agentmux-hub\n"
+	@printf "  make build-cross      Build release-platform binaries into bin/\n"
 	@printf "  make test             Run all Go tests\n"
 	@printf "  make test-hub         Run hub and hub-only entry tests\n"
 	@printf "  make check            Run web build, Go tests, and local builds\n"
@@ -48,16 +50,55 @@ web-sync:
 .PHONY: web
 web: web-build web-sync
 
-.PHONY: build build-agentmux build-hub
-build: build-agentmux build-hub
+.PHONY: build build-local build-cross build-agentmux build-tui build-hub build-worker-control-cross build-hub-cross
+build: build-local build-cross
+
+build-local: build-agentmux build-tui build-hub
+
+build-cross: build-worker-control-cross build-hub-cross
 
 build-agentmux:
 	mkdir -p $(BIN_DIR)
 	GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/agentmux ./cmd/agentmux
 
+build-tui:
+	mkdir -p $(BIN_DIR)
+	GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/agentmux-tui ./cmd/agentmux
+
 build-hub:
 	mkdir -p $(BIN_DIR)
 	GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/agentmux-hub ./cmd/agentmux-hub
+
+build-worker-control-cross:
+	mkdir -p $(BIN_DIR)
+	for role in worker control; do \
+	  for platform in $(WORKER_CONTROL_PLATFORMS); do \
+	    os="$${platform%/*}"; \
+	    arch="$${platform#*/}"; \
+	    name="agentmux-$${role}-$${os}-$${arch}"; \
+	    echo "building $(BIN_DIR)/$${name}"; \
+	    GOOS="$${os}" GOARCH="$${arch}" CGO_ENABLED=$(CROSS_CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o "$(BIN_DIR)/$${name}" ./cmd/agentmux; \
+	  done; \
+	done
+	for platform in $(WORKER_CONTROL_PLATFORMS); do \
+	  os="$${platform%/*}"; \
+	  arch="$${platform#*/}"; \
+	  name="agentmux-tui-$${os}-$${arch}"; \
+	  echo "building $(BIN_DIR)/$${name}"; \
+	  GOOS="$${os}" GOARCH="$${arch}" CGO_ENABLED=$(CROSS_CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o "$(BIN_DIR)/$${name}" ./cmd/agentmux; \
+	done
+
+build-hub-cross:
+	mkdir -p $(BIN_DIR)
+	for platform in $(HUB_PLATFORMS); do \
+	  os="$${platform%/*}"; \
+	  arch="$${platform#*/}"; \
+	  name="agentmux-hub-$${os}-$${arch}"; \
+	  ext=""; \
+	  if [ "$${os}" = "windows" ]; then ext=".exe"; fi; \
+	  echo "building $(BIN_DIR)/$${name}$${ext}"; \
+	  GOOS="$${os}" GOARCH="$${arch}" CGO_ENABLED=$(CROSS_CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o "$(BIN_DIR)/$${name}$${ext}" ./cmd/agentmux-hub; \
+	done
 
 .PHONY: build-hub-windows build-hub-linux
 build-hub-windows:
@@ -97,6 +138,15 @@ release-worker-control:
 	    tar -C "$(DIST_DIR)" -czf "$(DIST_DIR)/$${name}.tar.gz" "$${name}"; \
 	    sha256sum "$(DIST_DIR)/$${name}.tar.gz" > "$(DIST_DIR)/$${name}.tar.gz.sha256"; \
 	  done; \
+	done
+	for platform in $(WORKER_CONTROL_PLATFORMS); do \
+	  os="$${platform%/*}"; \
+	  arch="$${platform#*/}"; \
+	  name="agentmux-tui-$${os}-$${arch}"; \
+	  echo "building $${name}"; \
+	  GOOS="$${os}" GOARCH="$${arch}" CGO_ENABLED=$(CROSS_CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o "$(DIST_DIR)/$${name}" ./cmd/agentmux; \
+	  tar -C "$(DIST_DIR)" -czf "$(DIST_DIR)/$${name}.tar.gz" "$${name}"; \
+	  sha256sum "$(DIST_DIR)/$${name}.tar.gz" > "$(DIST_DIR)/$${name}.tar.gz.sha256"; \
 	done
 
 release-hub:

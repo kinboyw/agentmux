@@ -11,9 +11,13 @@ import (
 )
 
 type Config struct {
-	WorkerBackend    string `json:"worker_backend,omitempty"`
-	WorkerHubURL     string `json:"worker_hub_url,omitempty"`
-	WorkerInstanceID string `json:"worker_instance_id,omitempty"`
+	ControlHubURL      string `json:"control_hub_url,omitempty"`
+	WorkerBackend      string `json:"worker_backend,omitempty"`
+	WorkerTerminalMode string `json:"worker_terminal_mode,omitempty"`
+	WorkerStateCols    int    `json:"worker_state_cols,omitempty"`
+	WorkerStateRows    int    `json:"worker_state_rows,omitempty"`
+	WorkerHubURL       string `json:"worker_hub_url,omitempty"`
+	WorkerInstanceID   string `json:"worker_instance_id,omitempty"`
 	// WorkerToken is kept only for reading old config.json files. New writes
 	// store credentials in credentials.json through credentialcache.
 	WorkerToken string `json:"worker_token,omitempty"`
@@ -45,7 +49,9 @@ func Load() (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+	cfg.ControlHubURL = strings.TrimSpace(cfg.ControlHubURL)
 	cfg.WorkerBackend = strings.TrimSpace(cfg.WorkerBackend)
+	cfg.WorkerTerminalMode = strings.TrimSpace(cfg.WorkerTerminalMode)
 	cfg.WorkerHubURL = strings.TrimSpace(cfg.WorkerHubURL)
 	cfg.WorkerInstanceID = strings.TrimSpace(cfg.WorkerInstanceID)
 	cfg.WorkerToken = strings.TrimSpace(cfg.WorkerToken)
@@ -62,7 +68,9 @@ func Save(cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	cfg.ControlHubURL = strings.TrimSpace(cfg.ControlHubURL)
 	cfg.WorkerBackend = strings.TrimSpace(cfg.WorkerBackend)
+	cfg.WorkerTerminalMode = strings.TrimSpace(cfg.WorkerTerminalMode)
 	cfg.WorkerHubURL = strings.TrimSpace(cfg.WorkerHubURL)
 	cfg.WorkerInstanceID = strings.TrimSpace(cfg.WorkerInstanceID)
 	cfg.WorkerToken = ""
@@ -76,6 +84,15 @@ func Save(cfg Config) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+func SaveControlHubURL(hubURL string) error {
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	cfg.ControlHubURL = strings.TrimSpace(hubURL)
+	return Save(cfg)
 }
 
 func EnsureWorkerInstanceID() (string, error) {
@@ -123,6 +140,23 @@ func SaveWorkerBackend(backend string) error {
 		return err
 	}
 	cfg.WorkerBackend = strings.TrimSpace(backend)
+	return Save(cfg)
+}
+
+func SaveWorkerTerminalState(mode string, cols int, rows int) error {
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(mode) != "" {
+		cfg.WorkerTerminalMode = strings.TrimSpace(mode)
+	}
+	if cols > 0 {
+		cfg.WorkerStateCols = cols
+	}
+	if rows > 0 {
+		cfg.WorkerStateRows = rows
+	}
 	return Save(cfg)
 }
 

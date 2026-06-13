@@ -10,25 +10,38 @@ import (
 const (
 	ProtocolVersion = "1"
 
-	TypeWorkerHello        = "worker.hello"
-	TypeWorkerHeartbeat    = "worker.heartbeat"
-	TypeSessionSnapshot    = "session.snapshot"
-	TypeSessionSync        = "session.sync"
-	TypeSessionPreview     = "session.preview"
-	TypeSessionTargets     = "session.targets"
-	TypeSessionCreate      = "session.create"
-	TypeSessionCreated     = "session.created"
-	TypeSessionKill        = "session.kill"
-	TypeTerminalOpen       = "terminal.open"
-	TypeTerminalClose      = "terminal.close"
-	TypeTerminalInput      = "terminal.input"
-	TypeTerminalOutput     = "terminal.output"
-	TypeTerminalResize     = "terminal.resize"
-	TypeControlOpen        = "control.open"
-	TypeControlInput       = "control.input"
-	TypeWorkerUpdateApply  = "worker.update.apply"
-	TypeWorkerUpdateResult = "worker.update.result"
-	TypeError              = "error"
+	RenderModeAuto             = "auto"
+	RenderModeWorkerStateXterm = "worker_state_xterm"
+	RenderModeLiveAttachXterm  = "live_attach_xterm"
+
+	TypeWorkerHello         = "worker.hello"
+	TypeWorkerHeartbeat     = "worker.heartbeat"
+	TypeSessionSnapshot     = "session.snapshot"
+	TypeSessionSync         = "session.sync"
+	TypeSessionPreview      = "session.preview"
+	TypeSessionTargets      = "session.targets"
+	TypeSessionCreate       = "session.create"
+	TypeSessionCreated      = "session.created"
+	TypeSessionKill         = "session.kill"
+	TypeTerminalOpen        = "terminal.open"
+	TypeTerminalClose       = "terminal.close"
+	TypeTerminalInput       = "terminal.input"
+	TypeTerminalOutput      = "terminal.output"
+	TypeTerminalMode        = "terminal.mode"
+	TypeTerminalSnapshot    = "terminal.snapshot"
+	TypeTerminalStateReset  = "terminal.state.reset"
+	TypeTerminalDiff        = "terminal.diff"
+	TypeTerminalHistoryReq  = "terminal.history.request"
+	TypeTerminalHistoryPage = "terminal.history.page"
+	TypeTerminalSizeSync    = "terminal.size.sync"
+	TypeTerminalSizeReset   = "terminal.size.reset"
+	TypeTerminalMouse       = "terminal.mouse"
+	TypeTerminalResize      = "terminal.resize"
+	TypeControlOpen         = "control.open"
+	TypeControlInput        = "control.input"
+	TypeWorkerUpdateApply   = "worker.update.apply"
+	TypeWorkerUpdateResult  = "worker.update.result"
+	TypeError               = "error"
 )
 
 var DefaultWorkerCapabilities = []string{
@@ -39,7 +52,15 @@ var DefaultWorkerCapabilities = []string{
 	"session.targets",
 	"terminal.open",
 	"terminal.resize",
+	"terminal.size_control.v1",
+	"terminal.history.v1",
+	"terminal.cells.v1",
+	"terminal.mouse.v1",
 	"terminal.target_attach",
+	"terminal.render.worker_state_xterm.v1",
+	"terminal.render.live_attach_xterm.v1",
+	"terminal.snapshot.v1",
+	"terminal.state_reset.v1",
 	"worker.software_inventory",
 	"worker.update.apply",
 }
@@ -87,8 +108,9 @@ func (e Envelope) Validate() error {
 }
 
 type WorkerHello struct {
-	Name    string `json:"name"`
-	Backend string `json:"backend,omitempty"`
+	Name       string `json:"name"`
+	Backend    string `json:"backend,omitempty"`
+	InstanceID string `json:"worker_instance_id,omitempty"`
 	WorkerSoftware
 }
 
@@ -131,8 +153,9 @@ type SessionSnapshot struct {
 }
 
 type SessionPreviewRequest struct {
-	Lines int    `json:"lines"`
-	Scope string `json:"scope,omitempty"`
+	Lines  int             `json:"lines"`
+	Scope  string          `json:"scope,omitempty"`
+	Target *TerminalTarget `json:"target,omitempty"`
 }
 
 type SessionPreview struct {
@@ -180,9 +203,13 @@ type TerminalSize struct {
 }
 
 type TerminalOpen struct {
-	Cols   int             `json:"cols"`
-	Rows   int             `json:"rows"`
-	Target *TerminalTarget `json:"target,omitempty"`
+	Cols          int             `json:"cols"`
+	Rows          int             `json:"rows"`
+	Target        *TerminalTarget `json:"target,omitempty"`
+	Capabilities  []string        `json:"capabilities,omitempty"`
+	ResizePolicy  string          `json:"resize_policy,omitempty"`
+	TransportMode string          `json:"transport_mode,omitempty"`
+	RenderMode    string          `json:"render_mode,omitempty"`
 }
 
 func NewTerminalOpen(size TerminalSize, target *TerminalTarget) TerminalOpen {
@@ -198,8 +225,130 @@ type TerminalOutput struct {
 	Encoding string `json:"encoding,omitempty"`
 }
 
+type TerminalMode struct {
+	Mode         string       `json:"mode"`
+	RenderMode   string       `json:"render_mode,omitempty"`
+	Capabilities []string     `json:"capabilities,omitempty"`
+	ResizePolicy string       `json:"resize_policy,omitempty"`
+	RemoteSize   TerminalSize `json:"remote_size,omitempty"`
+	ViewportSize TerminalSize `json:"viewport_size,omitempty"`
+	DefaultSize  TerminalSize `json:"default_size,omitempty"`
+	Fallback     string       `json:"fallback,omitempty"`
+}
+
+type TerminalSnapshot struct {
+	Generation  int                   `json:"generation"`
+	Seq         int64                 `json:"seq"`
+	Cols        int                   `json:"cols"`
+	Rows        int                   `json:"rows"`
+	Encoding    string                `json:"encoding"`
+	Data        string                `json:"data"`
+	Cells       *TerminalCellSnapshot `json:"cells,omitempty"`
+	Scope       string                `json:"scope,omitempty"`
+	GeneratedAt time.Time             `json:"generated_at"`
+}
+
+type TerminalCellSnapshot struct {
+	Version string           `json:"version"`
+	Cols    int              `json:"cols"`
+	Rows    int              `json:"rows"`
+	Cursor  TerminalCursor   `json:"cursor"`
+	Lines   [][]TerminalCell `json:"lines"`
+}
+
+type TerminalCursor struct {
+	X       int  `json:"x"`
+	Y       int  `json:"y"`
+	Visible bool `json:"visible"`
+}
+
+type TerminalCell struct {
+	Text           string `json:"t,omitempty"`
+	Width          int    `json:"w,omitempty"`
+	Fg             string `json:"fg,omitempty"`
+	Bg             string `json:"bg,omitempty"`
+	Bold           bool   `json:"bold,omitempty"`
+	Faint          bool   `json:"faint,omitempty"`
+	Italic         bool   `json:"italic,omitempty"`
+	Blink          bool   `json:"blink,omitempty"`
+	Reverse        bool   `json:"reverse,omitempty"`
+	Conceal        bool   `json:"conceal,omitempty"`
+	Strikethrough  bool   `json:"strike,omitempty"`
+	Underline      string `json:"underline,omitempty"`
+	UnderlineColor string `json:"ul,omitempty"`
+	Link           string `json:"link,omitempty"`
+}
+
+type TerminalStateReset struct {
+	Generation         int          `json:"generation"`
+	Reason             string       `json:"reason"`
+	Cols               int          `json:"cols"`
+	Rows               int          `json:"rows"`
+	PreviousGeneration int          `json:"previous_generation,omitempty"`
+	RemoteSize         TerminalSize `json:"remote_size,omitempty"`
+	DefaultSize        TerminalSize `json:"default_size,omitempty"`
+	GeneratedAt        time.Time    `json:"generated_at"`
+}
+
+type TerminalSizeSync struct {
+	Cols   int    `json:"cols"`
+	Rows   int    `json:"rows"`
+	Source string `json:"source,omitempty"`
+}
+
+type TerminalSizeReset struct {
+	Source string `json:"source,omitempty"`
+}
+
+type TerminalMouse struct {
+	X       int    `json:"x"`
+	Y       int    `json:"y"`
+	Button  string `json:"button,omitempty"`
+	Motion  bool   `json:"motion,omitempty"`
+	Release bool   `json:"release,omitempty"`
+	Shift   bool   `json:"shift,omitempty"`
+	Alt     bool   `json:"alt,omitempty"`
+	Ctrl    bool   `json:"ctrl,omitempty"`
+	Source  string `json:"source,omitempty"`
+}
+
+type TerminalHistoryRequest struct {
+	BeforeSeq  int64 `json:"before_seq,omitempty"`
+	LimitLines int   `json:"limit_lines,omitempty"`
+}
+
+type TerminalHistoryLine struct {
+	SeqStart   int64    `json:"seq_start,omitempty"`
+	SeqEnd     int64    `json:"seq_end,omitempty"`
+	Generation int      `json:"generation,omitempty"`
+	Text       string   `json:"text"`
+	Flags      []string `json:"flags,omitempty"`
+}
+
+type TerminalHistoryPage struct {
+	StartSeq int64                 `json:"start_seq,omitempty"`
+	EndSeq   int64                 `json:"end_seq,omitempty"`
+	HasMore  bool                  `json:"has_more,omitempty"`
+	Lines    []TerminalHistoryLine `json:"lines"`
+}
+
+type TerminalDiff struct {
+	Generation int              `json:"generation"`
+	FromSeq    int64            `json:"from_seq,omitempty"`
+	ToSeq      int64            `json:"to_seq,omitempty"`
+	Ops        []TerminalDiffOp `json:"ops,omitempty"`
+}
+
+type TerminalDiffOp struct {
+	Op     string          `json:"op"`
+	Row    int             `json:"row,omitempty"`
+	Cells  []TerminalCell  `json:"cells,omitempty"`
+	Cursor *TerminalCursor `json:"cursor,omitempty"`
+}
+
 type WorkerView struct {
 	ID           string         `json:"id"`
+	InstanceID   string         `json:"worker_instance_id,omitempty"`
 	TenantID     string         `json:"tenant_id,omitempty"`
 	Name         string         `json:"name"`
 	Addr         string         `json:"addr"`

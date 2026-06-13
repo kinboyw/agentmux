@@ -1,12 +1,15 @@
 import * as React from "react";
+import { RefreshCw } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: "default" | "secondary" | "ghost" | "destructive";
   size?: "xs" | "sm" | "default" | "icon" | "icon-sm";
+  loading?: boolean;
 };
 
-export function Button({ className, variant = "default", size = "default", ...props }: ButtonProps) {
+export function Button({ className, variant = "default", size = "default", loading = false, disabled, children, ...props }: ButtonProps) {
+  const iconOnly = size === "icon" || size === "icon-sm";
   return (
     <button
       className={cn(
@@ -22,7 +25,12 @@ export function Button({ className, variant = "default", size = "default", ...pr
         size === "icon-sm" && "h-7 w-7",
         className,
       )}
+      disabled={disabled || loading}
+      aria-busy={loading || undefined}
       {...props}
-    />
+    >
+      {loading ? <RefreshCw className={cn("animate-spin", size === "xs" || size === "icon-sm" ? "h-3.5 w-3.5" : "h-4 w-4")} /> : null}
+      {loading && iconOnly ? null : children}
+    </button>
   );
 }

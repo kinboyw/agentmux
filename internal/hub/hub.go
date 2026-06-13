@@ -24,8 +24,10 @@ import (
 )
 
 const (
-	wsPingInterval = 15 * time.Second
-	wsPongWait     = 45 * time.Second
+	wsPingInterval           = 15 * time.Second
+	wsPongWait               = 45 * time.Second
+	sessionAuxRequestWait    = 8 * time.Second
+	sessionCreateRequestWait = 5 * time.Second
 )
 
 //go:embed webdist docassets
@@ -43,30 +45,35 @@ type Server struct {
 	workerViews map[string]workerRecord
 	sessions    map[string]protocol.SessionView
 	subscribers map[string]*controlConn
+	streams     map[string]streamSubscription
+	controls    map[string]*controlConn
 	previews    map[string]chan protocol.Envelope
 	targets     map[string]chan protocol.Envelope
 	creates     map[string]chan protocol.Envelope
 	updateJobs  map[string]*workerUpdateJob
 	auth        AuthStore
+	runtime     RuntimeStore
 	rateLimiter *rateLimiter
 }
 
 type workerConn struct {
-	id       string
-	tenantID string
-	name     string
-	addr     string
-	backend  string
-	software protocol.WorkerSoftware
-	lastSeen time.Time
-	conn     *ws.Conn
-	send     chan protocol.Envelope
-	done     chan struct{}
-	close    sync.Once
+	id         string
+	instanceID string
+	tenantID   string
+	name       string
+	addr       string
+	backend    string
+	software   protocol.WorkerSoftware
+	lastSeen   time.Time
+	conn       *ws.Conn
+	send       chan protocol.Envelope
+	done       chan struct{}
+	close      sync.Once
 }
 
 type workerRecord struct {
 	id           string
+	instanceID   string
 	tenantID     string
 	name         string
 	addr         string
@@ -80,17 +87,43 @@ type workerRecord struct {
 }
 
 type workerUpdateJob struct {
-	ID                     string    `json:"id"`
-	TenantID               string    `json:"tenant_id,omitempty"`
-	WorkerID               string    `json:"worker_id"`
-	TargetVersion          string    `json:"target_version"`
-	Repo                   string    `json:"repo"`
-	Status                 string    `json:"status"`
-	Message                string    `json:"message,omitempty"`
-	AllowDisruptiveRestart bool      `json:"allow_disruptive_restart,omitempty"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
-	FinishedAt             time.Time `json:"finished_at,omitempty"`
+	ID                     string              `json:"id"`
+	TenantID               string              `json:"tenant_id,omitempty"`
+	WorkerID               string              `json:"worker_id"`
+	WorkerInstanceID       string              `json:"worker_instance_id,omitempty"`
+	TargetVersion          string              `json:"target_version"`
+	Repo                   string              `json:"repo"`
+	Status                 string              `json:"status"`
+	Message                string              `json:"message,omitempty"`
+	AllowDisruptiveRestart bool                `json:"allow_disruptive_restart,omitempty"`
+	CreatedAt              time.Time           `json:"created_at"`
+	UpdatedAt              time.Time           `json:"updated_at"`
+	FinishedAt             time.Time           `json:"finished_at,omitempty"`
+	Events                 []workerUpdateEvent `json:"events,omitempty"`
+}
+
+type workerUpdateEvent struct {
+	ID               string    `json:"id"`
+	JobID            string    `json:"job_id"`
+	TenantID         string    `json:"tenant_id,omitempty"`
+	WorkerID         string    `json:"worker_id"`
+	WorkerInstanceID string    `json:"worker_instance_id,omitempty"`
+	Status           string    `json:"status"`
+	Message          string    `json:"message,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+type streamSubscription struct {
+	controlID string
+	workerID  string
+	sessionID string
+	name      string
+	targetKey string
+}
+
+type streamCloseRequest struct {
+	streamID     string
+	subscription streamSubscription
 }
 
 type controlConn struct {
@@ -159,12 +192,13 @@ func New(addr, token string, logger *slog.Logger) *Server {
 }
 
 type ServerOptions struct {
-	Addr        string
-	Token       string
-	PublicURL   string
-	ReleaseRepo string
-	Logger      *slog.Logger
-	AuthStore   AuthStore
+	Addr         string
+	Token        string
+	PublicURL    string
+	ReleaseRepo  string
+	Logger       *slog.Logger
+	AuthStore    AuthStore
+	RuntimeStore RuntimeStore
 }
 
 func NewWithOptions(options ServerOptions) (*Server, error) {
@@ -172,7 +206,9 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{
+	auth := defaultAuthStore(options.AuthStore)
+	runtime := defaultRuntimeStore(options.RuntimeStore, auth)
+	server := &Server{
 		addr:        options.Addr,
 		token:       options.Token,
 		publicURL:   strings.TrimRight(options.PublicURL, "/"),
@@ -182,13 +218,20 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		workerViews: map[string]workerRecord{},
 		sessions:    map[string]protocol.SessionView{},
 		subscribers: map[string]*controlConn{},
+		streams:     map[string]streamSubscription{},
+		controls:    map[string]*controlConn{},
 		previews:    map[string]chan protocol.Envelope{},
 		targets:     map[string]chan protocol.Envelope{},
 		creates:     map[string]chan protocol.Envelope{},
 		updateJobs:  map[string]*workerUpdateJob{},
-		auth:        defaultAuthStore(options.AuthStore),
+		auth:        auth,
+		runtime:     runtime,
 		rateLimiter: newRateLimiter(10, time.Minute),
-	}, nil
+	}
+	if err := server.loadRuntimeState(); err != nil {
+		return nil, err
+	}
+	return server, nil
 }
 
 func defaultAuthStore(store AuthStore) AuthStore {
@@ -196,6 +239,81 @@ func defaultAuthStore(store AuthStore) AuthStore {
 		return store
 	}
 	return newAuthStore()
+}
+
+func defaultRuntimeStore(store RuntimeStore, auth AuthStore) RuntimeStore {
+	if store != nil {
+		return store
+	}
+	if runtime, ok := auth.(RuntimeStore); ok {
+		return runtime
+	}
+	return newMemoryRuntimeStore()
+}
+
+func (s *Server) loadRuntimeState() error {
+	workers, err := s.runtime.LoadWorkers()
+	if err != nil {
+		return fmt.Errorf("load worker registry: %w", err)
+	}
+	for _, worker := range workers {
+		if worker.id == "" {
+			continue
+		}
+		worker.connected = false
+		s.workerViews[worker.id] = worker
+	}
+	jobs, err := s.runtime.LoadUpdateJobs()
+	if err != nil {
+		return fmt.Errorf("load worker update jobs: %w", err)
+	}
+	for i := range jobs {
+		job := jobs[i]
+		if job.ID == "" {
+			continue
+		}
+		s.updateJobs[job.ID] = &job
+	}
+	return nil
+}
+
+func (s *Server) persistWorkerRecord(record workerRecord) {
+	if s.runtime == nil || record.id == "" {
+		return
+	}
+	if err := s.runtime.SaveWorker(record); err != nil {
+		s.logger.Warn("persist worker registry failed", "worker", record.id, "error", err)
+	}
+}
+
+func (s *Server) persistUpdateJob(job *workerUpdateJob) {
+	if s.runtime == nil || job == nil || job.ID == "" {
+		return
+	}
+	if err := s.runtime.SaveUpdateJob(*job); err != nil {
+		s.logger.Warn("persist worker update job failed", "job", job.ID, "worker", job.WorkerID, "error", err)
+	}
+}
+
+func (s *Server) appendUpdateEvent(job *workerUpdateJob, status, message string, now time.Time) {
+	if job == nil || job.ID == "" {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	event := workerUpdateEvent{
+		ID: "evt_" + randomID(), JobID: job.ID, TenantID: job.TenantID,
+		WorkerID: job.WorkerID, WorkerInstanceID: job.WorkerInstanceID,
+		Status: status, Message: message, CreatedAt: now,
+	}
+	job.Events = append(job.Events, event)
+	if s.runtime == nil {
+		return
+	}
+	if err := s.runtime.AppendUpdateEvent(event); err != nil {
+		s.logger.Warn("persist worker update event failed", "job", job.ID, "worker", job.WorkerID, "status", status, "error", err)
+	}
 }
 
 func defaultReleaseRepo(repo string) string {
@@ -237,6 +355,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/ws/worker", s.handleWorkerWS)
 	mux.HandleFunc("/ws/control", s.handleControlWS)
 
+	go s.anonymousWorkerGC(ctx)
+
 	server := &http.Server{Addr: s.addr, Handler: mux}
 	go func() {
 		<-ctx.Done()
@@ -250,6 +370,140 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) anonymousWorkerGC(ctx context.Context) {
+	ticker := time.NewTicker(anonymousWorkerGCInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			reaped, err := s.reapExpiredAnonymousWorkers(now)
+			if err != nil {
+				s.logger.Warn("anonymous worker gc failed", "error", err)
+				continue
+			}
+			if reaped > 0 {
+				s.logger.Info("anonymous worker gc completed", "workers", reaped)
+			}
+		}
+	}
+}
+
+func (s *Server) reapExpiredAnonymousWorkers(now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	s.mu.RLock()
+	tenants := map[string]bool{}
+	for _, record := range s.workerViews {
+		if isAnonymousTenant(record.tenantID) {
+			tenants[record.tenantID] = true
+		}
+	}
+	s.mu.RUnlock()
+	reaped := 0
+	for tenantID := range tenants {
+		if s.auth.HasActiveControlCredential(tenantID, now) {
+			continue
+		}
+		removed := s.interruptAnonymousTenant(tenantID)
+		if s.runtime != nil {
+			if err := s.runtime.DeleteTenantRuntime(tenantID); err != nil {
+				return reaped, err
+			}
+		}
+		reaped += removed
+		if removed > 0 {
+			s.logger.Warn("anonymous tenant expired; workers interrupted", "tenant", tenantID, "workers", removed)
+		}
+	}
+	return reaped, nil
+}
+
+func (s *Server) interruptAnonymousTenant(tenantID string) int {
+	if !isAnonymousTenant(tenantID) {
+		return 0
+	}
+	var workers []*workerConn
+	var controls []*controlConn
+	removed := 0
+	s.mu.Lock()
+	for workerID, record := range s.workerViews {
+		if record.tenantID != tenantID {
+			continue
+		}
+		removed++
+		if worker := s.workers[workerID]; worker != nil {
+			workers = append(workers, worker)
+			delete(s.workers, workerID)
+		}
+		delete(s.workerViews, workerID)
+		for sessionID := range s.sessions {
+			if strings.HasPrefix(sessionID, workerID+"/") {
+				delete(s.sessions, sessionID)
+			}
+		}
+	}
+	for streamID, control := range s.subscribers {
+		if control != nil && control.tenantID == tenantID {
+			controls = append(controls, control)
+			delete(s.subscribers, streamID)
+		}
+	}
+	for controlID, control := range s.controls {
+		if control != nil && control.tenantID == tenantID {
+			controls = append(controls, control)
+			delete(s.controls, controlID)
+		}
+	}
+	for jobID, job := range s.updateJobs {
+		if job != nil && job.TenantID == tenantID {
+			delete(s.updateJobs, jobID)
+		}
+	}
+	s.mu.Unlock()
+	for _, worker := range workers {
+		closeWorkerConn(worker)
+	}
+	for _, control := range controls {
+		closeControlConn(control)
+	}
+	return removed
+}
+
+func closeWorkerConn(worker *workerConn) {
+	if worker == nil {
+		return
+	}
+	worker.close.Do(func() {
+		if worker.done != nil {
+			close(worker.done)
+		}
+	})
+	if worker.conn != nil {
+		_ = worker.conn.Close()
+	}
+}
+
+func closeControlConn(control *controlConn) {
+	if control == nil {
+		return
+	}
+	control.close.Do(func() {
+		if control.done != nil {
+			close(control.done)
+		}
+	})
+	if control.conn != nil {
+		_ = control.conn.Close()
+	}
+}
+
+func isAnonymousTenant(tenantID string) bool {
+	return strings.HasPrefix(strings.TrimSpace(tenantID), "anon_")
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -274,6 +528,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		"capabilities": []string{
 			"api.version",
 			"worker.software_inventory",
+			"terminal.snapshot.v1",
 			"control.web",
 			"control.device_login",
 			"update.local",
@@ -678,10 +933,6 @@ func (s *Server) handleAuthOAuth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	auth := requestAuth(r)
-	if isDirectControl(auth) {
-		writeError(w, http.StatusForbidden, "direct token cannot list workers")
-		return
-	}
 	s.mu.RLock()
 	workers := make([]protocol.WorkerView, 0, len(s.workerViews))
 	for _, worker := range s.workerViews {
@@ -783,6 +1034,7 @@ func (s *Server) handleWorkerAction(w http.ResponseWriter, r *http.Request) {
 	s.workerViews[workerID] = record
 	view := workerView(record)
 	s.mu.Unlock()
+	s.persistWorkerRecord(record)
 
 	writeJSON(w, http.StatusOK, map[string]any{"worker": view})
 }
@@ -866,11 +1118,13 @@ func (s *Server) startWorkerUpdate(workerID string, auth authContext, req worker
 		return workerUpdateJob{}, fmt.Errorf("%w: backend %s", errWorkerDisruptiveUpdate, record.backend)
 	}
 	job := &workerUpdateJob{
-		ID: "upd_" + randomID(), TenantID: record.tenantID, WorkerID: workerID,
+		ID: "upd_" + randomID(), TenantID: record.tenantID, WorkerID: workerID, WorkerInstanceID: record.instanceID,
 		TargetVersion: req.Version, Repo: req.Repo, Status: "queued",
 		AllowDisruptiveRestart: req.AllowDisruptiveRestart,
 		CreatedAt:              now, UpdatedAt: now,
 	}
+	s.appendUpdateEvent(job, job.Status, "update queued", now)
+	s.persistUpdateJob(job)
 	s.updateJobs[job.ID] = job
 	s.mu.Unlock()
 
@@ -884,6 +1138,8 @@ func (s *Server) startWorkerUpdate(workerID string, auth authContext, req worker
 		job.Message = err.Error()
 		job.UpdatedAt = time.Now().UTC()
 		job.FinishedAt = job.UpdatedAt
+		s.appendUpdateEvent(job, job.Status, job.Message, job.UpdatedAt)
+		s.persistUpdateJob(job)
 		copy := *job
 		s.mu.Unlock()
 		return copy, err
@@ -892,6 +1148,8 @@ func (s *Server) startWorkerUpdate(workerID string, auth authContext, req worker
 	job.Status = "sent"
 	job.Message = "update command sent"
 	job.UpdatedAt = time.Now().UTC()
+	s.appendUpdateEvent(job, job.Status, job.Message, job.UpdatedAt)
+	s.persistUpdateJob(job)
 	copy := *job
 	s.mu.Unlock()
 	return copy, nil
@@ -921,6 +1179,7 @@ func (s *Server) evictWorker(workerID string, auth authContext) (protocol.Worker
 	record.lastSeen = time.Now().UTC()
 	worker := s.workers[workerID]
 	delete(s.workers, workerID)
+	staleStreams := s.removeWorkerStreamsLocked(workerID)
 	for id := range s.sessions {
 		if strings.HasPrefix(id, workerID+"/") {
 			delete(s.sessions, id)
@@ -929,6 +1188,10 @@ func (s *Server) evictWorker(workerID string, auth authContext) (protocol.Worker
 	s.workerViews[workerID] = record
 	view := workerView(record)
 	s.mu.Unlock()
+	s.persistWorkerRecord(record)
+	if len(staleStreams) > 0 {
+		s.logger.Debug("worker eviction removed streams", "worker", workerID, "streams", len(staleStreams))
+	}
 
 	if worker != nil {
 		worker.close.Do(func() {
@@ -960,10 +1223,6 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 	case http.MethodPost:
 		auth := requestAuth(r)
-		if isDirectControl(auth) {
-			writeError(w, http.StatusForbidden, "direct token cannot create sessions")
-			return
-		}
 		var req protocol.CreateSession
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -1033,9 +1292,9 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lines := safeQueryInt(r.URL.Query().Get("lines"), 80)
-		preview, err := s.requestSessionPreview(r.Context(), workerID, name, sessionID, lines)
+		preview, err := s.requestSessionPreview(r.Context(), workerID, name, sessionID, lines, terminalTargetFromQuery(r.URL.Query(), name))
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, sessionActionErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, preview)
@@ -1048,7 +1307,7 @@ func (s *Server) handleSessionAction(w http.ResponseWriter, r *http.Request) {
 		}
 		targets, err := s.requestSessionTargets(r.Context(), workerID, name, sessionID)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, sessionActionErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, targets)
@@ -1098,20 +1357,27 @@ func (s *Server) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	_ = first.DecodePayload(&hello)
 	addr := remoteHost(r.RemoteAddr)
 	worker := &workerConn{
-		id:       first.WorkerID,
-		tenantID: authTenantID(auth),
-		name:     hello.Name,
-		addr:     addr,
-		backend:  hello.Backend,
-		software: hello.WorkerSoftware,
-		lastSeen: time.Now().UTC(),
-		conn:     conn,
-		send:     make(chan protocol.Envelope, 64),
-		done:     make(chan struct{}),
+		id:         first.WorkerID,
+		instanceID: strings.TrimSpace(hello.InstanceID),
+		tenantID:   authTenantID(auth),
+		name:       hello.Name,
+		addr:       addr,
+		backend:    hello.Backend,
+		software:   hello.WorkerSoftware,
+		lastSeen:   time.Now().UTC(),
+		conn:       conn,
+		send:       make(chan protocol.Envelope, 64),
+		done:       make(chan struct{}),
 	}
 	if !s.workerAllowedToConnect(worker) {
 		_ = conn.Close()
 		s.logger.Warn("disabled worker connection rejected", "worker", worker.id)
+		return
+	}
+	if err := s.workerConnectionConflict(worker); err != nil {
+		s.writeWorkerHandshakeError(conn, worker.id, err.Error())
+		_ = conn.Close()
+		s.logger.Warn("worker connection rejected", "worker", worker.id, "instance", worker.instanceID, "error", err)
 		return
 	}
 	s.registerWorker(worker)
@@ -1141,6 +1407,25 @@ func (s *Server) workerAllowedToConnect(worker *workerConn) bool {
 	return !record.disabled
 }
 
+func (s *Server) workerConnectionConflict(worker *workerConn) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	old := s.workers[worker.id]
+	if old == nil {
+		return nil
+	}
+	if old.instanceID == "" || worker.instanceID == "" || old.instanceID == worker.instanceID {
+		return nil
+	}
+	return fmt.Errorf("worker_id %q is already connected by another worker instance; set a unique --id or run worker leave before joining this machine", worker.id)
+}
+
+func (s *Server) writeWorkerHandshakeError(conn *ws.Conn, workerID, message string) {
+	env, _ := protocol.NewEnvelope(protocol.TypeError, protocol.ErrorPayload{Message: message})
+	env.WorkerID = workerID
+	_ = writeEnvelope(conn, env)
+}
+
 func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 	auth, ok := s.authenticateRole(r, "control")
 	if !ok {
@@ -1154,6 +1439,7 @@ func (s *Server) handleControlWS(w http.ResponseWriter, r *http.Request) {
 	}
 	control := &controlConn{id: "ctrl_" + randomID(), conn: conn, send: make(chan protocol.Envelope, 64), tenantID: auth.Credential.TenantID, admin: auth.Admin, direct: isDirectControl(auth), done: make(chan struct{})}
 	s.logger.Debug("control websocket connected", "control", control.id, "tenant", control.tenantID, "admin", control.admin)
+	s.addControl(control)
 	defer s.removeControl(control)
 	go s.writeLoop("control", control.id, conn, control.send, control.done)
 	go pingLoop(conn, control.done, wsPingInterval)
@@ -1173,8 +1459,9 @@ func (s *Server) registerWorker(worker *workerConn) {
 	if worker.done == nil {
 		worker.done = make(chan struct{})
 	}
+	var old *workerConn
 	s.mu.Lock()
-	old := s.workers[worker.id]
+	old = s.workers[worker.id]
 	if old != nil {
 		old.close.Do(func() {
 			if old.done != nil {
@@ -1186,16 +1473,25 @@ func (s *Server) registerWorker(worker *workerConn) {
 		}
 		s.logger.Warn("worker connection replaced", "worker", worker.id)
 	}
+	staleStreams := s.removeWorkerStreamsLocked(worker.id)
 	s.workers[worker.id] = worker
 	previous := s.workerViews[worker.id]
+	if worker.instanceID == "" {
+		worker.instanceID = previous.instanceID
+	}
 	software := mergeWorkerSoftware(previous.software, worker.software)
 	s.workerViews[worker.id] = workerRecord{
-		id: worker.id, tenantID: worker.tenantID, name: worker.name, addr: worker.addr,
+		id: worker.id, instanceID: worker.instanceID, tenantID: worker.tenantID, name: worker.name, addr: worker.addr,
 		backend: worker.backend, software: software, lastSeen: worker.lastSeen, connected: true,
 		disabled: previous.disabled, traceEnabled: previous.traceEnabled, debugEnabled: previous.debugEnabled,
 	}
+	record := s.workerViews[worker.id]
 	s.completeWorkerUpdateOnReconnectLocked(worker.id, software)
 	s.mu.Unlock()
+	if old != nil && len(staleStreams) > 0 {
+		s.logger.Debug("worker replacement removed streams", "worker", worker.id, "streams", len(staleStreams))
+	}
+	s.persistWorkerRecord(record)
 	s.logger.Info("worker connected", "worker", worker.id)
 }
 
@@ -1217,10 +1513,13 @@ func (s *Server) unregisterWorker(worker *workerConn) {
 	delete(s.workers, worker.id)
 	record := s.workerViews[worker.id]
 	if record.id == "" {
-		record = workerRecord{id: worker.id, tenantID: worker.tenantID, name: worker.name, addr: worker.addr}
+		record = workerRecord{id: worker.id, instanceID: worker.instanceID, tenantID: worker.tenantID, name: worker.name, addr: worker.addr}
 	}
 	record.connected = false
 	record.lastSeen = time.Now().UTC()
+	if worker.instanceID != "" {
+		record.instanceID = worker.instanceID
+	}
 	if worker.name != "" {
 		record.name = worker.name
 	}
@@ -1232,7 +1531,12 @@ func (s *Server) unregisterWorker(worker *workerConn) {
 	}
 	record.software = mergeWorkerSoftware(record.software, worker.software)
 	s.workerViews[worker.id] = record
+	staleStreams := s.removeWorkerStreamsLocked(worker.id)
 	s.mu.Unlock()
+	if len(staleStreams) > 0 {
+		s.logger.Debug("worker disconnect removed streams", "worker", worker.id, "streams", len(staleStreams))
+	}
+	s.persistWorkerRecord(record)
 	s.logger.Info("worker disconnected", "worker", worker.id)
 }
 
@@ -1261,6 +1565,9 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 		s.updateSessions(worker.id, snapshot.Sessions)
 	case protocol.TypeTerminalOutput:
 		s.logger.Debug("terminal output from worker", "worker", worker.id, "session_id", env.SessionID, "stream_id", env.StreamID, "payload_bytes", len(env.Payload))
+		s.publish(env.StreamID, env)
+	case protocol.TypeTerminalMode, protocol.TypeTerminalSnapshot, protocol.TypeTerminalStateReset, protocol.TypeTerminalDiff, protocol.TypeTerminalHistoryPage:
+		s.logger.Debug("terminal state message from worker", "worker", worker.id, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "payload_bytes", len(env.Payload))
 		s.publish(env.StreamID, env)
 	case protocol.TypeSessionPreview:
 		s.completePreview(env)
@@ -1309,6 +1616,27 @@ func sessionBackend(session protocol.Session, worker workerRecord) string {
 		return session.Backend
 	}
 	return worker.backend
+}
+
+func sessionActionErrorStatus(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	if errors.Is(err, context.Canceled) {
+		return http.StatusRequestTimeout
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "timed out"):
+		return http.StatusGatewayTimeout
+	case strings.Contains(message, "worker not connected"), strings.Contains(message, "worker send queue full"):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func mergeWorkerSoftware(previous, next protocol.WorkerSoftware) protocol.WorkerSoftware {
@@ -1403,6 +1731,8 @@ func (s *Server) completeWorkerUpdateResult(env protocol.Envelope) {
 		job.TargetVersion = result.Version
 	}
 	job.UpdatedAt = now
+	s.appendUpdateEvent(job, job.Status, job.Message, now)
+	s.persistUpdateJob(job)
 }
 
 func (s *Server) completeWorkerUpdateOnReconnectLocked(workerID string, software protocol.WorkerSoftware) {
@@ -1418,6 +1748,8 @@ func (s *Server) completeWorkerUpdateOnReconnectLocked(workerID string, software
 		job.Message = "worker reconnected with version " + firstNonEmpty(software.Version, "unknown")
 		job.UpdatedAt = now
 		job.FinishedAt = now
+		s.appendUpdateEvent(job, job.Status, job.Message, now)
+		s.persistUpdateJob(job)
 	}
 }
 
@@ -1464,6 +1796,7 @@ func workerView(worker workerRecord) protocol.WorkerView {
 	}
 	return protocol.WorkerView{
 		ID:           worker.id,
+		InstanceID:   worker.instanceID,
 		TenantID:     worker.tenantID,
 		Name:         worker.name,
 		Addr:         worker.addr,
@@ -1513,7 +1846,14 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 		}
 		size := open.Size()
 		s.logger.Debug("control open stream", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows, "pane_id", terminalTargetPane(open.Target))
-		s.addSubscriber(env.StreamID, control)
+		staleStreams := s.addSubscriber(env.StreamID, control, streamSubscription{
+			controlID: control.id,
+			workerID:  workerID,
+			sessionID: env.SessionID,
+			name:      name,
+			targetKey: terminalTargetKey(open.Target),
+		})
+		s.closeStreams(staleStreams, "control stream replaced")
 		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, open, name, env.SessionID, env.StreamID); err != nil {
 			s.logger.Debug("control open forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
@@ -1558,6 +1898,79 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			s.logger.Debug("control resize forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
 		}
+	case protocol.TypeTerminalSizeSync:
+		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
+		if !ok {
+			sendError(control.send, env.SessionID, "invalid session_id")
+			return
+		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
+			return
+		}
+		var size protocol.TerminalSizeSync
+		if err := env.DecodePayload(&size); err != nil {
+			sendError(control.send, env.SessionID, err.Error())
+			return
+		}
+		s.logger.Debug("control size sync forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows)
+		if err := s.sendToWorker(workerID, protocol.TypeTerminalSizeSync, size, name, env.SessionID, env.StreamID); err != nil {
+			s.logger.Debug("control size sync forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
+			sendError(control.send, env.SessionID, err.Error())
+		}
+	case protocol.TypeTerminalSizeReset:
+		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
+		if !ok {
+			sendError(control.send, env.SessionID, "invalid session_id")
+			return
+		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
+			return
+		}
+		var req protocol.TerminalSizeReset
+		_ = env.DecodePayload(&req)
+		s.logger.Debug("control size reset forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID)
+		if err := s.sendToWorker(workerID, protocol.TypeTerminalSizeReset, req, name, env.SessionID, env.StreamID); err != nil {
+			s.logger.Debug("control size reset forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
+			sendError(control.send, env.SessionID, err.Error())
+		}
+	case protocol.TypeTerminalHistoryReq:
+		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
+		if !ok {
+			sendError(control.send, env.SessionID, "invalid session_id")
+			return
+		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
+			return
+		}
+		var req protocol.TerminalHistoryRequest
+		if err := env.DecodePayload(&req); err != nil {
+			sendError(control.send, env.SessionID, err.Error())
+			return
+		}
+		if err := s.sendToWorker(workerID, protocol.TypeTerminalHistoryReq, req, name, env.SessionID, env.StreamID); err != nil {
+			sendError(control.send, env.SessionID, err.Error())
+		}
+	case protocol.TypeTerminalMouse:
+		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
+		if !ok {
+			sendError(control.send, env.SessionID, "invalid session_id")
+			return
+		}
+		if !control.admin && !s.workerInTenant(workerID, control.tenantID) {
+			sendError(control.send, env.SessionID, "worker is not in credential tenant")
+			return
+		}
+		var mouse protocol.TerminalMouse
+		if err := env.DecodePayload(&mouse); err != nil {
+			sendError(control.send, env.SessionID, err.Error())
+			return
+		}
+		if err := s.sendToWorker(workerID, protocol.TypeTerminalMouse, mouse, name, env.SessionID, env.StreamID); err != nil {
+			sendError(control.send, env.SessionID, err.Error())
+		}
 	case protocol.TypeTerminalClose:
 		if env.StreamID == "" {
 			return
@@ -1567,15 +1980,39 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			return
 		}
 		s.logger.Debug("control close forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID)
-		_ = s.sendToWorker(workerID, protocol.TypeTerminalClose, map[string]string{"name": name}, name, env.SessionID, env.StreamID)
+		staleStreams := s.removeSubscriberStream(env.StreamID)
+		if len(staleStreams) == 0 {
+			staleStreams = []streamCloseRequest{{streamID: env.StreamID, subscription: streamSubscription{workerID: workerID, sessionID: env.SessionID, name: name}}}
+		}
+		s.closeStreams(staleStreams, "control close")
 	}
 }
 
-func (s *Server) addSubscriber(streamID string, control *controlConn) {
+func (s *Server) addControl(control *controlConn) {
 	s.mu.Lock()
+	s.controls[control.id] = control
+	s.mu.Unlock()
+}
+
+func (s *Server) addSubscriber(streamID string, control *controlConn, subscription streamSubscription) []streamCloseRequest {
+	s.mu.Lock()
+	staleStreams := make([]streamCloseRequest, 0)
+	for id, existing := range s.streams {
+		if id == streamID {
+			continue
+		}
+		if existing.controlID == control.id && existing.workerID == subscription.workerID && existing.sessionID == subscription.sessionID && existing.name == subscription.name && existing.targetKey == subscription.targetKey {
+			delete(s.subscribers, id)
+			delete(s.streams, id)
+			staleStreams = append(staleStreams, streamCloseRequest{streamID: id, subscription: existing})
+			s.logger.Debug("subscriber replaced", "control", control.id, "old_stream_id", id, "new_stream_id", streamID, "session_id", existing.sessionID)
+		}
+	}
 	s.subscribers[streamID] = control
+	s.streams[streamID] = subscription
 	s.mu.Unlock()
 	s.logger.Debug("subscriber added", "control", control.id, "stream_id", streamID)
+	return staleStreams
 }
 
 func (s *Server) removeControl(control *controlConn) {
@@ -1585,15 +2022,71 @@ func (s *Server) removeControl(control *controlConn) {
 		}
 	})
 	s.mu.Lock()
-	for id, subscribed := range s.subscribers {
-		if subscribed == control {
+	staleStreams := make([]streamCloseRequest, 0)
+	for id, subscription := range s.streams {
+		if subscription.controlID == control.id {
 			delete(s.subscribers, id)
+			delete(s.streams, id)
+			staleStreams = append(staleStreams, streamCloseRequest{streamID: id, subscription: subscription})
 			s.logger.Debug("subscriber removed", "control", control.id, "stream_id", id)
 		}
 	}
+	delete(s.controls, control.id)
 	s.mu.Unlock()
-	_ = control.conn.Close()
+	s.closeStreams(staleStreams, "control disconnected")
+	if control.conn != nil {
+		_ = control.conn.Close()
+	}
 	s.logger.Debug("control websocket disconnected", "control", control.id)
+}
+
+func (s *Server) removeSubscriberStream(streamID string) []streamCloseRequest {
+	if streamID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	subscription, ok := s.streams[streamID]
+	delete(s.subscribers, streamID)
+	delete(s.streams, streamID)
+	if !ok {
+		return nil
+	}
+	return []streamCloseRequest{{streamID: streamID, subscription: subscription}}
+}
+
+func (s *Server) removeWorkerStreams(workerID string) []streamCloseRequest {
+	if workerID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.removeWorkerStreamsLocked(workerID)
+}
+
+func (s *Server) removeWorkerStreamsLocked(workerID string) []streamCloseRequest {
+	staleStreams := make([]streamCloseRequest, 0)
+	for streamID, subscription := range s.streams {
+		if subscription.workerID != workerID {
+			continue
+		}
+		delete(s.subscribers, streamID)
+		delete(s.streams, streamID)
+		staleStreams = append(staleStreams, streamCloseRequest{streamID: streamID, subscription: subscription})
+		s.logger.Debug("worker stream removed", "worker", workerID, "stream_id", streamID, "session_id", subscription.sessionID)
+	}
+	return staleStreams
+}
+
+func (s *Server) closeStreams(streams []streamCloseRequest, reason string) {
+	for _, stream := range streams {
+		subscription := stream.subscription
+		if subscription.workerID == "" || subscription.sessionID == "" || stream.streamID == "" {
+			continue
+		}
+		s.logger.Debug("terminal close forwarded", "worker", subscription.workerID, "session_id", subscription.sessionID, "stream_id", stream.streamID, "reason", reason)
+		_ = s.sendToWorker(subscription.workerID, protocol.TypeTerminalClose, map[string]string{"name": subscription.name, "reason": reason}, subscription.name, subscription.sessionID, stream.streamID)
+	}
 }
 
 func (s *Server) publish(streamID string, env protocol.Envelope) {
@@ -1602,6 +2095,7 @@ func (s *Server) publish(streamID string, env protocol.Envelope) {
 	s.mu.RUnlock()
 	if control == nil {
 		s.logger.Debug("publish dropped without subscriber", "stream_id", streamID, "session_id", env.SessionID, "type", env.Type, "payload_bytes", len(env.Payload))
+		s.closeOrphanStream(streamID, env.SessionID)
 		return
 	}
 	select {
@@ -1612,10 +2106,26 @@ func (s *Server) publish(streamID string, env protocol.Envelope) {
 	}
 }
 
-func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sessionID string, lines int) (protocol.SessionPreview, error) {
+func (s *Server) closeOrphanStream(streamID, sessionID string) {
+	if streamID == "" || sessionID == "" {
+		return
+	}
+	staleStreams := s.removeSubscriberStream(streamID)
+	if len(staleStreams) > 0 {
+		s.closeStreams(staleStreams, "orphan output")
+		return
+	}
+	workerID, name, ok := protocol.SplitSessionID(sessionID)
+	if !ok {
+		return
+	}
+	s.closeStreams([]streamCloseRequest{{streamID: streamID, subscription: streamSubscription{workerID: workerID, sessionID: sessionID, name: name}}}, "orphan output")
+}
+
+func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sessionID string, lines int, target *protocol.TerminalTarget) (protocol.SessionPreview, error) {
 	requestID := "preview_" + randomID()
 	reply := make(chan protocol.Envelope, 1)
-	s.logger.Debug("preview request start", "worker", workerID, "session_id", sessionID, "request_id", requestID, "lines", lines)
+	s.logger.Debug("preview request start", "worker", workerID, "session_id", sessionID, "request_id", requestID, "lines", lines, "pane_id", terminalTargetPane(target))
 	s.mu.Lock()
 	s.previews[requestID] = reply
 	s.mu.Unlock()
@@ -1625,11 +2135,15 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 		s.mu.Unlock()
 	}()
 
-	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionPreview, protocol.SessionPreviewRequest{Lines: lines, Scope: "active_pane"}, name, sessionID, requestID); err != nil {
+	scope := "active_pane"
+	if target != nil && target.PaneID != "" {
+		scope = "pane"
+	}
+	if err := s.sendToWorkerWithID(workerID, protocol.TypeSessionPreview, protocol.SessionPreviewRequest{Lines: lines, Scope: scope, Target: target}, name, sessionID, requestID); err != nil {
 		s.logger.Debug("preview request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 		return protocol.SessionPreview{}, err
 	}
-	timer := time.NewTimer(2 * time.Second)
+	timer := time.NewTimer(sessionAuxRequestWait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -1674,7 +2188,7 @@ func (s *Server) requestSessionTargets(ctx context.Context, workerID, name, sess
 		s.logger.Debug("targets request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 		return protocol.SessionTargets{}, err
 	}
-	timer := time.NewTimer(2 * time.Second)
+	timer := time.NewTimer(sessionAuxRequestWait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -1730,7 +2244,7 @@ func (s *Server) requestSessionCreate(ctx context.Context, workerID string, sess
 		s.logger.Debug("session create request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 		return err
 	}
-	timer := time.NewTimer(5 * time.Second)
+	timer := time.NewTimer(sessionCreateRequestWait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -1813,6 +2327,57 @@ func terminalTargetPane(target *protocol.TerminalTarget) string {
 		return ""
 	}
 	return target.PaneID
+}
+
+func terminalTargetKey(target *protocol.TerminalTarget) string {
+	if target == nil {
+		return ""
+	}
+	if target.PaneID != "" {
+		return "pane_id:" + target.PaneID
+	}
+	if target.WindowID != "" || target.PaneIndex != 0 {
+		return fmt.Sprintf("window_id:%s|pane_index:%d", target.WindowID, target.PaneIndex)
+	}
+	if target.WindowIndex != 0 || target.PaneIndex != 0 {
+		return fmt.Sprintf("window_index:%d|pane_index:%d", target.WindowIndex, target.PaneIndex)
+	}
+	if target.WindowName != "" || target.PaneActive {
+		return fmt.Sprintf("window_name:%s|pane_active:%t", target.WindowName, target.PaneActive)
+	}
+	return ""
+}
+
+func terminalTargetFromQuery(values url.Values, name string) *protocol.TerminalTarget {
+	paneID := strings.TrimSpace(values.Get("pane_id"))
+	if paneID == "" {
+		return nil
+	}
+	return &protocol.TerminalTarget{
+		SessionName:  firstNonEmptyString(values.Get("session_name"), name),
+		WindowID:     strings.TrimSpace(values.Get("window_id")),
+		WindowIndex:  safeQueryInt(values.Get("window_index"), 0),
+		WindowName:   strings.TrimSpace(values.Get("window_name")),
+		WindowActive: values.Get("window_active") == "true",
+		PaneID:       paneID,
+		PaneIndex:    safeQueryInt(values.Get("pane_index"), 0),
+		PaneActive:   values.Get("pane_active") == "true",
+		CWD:          strings.TrimSpace(values.Get("cwd")),
+		Command:      strings.TrimSpace(values.Get("command")),
+		Left:         safeQueryInt(values.Get("left"), 0),
+		Top:          safeQueryInt(values.Get("top"), 0),
+		Width:        safeQueryInt(values.Get("width"), 0),
+		Height:       safeQueryInt(values.Get("height"), 0),
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (s *Server) sendToWorker(workerID, messageType string, payload any, name, sessionID string, streamID ...string) error {
@@ -1982,6 +2547,14 @@ func readEnvelope(conn *ws.Conn) (protocol.Envelope, error) {
 	return env, env.Validate()
 }
 
+func writeEnvelope(conn *ws.Conn, env protocol.Envelope) error {
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	return conn.WriteText(string(raw))
+}
+
 func (s *Server) writeLoop(peerType, peerID string, conn *ws.Conn, send <-chan protocol.Envelope, done <-chan struct{}) {
 	for {
 		select {
@@ -2115,9 +2688,13 @@ verify_sha256() {
 }
 
 case "$ROLE" in
-  worker|control)
-    ASSET_ROLE="$ROLE"
+  worker)
+    ASSET_ROLE="worker"
     INSTALL_BIN="$BIN"
+    ;;
+  control)
+    ASSET_ROLE="tui"
+    INSTALL_BIN="$TUI_BIN"
     ;;
   hub)
     ASSET_ROLE="hub"
@@ -2129,9 +2706,11 @@ case "$ROLE" in
     ;;
 esac
 
-if [ "$ROLE" = "hub" ] && command -v agentmux-hub >/dev/null 2>&1; then
+if [ "$ROLE" = "control" ] && command -v agentmux-tui >/dev/null 2>&1; then
+  INSTALL_BIN="$(command -v agentmux-tui)"
+elif [ "$ROLE" = "hub" ] && command -v agentmux-hub >/dev/null 2>&1; then
   INSTALL_BIN="$(command -v agentmux-hub)"
-elif command -v agentmux >/dev/null 2>&1; then
+elif [ "$ROLE" != "control" ] && command -v agentmux >/dev/null 2>&1; then
   INSTALL_BIN="$(command -v agentmux)"
 elif command -v go >/dev/null 2>&1 && [ "$ROLE" = "hub" ] && [ -f "./cmd/agentmux-hub/main.go" ]; then
   go build -o "$INSTALL_BIN" ./cmd/agentmux-hub
@@ -2163,16 +2742,33 @@ elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
     if [ "$ROLE" = "hub" ]; then
       exit 1
     fi
-    legacy_base="agentmux-${os}-${arch}"
-    asset_base="$legacy_base"
-    asset="${legacy_base}.tar.gz"
-    if [ "$VERSION" = "latest" ]; then
-      url="https://github.com/${REPO}/releases/latest/download/${asset}"
-    else
-      url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+    if [ "$ROLE" = "control" ]; then
+      fallback_base="agentmux-control-${os}-${arch}"
+      fallback_asset="${fallback_base}.tar.gz"
+      if [ "$VERSION" = "latest" ]; then
+        fallback_url="https://github.com/${REPO}/releases/latest/download/${fallback_asset}"
+      else
+        fallback_url="https://github.com/${REPO}/releases/download/${VERSION}/${fallback_asset}"
+      fi
+      echo "Falling back to $fallback_url" >&2
+      if curl -fsSL "$fallback_url" -o "$tmp/$fallback_asset"; then
+        asset_base="$fallback_base"
+        asset="$fallback_asset"
+        url="$fallback_url"
+      fi
     fi
-    echo "Falling back to $url" >&2
-    curl -fsSL "$url" -o "$tmp/$asset"
+    if [ ! -f "$tmp/$asset" ]; then
+      legacy_base="agentmux-${os}-${arch}"
+      asset_base="$legacy_base"
+      asset="${legacy_base}.tar.gz"
+      if [ "$VERSION" = "latest" ]; then
+        url="https://github.com/${REPO}/releases/latest/download/${asset}"
+      else
+        url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+      fi
+      echo "Falling back to $url" >&2
+      curl -fsSL "$url" -o "$tmp/$asset"
+    fi
   fi
   checksum_url="${url}.sha256"
   echo "Verifying $checksum_url" >&2
@@ -2186,16 +2782,12 @@ else
   exit 1
 fi
 
-if [ "$ROLE" = "control" ] && [ "$INSTALL_BIN" != "$TUI_BIN" ]; then
-  ln -sf "$INSTALL_BIN" "$TUI_BIN" 2>/dev/null || true
-fi
-
 case "$ROLE" in
   worker)
     exec "$INSTALL_BIN" worker join --hub "$HUB_WS" "$@"
     ;;
   control)
-    exec "$INSTALL_BIN" control login --hub "$HUB_HTTP" "$@"
+    exec "$INSTALL_BIN" --hub "$HUB_HTTP" "$@"
     ;;
   hub)
     exec "$INSTALL_BIN" hub "$@"
@@ -2265,13 +2857,16 @@ case "$os" in
 esac
 
 asset_role="$ROLE"
+if [ "$ROLE" = "control" ]; then
+  asset_role="tui"
+fi
 asset_base="agentmux-${asset_role}-${os}-${arch}"
 asset="${asset_base}.tar.gz"
-if [ "$ROLE" = "hub" ]; then
-  bin_name="agentmux-hub"
-else
-  bin_name="agentmux"
-fi
+case "$ROLE" in
+  control) bin_name="agentmux-tui" ;;
+  hub) bin_name="agentmux-hub" ;;
+  *) bin_name="agentmux" ;;
+esac
 cache_bin="$CACHE_DIR/releases/$VERSION/$ROLE/${os}-${arch}/$bin_name"
 
 if [ ! -x "$cache_bin" ]; then
@@ -2288,16 +2883,33 @@ if [ ! -x "$cache_bin" ]; then
     if [ "$ROLE" = "hub" ]; then
       exit 1
     fi
-    legacy_base="agentmux-${os}-${arch}"
-    asset_base="$legacy_base"
-    asset="${legacy_base}.tar.gz"
-    if [ "$VERSION" = "latest" ]; then
-      url="https://github.com/${REPO}/releases/latest/download/${asset}"
-    else
-      url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+    if [ "$ROLE" = "control" ]; then
+      fallback_base="agentmux-control-${os}-${arch}"
+      fallback_asset="${fallback_base}.tar.gz"
+      if [ "$VERSION" = "latest" ]; then
+        fallback_url="https://github.com/${REPO}/releases/latest/download/${fallback_asset}"
+      else
+        fallback_url="https://github.com/${REPO}/releases/download/${VERSION}/${fallback_asset}"
+      fi
+      echo "Falling back to $fallback_url" >&2
+      if curl -fsSL "$fallback_url" -o "$tmp/$fallback_asset"; then
+        asset_base="$fallback_base"
+        asset="$fallback_asset"
+        url="$fallback_url"
+      fi
     fi
-    echo "Falling back to $url" >&2
-    curl -fsSL "$url" -o "$tmp/$asset"
+    if [ ! -f "$tmp/$asset" ]; then
+      legacy_base="agentmux-${os}-${arch}"
+      asset_base="$legacy_base"
+      asset="${legacy_base}.tar.gz"
+      if [ "$VERSION" = "latest" ]; then
+        url="https://github.com/${REPO}/releases/latest/download/${asset}"
+      else
+        url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+      fi
+      echo "Falling back to $url" >&2
+      curl -fsSL "$url" -o "$tmp/$asset"
+    fi
   fi
   checksum_url="${url}.sha256"
   echo "Verifying $checksum_url" >&2
@@ -2309,7 +2921,7 @@ fi
 
 case "$ROLE" in
   control)
-    exec "$cache_bin" control app --hub "$HUB_HTTP" "$@"
+    exec "$cache_bin" --hub "$HUB_HTTP" "$@"
     ;;
   worker)
     exec "$cache_bin" worker --hub "$HUB_WS" "$@"
@@ -2384,7 +2996,7 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
       <div class="row"><span>Expires</span><strong>{{.Info.ExpiresAt.Format "2006-01-02 15:04:05 UTC"}}</strong></div>
     </section>
     {{else}}
-    <p class="warning">Only approve this request if you just ran <strong>agentmux control login</strong> in your own terminal.</p>
+    <p class="warning">Only approve this request if you just started login from <strong>agentmux-tui</strong> or <strong>agentmux control login</strong> in your own terminal.</p>
     {{end}}
     <section id="current-auth" class="auth-panel hidden">
       <label>Code<input id="current_user_code" autocomplete="one-time-code" value="{{.UserCode}}" required></label>
@@ -2477,6 +3089,34 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
       currentAuth.classList.remove('hidden');
       form.classList.add('hidden');
     }
+    function setButtonLoading(button, loading, label) {
+      if (!button) return;
+      if (loading) {
+        if (!button.dataset.label) button.dataset.label = button.textContent;
+        button.disabled = true;
+        button.textContent = label || 'Working...';
+      } else {
+        button.disabled = false;
+        button.textContent = button.dataset.label || button.textContent;
+      }
+    }
+    function closeAfterSuccess(target) {
+      let remaining = 5;
+      const update = () => {
+        target.textContent = 'Authorized. You can return to your terminal. This page will close in ' + remaining + 's.';
+      };
+      update();
+      const timer = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          clearInterval(timer);
+          window.close();
+          target.textContent = 'Authorized. You can close this page.';
+          return;
+        }
+        update();
+      }, 1000);
+    }
     const storedUser = readStoredUser();
     if (storedUser && (localStorage.getItem('agentmux.token') || localStorage.getItem('agentmux.refresh_token'))) {
       showCurrentUser(storedUser);
@@ -2505,52 +3145,64 @@ var deviceTemplate = template.Must(template.New("device").Parse(`<!doctype html>
         body: JSON.stringify({ user_code: document.getElementById('current_user_code').value })
       });
     }
-    document.getElementById('approve-current').addEventListener('click', async () => {
+    document.getElementById('approve-current').addEventListener('click', async event => {
+      const button = event.currentTarget;
+      setButtonLoading(button, true, 'Authorizing...');
       currentStatus.textContent = 'Authorizing...';
-      let accessToken = localStorage.getItem('agentmux.token') || '';
-      if (!accessToken) {
-        accessToken = await refreshBrowserCredential();
-      }
-      if (!accessToken) {
-        showPasswordLogin('Your browser session expired. Sign in again to authorize this device.');
-        return;
-      }
-      let res = await approveWithCurrentCredential(accessToken);
-      if (res.status === 401) {
-        accessToken = await refreshBrowserCredential();
-        if (accessToken) {
-          res = await approveWithCurrentCredential(accessToken);
+      try {
+        let accessToken = localStorage.getItem('agentmux.token') || '';
+        if (!accessToken) {
+          accessToken = await refreshBrowserCredential();
         }
-      }
-      if (!res.ok) {
-        const detail = await res.text();
-        if (res.status === 401 || res.status === 403) {
-          showPasswordLogin(detail || 'Sign in again to authorize this device.');
+        if (!accessToken) {
+          showPasswordLogin('Your browser session expired. Sign in again to authorize this device.');
           return;
         }
-        currentStatus.textContent = detail;
-        return;
+        let res = await approveWithCurrentCredential(accessToken);
+        if (res.status === 401) {
+          accessToken = await refreshBrowserCredential();
+          if (accessToken) {
+            res = await approveWithCurrentCredential(accessToken);
+          }
+        }
+        if (!res.ok) {
+          const detail = await res.text();
+          if (res.status === 401 || res.status === 403) {
+            showPasswordLogin(detail || 'Sign in again to authorize this device.');
+            return;
+          }
+          currentStatus.textContent = detail;
+          return;
+        }
+        closeAfterSuccess(currentStatus);
+      } finally {
+        setButtonLoading(button, false);
       }
-      currentStatus.textContent = 'Authorized. You can return to your terminal.';
     });
     document.getElementById('form').addEventListener('submit', async event => {
       event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      setButtonLoading(button, true, 'Authorizing...');
       status.textContent = 'Authorizing...';
-      const body = {
-        user_code: document.getElementById('user_code').value,
-        email: document.getElementById('email').value,
-        password: document.getElementById('password').value
-      };
-      const res = await fetch('/api/auth/device/approve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      if (!res.ok) {
-        status.textContent = await res.text();
-        return;
+      try {
+        const body = {
+          user_code: document.getElementById('user_code').value,
+          email: document.getElementById('email').value,
+          password: document.getElementById('password').value
+        };
+        const res = await fetch('/api/auth/device/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+          status.textContent = await res.text();
+          return;
+        }
+        closeAfterSuccess(status);
+      } finally {
+        setButtonLoading(button, false);
       }
-      status.textContent = 'Authorized. You can return to your terminal.';
     });
   </script>
 </body>
@@ -2633,6 +3285,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     }
     button:hover, .button:hover { transform: translateY(-1px); border-color: rgba(54, 214, 147, .45); }
     button.primary, .button.primary { background: linear-gradient(135deg, var(--accent), #8df3c5); border-color: transparent; color: #06130e; font-weight: 760; }
+    button:disabled { cursor: wait; opacity: .72; transform: none; }
+    .loading-spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 999px; animation: spin .75s linear infinite; }
+    .is-loading .loading-spinner { display: inline-block; }
     .shell { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; }
     .nav {
       height: 66px;
@@ -2720,6 +3375,9 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     @keyframes auroraShift {
       from { transform: translate3d(-2%, -1%, 0) scale(1); }
       to { transform: translate3d(2%, 1.5%, 0) scale(1.04); }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
     @media (prefers-reduced-motion: reduce) {
       *, body::before { animation: none !important; transition: none !important; }
@@ -2893,7 +3551,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     const fallbackReleaseURL = '{{.ReleasesURL}}';
     const result = document.getElementById('result');
     const status = document.getElementById('status');
+    const mintButtons = [document.getElementById('mint'), document.getElementById('mint2')].filter(Boolean);
+    const quickStart = document.getElementById('quickstart');
     let latestRelease = null;
+    let minting = false;
     const dictionaries = {
       en: {
         navControl: 'Web Control',
@@ -3036,22 +3697,46 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     setLanguage(currentLang);
     loadLatestVersion();
     async function mint() {
+      if (minting) return;
+      minting = true;
+      setMintLoading(true);
       status.textContent = t('generating');
-      const res = await fetch('/api/signals', { method: 'POST' });
-      if (!res.ok) {
-        status.textContent = signalErrorMessage(res.status, await res.text());
-        return;
+      try {
+        const res = await fetch('/api/signals', { method: 'POST' });
+        if (!res.ok) {
+          status.textContent = signalErrorMessage(res.status, await res.text());
+          return;
+        }
+        const data = await res.json();
+        const signal = data.signal || data.token;
+        status.textContent = t('signalReady') + new Date(data.expires_at).toLocaleString();
+        result.innerHTML =
+          commandBlock(t('signal'), signal, true) +
+          commandBlock(t('workerCommand'), data.worker_command, true) +
+          commandBlock(t('workerJoinCommand'), data.worker_join_command || '', true) +
+          commandBlock(t('directToken'), data.direct_token || '', true) +
+          linkBlock(t('webControlShare'), data.control_share_url || data.control_url) +
+          commandBlock(t('controlDirectCommand'), data.control_direct_command || data.control_command, true);
+        if (quickStart) quickStart.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (error) {
+        status.textContent = t('failed') + (error && error.message ? error.message : String(error));
+      } finally {
+        minting = false;
+        setMintLoading(false);
       }
-      const data = await res.json();
-      const signal = data.signal || data.token;
-      status.textContent = t('signalReady') + new Date(data.expires_at).toLocaleString();
-      result.innerHTML =
-        commandBlock(t('signal'), signal, true) +
-        commandBlock(t('workerCommand'), data.worker_command, true) +
-        commandBlock(t('workerJoinCommand'), data.worker_join_command || '', true) +
-        commandBlock(t('directToken'), data.direct_token || '', true) +
-        linkBlock(t('webControlShare'), data.control_share_url || data.control_url) +
-        commandBlock(t('controlDirectCommand'), data.control_direct_command || data.control_command, true);
+    }
+    function setMintLoading(loading) {
+      mintButtons.forEach(button => {
+        button.disabled = loading;
+        button.classList.toggle('is-loading', loading);
+        if (loading) {
+          if (!button.dataset.label) button.dataset.label = button.textContent;
+          button.innerHTML = '<span class="loading-spinner" aria-hidden="true"></span><span>' + escapeHTML(t('generating')) + '</span>';
+        } else {
+          const key = button.id === 'mint' ? 'generateSignal' : 'generate';
+          button.textContent = t(key);
+        }
+      });
     }
     function signalErrorMessage(statusCode, text) {
       if (statusCode === 401) return t('invalidControlToken');

@@ -19,6 +19,7 @@ const (
 	defaultControlAccessTTL   = 15 * time.Minute
 	defaultRefreshTokenTTL    = 7 * 24 * time.Hour
 	defaultDeviceAuthTTL      = 10 * time.Minute
+	anonymousWorkerGCInterval = time.Minute
 	devicePollIntervalSeconds = 2
 	deviceSlowDownSeconds     = 5
 	maxDeviceApproveFailures  = 8
@@ -47,6 +48,7 @@ type AuthStore interface {
 	PollDeviceAuth(req devicePollRequest) (devicePollResponse, error)
 	DeviceAuthInfo(userCode string) (deviceAuthInfo, bool)
 	Credential(token string) (credentialEntry, bool)
+	HasActiveControlCredential(tenantID string, now time.Time) bool
 }
 
 type signalEntry struct {
@@ -126,13 +128,15 @@ type deviceAuthEntry struct {
 }
 
 type exchangedCredential struct {
-	Credential   string    `json:"credential"`
-	CredentialID string    `json:"credential_id"`
-	TenantID     string    `json:"tenant_id"`
-	Role         string    `json:"role"`
-	DeviceID     string    `json:"device_id"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	Scopes       []string  `json:"scopes"`
+	Credential       string    `json:"credential"`
+	CredentialID     string    `json:"credential_id"`
+	TenantID         string    `json:"tenant_id"`
+	Role             string    `json:"role"`
+	DeviceID         string    `json:"device_id"`
+	ExpiresAt        time.Time `json:"expires_at"`
+	Scopes           []string  `json:"scopes"`
+	RefreshToken     string    `json:"refresh_token,omitempty"`
+	RefreshExpiresAt time.Time `json:"refresh_expires_at,omitempty"`
 }
 
 type authCredentialResponse struct {
@@ -327,11 +331,26 @@ func (s *authStore) Exchange(req exchangeRequest) (exchangedCredential, error) {
 		CreatedAt: now,
 	}
 	s.credentials[entry.Hash] = entry
-	return exchangedCredential{
+	result := exchangedCredential{
 		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
 		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
 		Scopes: append([]string(nil), entry.Scopes...),
-	}, nil
+	}
+	if role == "worker" {
+		refreshToken, err := randomToken("amx_ref_")
+		if err != nil {
+			return exchangedCredential{}, err
+		}
+		refresh := refreshTokenEntry{
+			Hash: tokenHash(refreshToken), ID: "ref_" + randomID(), TenantID: entry.TenantID,
+			Role: role, DeviceID: entry.DeviceID, DeviceName: entry.Name, Status: "active",
+			ExpiresAt: now.Add(defaultRefreshTokenTTL), CreatedAt: now,
+		}
+		s.refreshes[refresh.Hash] = refresh
+		result.RefreshToken = refreshToken
+		result.RefreshExpiresAt = refresh.ExpiresAt
+	}
+	return result, nil
 }
 
 func (s *authStore) Register(req registerRequest) (authCredentialResponse, error) {
@@ -392,11 +411,14 @@ func (s *authStore) Refresh(req refreshRequest) (authCredentialResponse, error) 
 	if !ok || now.After(refresh.ExpiresAt) || refresh.Status != "active" {
 		return authCredentialResponse{}, fmt.Errorf("invalid or expired refresh token")
 	}
+	delete(s.refreshes, refresh.Hash)
+	if refresh.Role == "worker" {
+		return s.issueWorkerCredentialLocked(refresh.TenantID, refresh.DeviceID, refresh.DeviceName, now)
+	}
 	user, ok := s.users[refresh.UserEmail]
 	if !ok {
 		return authCredentialResponse{}, fmt.Errorf("refresh user is missing")
 	}
-	delete(s.refreshes, refresh.Hash)
 	return s.issueControlCredentialLocked(user, refresh.DeviceID, refresh.DeviceName, now)
 }
 
@@ -629,6 +651,40 @@ func (s *authStore) issueControlCredentialLocked(user userEntry, deviceID, devic
 	}, nil
 }
 
+func (s *authStore) issueWorkerCredentialLocked(tenantID, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
+	credential, err := randomToken("amx_cred_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	refreshToken, err := randomToken("amx_ref_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		deviceID = "dev_" + randomID()
+	}
+	deviceName = strings.TrimSpace(deviceName)
+	entry := credentialEntry{
+		Hash: tokenHash(credential), ID: "cred_" + randomID(), TenantID: tenantID,
+		Role: "worker", DeviceID: deviceID, Name: deviceName,
+		Scopes: credentialScopes("worker"), ExpiresAt: now.Add(defaultCredentialTTL), CreatedAt: now,
+	}
+	s.credentials[entry.Hash] = entry
+	refresh := refreshTokenEntry{
+		Hash: tokenHash(refreshToken), ID: "ref_" + randomID(), TenantID: tenantID,
+		Role: "worker", DeviceID: deviceID, DeviceName: deviceName,
+		Status: "active", ExpiresAt: now.Add(defaultRefreshTokenTTL), CreatedAt: now,
+	}
+	s.refreshes[refresh.Hash] = refresh
+	return authCredentialResponse{
+		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
+		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
+		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
+		RefreshExpiresAt: refresh.ExpiresAt,
+	}, nil
+}
+
 func (s *authStore) Credential(token string) (credentialEntry, bool) {
 	if token == "" {
 		return credentialEntry{}, false
@@ -643,6 +699,25 @@ func (s *authStore) Credential(token string) (credentialEntry, bool) {
 		return credentialEntry{}, false
 	}
 	return entry, true
+}
+
+func (s *authStore) HasActiveControlCredential(tenantID string, now time.Time) bool {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	for _, entry := range s.credentials {
+		if entry.TenantID == tenantID && entry.Role == "control" && now.Before(entry.ExpiresAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *authStore) cleanupLocked(now time.Time) {

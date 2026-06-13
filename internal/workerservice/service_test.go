@@ -87,3 +87,35 @@ func TestPrepareWorkerBinaryUsesUniqueCopy(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerServicePathIncludesHomebrewAndDeduplicates(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/opt/homebrew/bin:/usr/bin")
+	got := workerServicePath()
+	if !strings.Contains(got, "/opt/homebrew/bin") || !strings.Contains(got, "/usr/local/bin") {
+		t.Fatalf("expected macOS package manager paths, got %q", got)
+	}
+	if strings.Count(got, "/usr/bin") != 1 {
+		t.Fatalf("expected deduplicated PATH, got %q", got)
+	}
+}
+
+func TestLaunchdEnvXMLIncludesConfiguredTmux(t *testing.T) {
+	got := launchdEnvXML(map[string]string{
+		"PATH":                            "/opt/homebrew/bin:/usr/bin",
+		"AGENTMUX_WORKER_INSTALL_KIND":    "service",
+		"AGENTMUX_WORKER_SERVICE_BACKEND": "launchd",
+		"AGENTMUX_TMUX":                   "/custom/tmux",
+	})
+	for _, want := range []string{
+		"<key>PATH</key><string>/opt/homebrew/bin:/usr/bin</string>",
+		"<key>AGENTMUX_TMUX</key><string>/custom/tmux</string>",
+		"<key>AGENTMUX_WORKER_SERVICE_BACKEND</key><string>launchd</string>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("launchd env missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "AGENTMUX_TMUX_PATH") {
+		t.Fatalf("empty env should be omitted:\n%s", got)
+	}
+}

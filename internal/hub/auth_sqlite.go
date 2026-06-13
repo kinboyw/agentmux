@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"private/agentmux/internal/protocol"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -42,6 +44,227 @@ func OpenSQLiteAuthStore(path string) (*sqliteAuthStore, error) {
 
 func (s *sqliteAuthStore) Close() error {
 	return s.db.Close()
+}
+
+func (s *sqliteAuthStore) LoadWorkers() ([]workerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT worker_id, worker_instance_id, tenant_id, name, addr, backend, software_json, last_seen, connected, disabled, trace_enabled, debug_enabled FROM workers ORDER BY last_seen DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	workers := []workerRecord{}
+	for rows.Next() {
+		var worker workerRecord
+		var softwareJSON, lastSeen string
+		var connected, disabled, traceEnabled, debugEnabled int
+		if err := rows.Scan(
+			&worker.id, &worker.instanceID, &worker.tenantID, &worker.name, &worker.addr, &worker.backend, &softwareJSON, &lastSeen,
+			&connected, &disabled, &traceEnabled, &debugEnabled,
+		); err != nil {
+			return nil, err
+		}
+		worker.software = unmarshalWorkerSoftware(softwareJSON)
+		worker.lastSeen = parseStoredTime(lastSeen)
+		worker.connected = intToBool(connected)
+		worker.disabled = intToBool(disabled)
+		worker.traceEnabled = intToBool(traceEnabled)
+		worker.debugEnabled = intToBool(debugEnabled)
+		workers = append(workers, worker)
+	}
+	return workers, rows.Err()
+}
+
+func (s *sqliteAuthStore) SaveWorker(worker workerRecord) error {
+	if strings.TrimSpace(worker.id) == "" {
+		return nil
+	}
+	softwareJSON, err := marshalWorkerSoftware(worker.software)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if worker.lastSeen.IsZero() {
+		worker.lastSeen = now
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err = s.db.Exec(
+		`INSERT INTO workers(worker_id, worker_instance_id, tenant_id, name, addr, backend, software_json, last_seen, connected, disabled, trace_enabled, debug_enabled, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(worker_id) DO UPDATE SET
+			worker_instance_id = excluded.worker_instance_id,
+			tenant_id = excluded.tenant_id,
+			name = excluded.name,
+			addr = excluded.addr,
+			backend = excluded.backend,
+			software_json = excluded.software_json,
+			last_seen = excluded.last_seen,
+			connected = excluded.connected,
+			disabled = excluded.disabled,
+			trace_enabled = excluded.trace_enabled,
+			debug_enabled = excluded.debug_enabled,
+			updated_at = excluded.updated_at`,
+		worker.id, worker.instanceID, worker.tenantID, worker.name, worker.addr, worker.backend, softwareJSON, formatTime(worker.lastSeen),
+		boolToInt(worker.connected), boolToInt(worker.disabled), boolToInt(worker.traceEnabled), boolToInt(worker.debugEnabled), formatTime(now),
+	)
+	return err
+}
+
+func (s *sqliteAuthStore) DeleteWorker(workerID string) error {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(`DELETE FROM update_events WHERE worker_id = ?`, workerID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM update_jobs WHERE worker_id = ?`, workerID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM workers WHERE worker_id = ?`, workerID)
+	return err
+}
+
+func (s *sqliteAuthStore) DeleteTenantRuntime(tenantID string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(`DELETE FROM update_events WHERE tenant_id = ?`, tenantID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM update_jobs WHERE tenant_id = ?`, tenantID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM workers WHERE tenant_id = ?`, tenantID)
+	return err
+}
+
+func (s *sqliteAuthStore) LoadUpdateJobs() ([]workerUpdateJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT id, tenant_id, worker_id, worker_instance_id, target_version, repo, status, message, allow_disruptive_restart, created_at, updated_at, finished_at FROM update_jobs ORDER BY updated_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	jobs := []workerUpdateJob{}
+	for rows.Next() {
+		var job workerUpdateJob
+		var createdAt, updatedAt, finishedAt string
+		var allowDisruptiveRestart int
+		if err := rows.Scan(
+			&job.ID, &job.TenantID, &job.WorkerID, &job.WorkerInstanceID, &job.TargetVersion, &job.Repo, &job.Status, &job.Message,
+			&allowDisruptiveRestart, &createdAt, &updatedAt, &finishedAt,
+		); err != nil {
+			return nil, err
+		}
+		job.AllowDisruptiveRestart = intToBool(allowDisruptiveRestart)
+		job.CreatedAt = parseStoredTime(createdAt)
+		job.UpdatedAt = parseStoredTime(updatedAt)
+		job.FinishedAt = parseStoredTime(finishedAt)
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range jobs {
+		events, err := s.listUpdateEventsLocked(jobs[index].ID)
+		if err != nil {
+			return nil, err
+		}
+		jobs[index].Events = events
+	}
+	return jobs, nil
+}
+
+func (s *sqliteAuthStore) SaveUpdateJob(job workerUpdateJob) error {
+	if strings.TrimSpace(job.ID) == "" {
+		return nil
+	}
+	if job.CreatedAt.IsZero() {
+		job.CreatedAt = time.Now().UTC()
+	}
+	if job.UpdatedAt.IsZero() {
+		job.UpdatedAt = job.CreatedAt
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO update_jobs(id, tenant_id, worker_id, worker_instance_id, target_version, repo, status, message, allow_disruptive_restart, created_at, updated_at, finished_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+			tenant_id = excluded.tenant_id,
+			worker_id = excluded.worker_id,
+			worker_instance_id = excluded.worker_instance_id,
+			target_version = excluded.target_version,
+			repo = excluded.repo,
+			status = excluded.status,
+			message = excluded.message,
+			allow_disruptive_restart = excluded.allow_disruptive_restart,
+			updated_at = excluded.updated_at,
+			finished_at = excluded.finished_at`,
+		job.ID, job.TenantID, job.WorkerID, job.WorkerInstanceID, job.TargetVersion, job.Repo, job.Status, job.Message,
+		boolToInt(job.AllowDisruptiveRestart), formatTime(job.CreatedAt), formatTime(job.UpdatedAt), formatTime(job.FinishedAt),
+	)
+	return err
+}
+
+func (s *sqliteAuthStore) AppendUpdateEvent(event workerUpdateEvent) error {
+	if strings.TrimSpace(event.ID) == "" || strings.TrimSpace(event.JobID) == "" {
+		return nil
+	}
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO update_events(id, job_id, tenant_id, worker_id, worker_instance_id, status, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.JobID, event.TenantID, event.WorkerID, event.WorkerInstanceID, event.Status, event.Message, formatTime(event.CreatedAt),
+	)
+	return err
+}
+
+func (s *sqliteAuthStore) ListUpdateEvents(jobID string) ([]workerUpdateEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listUpdateEventsLocked(jobID)
+}
+
+func (s *sqliteAuthStore) listUpdateEventsLocked(jobID string) ([]workerUpdateEvent, error) {
+	rows, err := s.db.Query(
+		`SELECT id, job_id, tenant_id, worker_id, worker_instance_id, status, message, created_at FROM update_events WHERE job_id = ? ORDER BY created_at ASC`,
+		jobID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := []workerUpdateEvent{}
+	for rows.Next() {
+		var event workerUpdateEvent
+		var createdAt string
+		if err := rows.Scan(&event.ID, &event.JobID, &event.TenantID, &event.WorkerID, &event.WorkerInstanceID, &event.Status, &event.Message, &createdAt); err != nil {
+			return nil, err
+		}
+		event.CreatedAt = parseStoredTime(createdAt)
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func (s *sqliteAuthStore) migrate() error {
@@ -117,6 +340,50 @@ func (s *sqliteAuthStore) migrate() error {
 			last_poll_at TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_auth_user_code ON device_auth_sessions(user_code_hash)`,
+		`CREATE TABLE IF NOT EXISTS workers (
+			worker_id TEXT PRIMARY KEY,
+			worker_instance_id TEXT NOT NULL DEFAULT '',
+			tenant_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			addr TEXT NOT NULL,
+			backend TEXT NOT NULL,
+			software_json TEXT NOT NULL,
+			last_seen TEXT NOT NULL,
+			connected INTEGER NOT NULL DEFAULT 0,
+			disabled INTEGER NOT NULL DEFAULT 0,
+			trace_enabled INTEGER NOT NULL DEFAULT 0,
+			debug_enabled INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_workers_tenant ON workers(tenant_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_workers_instance ON workers(worker_instance_id)`,
+		`CREATE TABLE IF NOT EXISTS update_jobs (
+			id TEXT PRIMARY KEY,
+			tenant_id TEXT NOT NULL,
+			worker_id TEXT NOT NULL,
+			worker_instance_id TEXT NOT NULL DEFAULT '',
+			target_version TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			status TEXT NOT NULL,
+			message TEXT NOT NULL,
+			allow_disruptive_restart INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			finished_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_update_jobs_worker ON update_jobs(worker_id, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_update_jobs_tenant ON update_jobs(tenant_id, updated_at)`,
+		`CREATE TABLE IF NOT EXISTS update_events (
+			id TEXT PRIMARY KEY,
+			job_id TEXT NOT NULL,
+			tenant_id TEXT NOT NULL,
+			worker_id TEXT NOT NULL,
+			worker_instance_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			message TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_update_events_job ON update_events(job_id, created_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
@@ -129,6 +396,9 @@ func (s *sqliteAuthStore) migrate() error {
 		`ALTER TABLE device_auth_sessions ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE device_auth_sessions ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE device_auth_sessions ADD COLUMN last_poll_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE workers ADD COLUMN worker_instance_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE update_jobs ADD COLUMN worker_instance_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE update_events ADD COLUMN worker_instance_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(statement); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return err
@@ -260,11 +530,28 @@ func (s *sqliteAuthStore) Exchange(req exchangeRequest) (exchangedCredential, er
 	if err := s.insertCredential(entry); err != nil {
 		return exchangedCredential{}, err
 	}
-	return exchangedCredential{
+	result := exchangedCredential{
 		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
 		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
 		Scopes: append([]string(nil), entry.Scopes...),
-	}, nil
+	}
+	if role == "worker" {
+		refreshToken, err := randomToken("amx_ref_")
+		if err != nil {
+			return exchangedCredential{}, err
+		}
+		refresh := refreshTokenEntry{
+			Hash: tokenHash(refreshToken), ID: "ref_" + randomID(), TenantID: entry.TenantID,
+			Role: role, DeviceID: entry.DeviceID, DeviceName: entry.Name,
+			Status: "active", ExpiresAt: now.Add(defaultRefreshTokenTTL), CreatedAt: now,
+		}
+		if err := s.insertRefresh(refresh); err != nil {
+			return exchangedCredential{}, err
+		}
+		result.RefreshToken = refreshToken
+		result.RefreshExpiresAt = refresh.ExpiresAt
+	}
+	return result, nil
 }
 
 func (s *sqliteAuthStore) Register(req registerRequest) (authCredentialResponse, error) {
@@ -345,15 +632,18 @@ func (s *sqliteAuthStore) Refresh(req refreshRequest) (authCredentialResponse, e
 	if !ok || now.After(refresh.ExpiresAt) || refresh.Status != "active" {
 		return authCredentialResponse{}, fmt.Errorf("invalid or expired refresh token")
 	}
+	if _, err := s.db.Exec(`DELETE FROM refresh_tokens WHERE hash = ?`, refresh.Hash); err != nil {
+		return authCredentialResponse{}, err
+	}
+	if refresh.Role == "worker" {
+		return s.issueWorkerCredentialLocked(refresh.TenantID, refresh.DeviceID, refresh.DeviceName, now)
+	}
 	user, ok, err := s.userByEmail(refresh.UserEmail)
 	if err != nil {
 		return authCredentialResponse{}, err
 	}
 	if !ok {
 		return authCredentialResponse{}, fmt.Errorf("refresh user is missing")
-	}
-	if _, err := s.db.Exec(`DELETE FROM refresh_tokens WHERE hash = ?`, refresh.Hash); err != nil {
-		return authCredentialResponse{}, err
 	}
 	return s.issueControlCredentialLocked(user, refresh.DeviceID, refresh.DeviceName, now)
 }
@@ -591,6 +881,27 @@ func (s *sqliteAuthStore) Credential(token string) (credentialEntry, bool) {
 	return entry, true
 }
 
+func (s *sqliteAuthStore) HasActiveControlCredential(tenantID string, now time.Time) bool {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(now); err != nil {
+		return false
+	}
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM credentials WHERE tenant_id = ? AND role = ? AND expires_at > ?`,
+		tenantID, "control", formatTime(now),
+	).Scan(&count)
+	return err == nil && count > 0
+}
+
 func (s *sqliteAuthStore) issueControlCredentialLocked(user userEntry, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
 	credential, err := randomToken("amx_cred_")
 	if err != nil {
@@ -627,6 +938,44 @@ func (s *sqliteAuthStore) issueControlCredentialLocked(user userEntry, deviceID,
 		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
 		RefreshExpiresAt: refresh.ExpiresAt,
 		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+	}, nil
+}
+
+func (s *sqliteAuthStore) issueWorkerCredentialLocked(tenantID, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
+	credential, err := randomToken("amx_cred_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	refreshToken, err := randomToken("amx_ref_")
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		deviceID = "dev_" + randomID()
+	}
+	deviceName = strings.TrimSpace(deviceName)
+	entry := credentialEntry{
+		Hash: tokenHash(credential), ID: "cred_" + randomID(), TenantID: tenantID,
+		Role: "worker", DeviceID: deviceID, Name: deviceName,
+		Scopes: credentialScopes("worker"), ExpiresAt: now.Add(defaultCredentialTTL), CreatedAt: now,
+	}
+	if err := s.insertCredential(entry); err != nil {
+		return authCredentialResponse{}, err
+	}
+	refresh := refreshTokenEntry{
+		Hash: tokenHash(refreshToken), ID: "ref_" + randomID(), TenantID: tenantID,
+		Role: "worker", DeviceID: deviceID, DeviceName: deviceName,
+		Status: "active", ExpiresAt: now.Add(defaultRefreshTokenTTL), CreatedAt: now,
+	}
+	if err := s.insertRefresh(refresh); err != nil {
+		return authCredentialResponse{}, err
+	}
+	return authCredentialResponse{
+		Credential: credential, CredentialID: entry.ID, TenantID: entry.TenantID,
+		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
+		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
+		RefreshExpiresAt: refresh.ExpiresAt,
 	}, nil
 }
 
@@ -801,4 +1150,28 @@ func parseStoredTime(value string) time.Time {
 		return time.Time{}
 	}
 	return parsed
+}
+
+func marshalWorkerSoftware(software protocol.WorkerSoftware) (string, error) {
+	raw, err := json.Marshal(software)
+	return string(raw), err
+}
+
+func unmarshalWorkerSoftware(value string) protocol.WorkerSoftware {
+	var software protocol.WorkerSoftware
+	if err := json.Unmarshal([]byte(value), &software); err != nil {
+		return protocol.WorkerSoftware{}
+	}
+	return software
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func intToBool(value int) bool {
+	return value != 0
 }

@@ -21,6 +21,20 @@ func TestSaveWorkerBackend(t *testing.T) {
 	}
 }
 
+func TestSaveWorkerTerminalState(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := SaveWorkerTerminalState("state", 132, 40); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkerTerminalMode != "state" || cfg.WorkerStateCols != 132 || cfg.WorkerStateRows != 40 {
+		t.Fatalf("unexpected worker terminal state config: %+v", cfg)
+	}
+}
+
 func TestSaveWorkerAuth(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	if err := SaveWorkerAuth("wss://hub.example/ws", "amx_cred_test", "worker-1", "Worker One"); err != nil {
@@ -42,6 +56,34 @@ func TestSaveWorkerAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), "worker_token") || strings.Contains(string(raw), "amx_cred_test") {
+		t.Fatalf("config should not persist credentials: %s", raw)
+	}
+}
+
+func TestSaveControlHubURL(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := Save(Config{WorkerToken: "amx_should_not_persist"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveControlHubURL(" https://hub.example.com/path/ "); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ControlHubURL != "https://hub.example.com/path/" {
+		t.Fatalf("unexpected control hub: %q", cfg.ControlHubURL)
+	}
+	path, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "worker_token") || strings.Contains(string(raw), "amx_should_not_persist") {
 		t.Fatalf("config should not persist credentials: %s", raw)
 	}
 }

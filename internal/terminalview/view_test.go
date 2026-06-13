@@ -39,6 +39,59 @@ func TestViewPreservesSGR(t *testing.T) {
 	}
 }
 
+func TestViewCellsReflectScreenState(t *testing.T) {
+	view := New(8, 2)
+	view.Write([]byte("hello\rHE"))
+	snapshot := view.Cells()
+	if snapshot.Cols != 8 || snapshot.Rows != 2 {
+		t.Fatalf("unexpected snapshot size: %+v", snapshot)
+	}
+	if got := snapshot.Lines[0][0].Text + snapshot.Lines[0][1].Text + snapshot.Lines[0][2].Text; got != "HEl" {
+		t.Fatalf("unexpected cells after carriage return overwrite: %q", got)
+	}
+	if !snapshot.Cursor.Visible {
+		t.Fatalf("expected visible cursor")
+	}
+}
+
+func TestViewCellsPreserveSGRColors(t *testing.T) {
+	view := New(12, 2)
+	view.Write([]byte("\x1b[31mR\x1b[0m \x1b[48;5;33mB\x1b[0m \x1b[38;2;1;2;3mT"))
+
+	snapshot := view.Cells()
+	if got := snapshot.Lines[0][0].Fg; got != "ansi:1" {
+		t.Fatalf("expected basic red fg, got %q", got)
+	}
+	if got := snapshot.Lines[0][2].Bg; got != "ansi:33" {
+		t.Fatalf("expected indexed blue bg, got %q", got)
+	}
+	if got := snapshot.Lines[0][4].Fg; got != "#010203" {
+		t.Fatalf("expected truecolor fg, got %q", got)
+	}
+	if got := snapshot.Lines[0][1].Fg; got != "" {
+		t.Fatalf("expected reset cell without fg, got %q", got)
+	}
+}
+
+func TestSnapshotANSIRestoresScreenWithStyle(t *testing.T) {
+	view := New(12, 2)
+	view.Write([]byte("\x1b[31mR\x1b[0m \x1b[48;5;33mB\x1b[0m \x1b[38;2;1;2;3mT"))
+	got := view.ANSI()
+
+	for _, want := range []string{
+		"\x1b[0m\x1b[2J",
+		"\x1b[1;1H",
+		"\x1b[0;31mR",
+		"\x1b[0;48;5;33mB",
+		"\x1b[0;38;2;1;2;3mT",
+		"\x1b[?25h",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected ANSI snapshot to contain %q, got %q", want, got)
+		}
+	}
+}
+
 func TestViewWriteDoesNotBlockOnTerminalReports(t *testing.T) {
 	view := New(20, 3)
 	done := make(chan struct{})

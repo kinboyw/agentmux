@@ -58,7 +58,9 @@ Worker is an outbound connector.
 - Maintains a long-lived device identity after enrollment.
 - Reports local terminal sessions.
 - Creates, attaches, resizes, and stops tmux-backed or built-in PTY agent sessions.
-- Never requires inbound ports in the default relay mode.
+- Keeps an outbound Hub control channel for enrollment, signaling, policy, and
+  revocation. Terminal streams should prefer direct P2P transport and fall back
+  to Hub relay when direct negotiation is unavailable or fails.
 
 ### Control
 
@@ -143,6 +145,10 @@ Properties:
 - Worker signal and Direct Token are tenant-scoped.
 - No durable account ownership.
 - Good for local demos, trusted personal machines, and quick trials.
+- When the anonymous Control Direct Token expires, Hub treats the anonymous
+  tenant as expired. Any anonymous Workers still registered under that tenant
+  are evicted from Hub state, and live Worker/Control WebSocket connections are
+  interrupted so abandoned shares do not keep accumulating runtime resources.
 
 Signal shape:
 
@@ -182,6 +188,23 @@ The matching TUI path is:
 agentmux-tui --hub https://hub.example.com --token 'amx_cred_xxx'
 ```
 
+Anonymous cleanup rule:
+
+```text
+if tenant_id starts with "anon_"
+and there is no active control credential for that tenant
+then interrupt tenant runtime:
+  - close live Worker connections
+  - close live Control connections
+  - remove Worker registry records
+  - remove Worker update jobs/events for that tenant
+```
+
+This intentionally keys lifecycle to the Control share, not to the Worker
+connection. If the Direct Token or share URL is lost, the anonymous Worker is no
+longer recoverable by that Control path and should be removed automatically
+after expiry. Registered tenants are not subject to this cleanup rule.
+
 ### Registered Flow
 
 Registered users get the full management surface and stronger controls.
@@ -189,6 +212,7 @@ Registered users get the full management surface and stronger controls.
 Capabilities:
 
 - persistent workers
+- stable Worker installation identity through `worker_instance_id`
 - multiple controls
 - Web Control workspaces
 - access policies
@@ -218,6 +242,125 @@ GET  /api/auth/oauth/{github|google}
 
 Register/login issue control credentials for the user's tenant. OAuth routes are
 kept as stable frontend integration points before provider configuration lands.
+
+## Control-Worker P2P Direction
+
+Direct Control-Worker transport should be the preferred data path. Hub relay is
+the compatibility fallback for NAT, Cloudflare Tunnel, corporate networks,
+mobile browsers, or any failed direct negotiation. This keeps terminal bytes off
+the Hub whenever possible without weakening Hub ownership or cleanup semantics.
+
+Target shape:
+
+```text
+Control -> Hub: authenticate and request session attach
+Worker  -> Hub: authenticate and advertise P2P capability
+Hub     -> both: issue short-lived attach grant and connection hints
+Control <-> Worker: direct encrypted terminal stream when negotiation succeeds
+Hub     -> both: interrupt/revoke when policy, tenant expiry, or eviction changes
+Control -> Hub -> Worker: relay terminal stream when direct negotiation fails
+```
+
+Design constraints:
+
+- Hub remains the source of truth for tenant identity, Worker membership,
+  session discovery, and policy. P2P is the preferred data plane, not an
+  ownership model.
+- Control should attempt P2P first for every attach when both endpoints advertise
+  compatible direct-mode capabilities. Relay should be selected only when direct
+  mode is disabled, unsupported, explicitly forced, or negotiation fails within a
+  short timeout.
+- Every P2P attach must be backed by a short-lived Hub-issued grant containing
+  tenant ID, worker ID, session ID, stream ID, expiry, and allowed terminal
+  operations.
+- Worker must keep a Hub control channel open even while terminal bytes flow
+  P2P. Hub uses that channel to interrupt streams, revoke grants, evict
+  anonymous Workers, and force fallback to relay.
+- Anonymous tenant expiry must interrupt both relay and P2P streams. The same
+  cleanup rule used for Direct Token expiry applies: no active anonymous
+  Control credential means no valid anonymous Worker runtime.
+- If P2P negotiation fails, Control falls back to Hub relay without changing
+  the session model.
+- Direct Token mode remains limited even over P2P: session list, session
+  switching, and terminal attach only. It still cannot create sessions, manage
+  Workers, inspect previews, or trigger updates.
+- P2P implementation should prefer WebRTC DataChannel for browsers and a
+  compatible native transport for TUI. Any TURN/STUN configuration should be
+  optional and exposed by Hub as connection hints.
+- Direct-mode encryption should bind the Hub-issued grant to the negotiated
+  peer identity or fingerprint. WebRTC DTLS is the baseline; a later
+  application-level Noise or HPKE envelope can provide additional
+  end-to-end-proof against compromised signaling infrastructure.
+
+Control connection state:
+
+```text
+idle
+authenticating
+requesting_attach_grant
+probing_direct_capability
+negotiating_direct
+direct_connected
+direct_failed
+falling_back_to_relay
+relay_connected
+interrupted
+closed
+```
+
+Control UX requirements:
+
+- Show the current transport mode per pane: `direct`, `relay`, `negotiating`,
+  `fallback`, or `interrupted`.
+- Show the last direct negotiation failure in a compact diagnostic surface, for
+  example `ice_timeout`, `grant_expired`, `worker_unsupported`,
+  `control_unsupported`, `fingerprint_mismatch`, `datachannel_closed`, or
+  `policy_revoked`.
+- Do not block terminal attach on perfect direct connectivity. After the direct
+  timeout, attach through relay and keep the user in the same session.
+- Keep the negotiated transport mode and fallback reason outside the terminal
+  buffer so it does not pollute the agent session.
+- Expose a debug view with stream ID, grant ID, worker ID, ICE state, selected
+  candidate pair if available, relay fallback reason, reconnect count, and last
+  interrupt reason.
+
+Logging requirements:
+
+- Hub, Worker, and Control logs must include `tenant_id`, `worker_id`,
+  `control_id`, `session_id`, `stream_id`, `grant_id`, `transport_mode`, and
+  `attempt` whenever available.
+- Hub should log attach grant issuance, direct capability exchange, signaling
+  relay, policy interruption, and relay fallback authorization.
+- Worker should log direct grant validation, peer fingerprint checks, data
+  channel open/close, terminal stream binding, and Hub interrupt handling.
+- Control should log every state transition in the connection state machine,
+  direct negotiation timing, selected transport, fallback reason, and user-
+  visible error message.
+- Logs should be structured and correlation-friendly. A single attach attempt
+  must be traceable across Control, Hub, and Worker by `stream_id` and
+  `grant_id`.
+
+Interrupt semantics:
+
+```text
+Hub interrupt reasons:
+  - anonymous tenant expired
+  - Worker evicted or disabled
+  - Control credential expired or revoked
+  - Worker credential expired before reconnect
+  - tenant policy changed
+  - duplicate Worker instance conflict
+
+Required effect:
+  - relay stream: close Hub WebSocket subscription and Worker stream
+  - P2P stream: revoke attach grant and send interrupt over Hub control channel
+  - Worker: close local stream binding, keep underlying tmux/PTY session alive
+    unless the command explicitly requested stop/kill
+```
+
+The important product invariant is that losing a Direct Token should not create
+an immortal anonymous Worker. Hub must always have a way to revoke or interrupt
+both relay and direct P2P paths.
 
 ### Signal Exchange
 
@@ -283,12 +426,12 @@ reuse the same signal by changing only `--name`. If a Worker was accidentally
 joined to the wrong Hub, run `agentmux worker leave` before joining again.
 
 The `/install.sh` endpoint is intentionally conservative: it uses an existing
-`agentmux` binary from `PATH`, builds from source when run inside a checkout, or
+role binary from `PATH`, builds from source when run inside a checkout, or
 downloads the matching role-specific Linux/macOS release archive from GitHub.
-Release assets are split by role so Hub can ship as a smaller cross-platform
-binary; Windows support starts with `agentmux-hub-windows-amd64.tar.gz` while
-Worker and terminal Control remain Linux/macOS until the Windows PTY/service
-model is implemented.
+Control installs a real `agentmux-tui` binary. Release assets are split by role
+so Hub can ship as a smaller cross-platform binary; Windows support starts with
+`agentmux-hub-windows-amd64.tar.gz` while Worker and terminal Control remain
+Linux/macOS until the Windows PTY/service model is implemented.
 
 ## Update Model
 
@@ -353,22 +496,70 @@ user_id = usr_<id>
 ```
 
 The immediate implementation stores anonymous and registered tenant identity in
-memory or SQLite. Worker connectivity and terminal streams remain runtime state.
+memory or SQLite. SQLite-backed Hubs also persist Worker registry records,
+software inventory, and Worker update job/event history. Live Worker
+connections, active terminal streams, and session snapshots remain runtime state
+and are rebuilt as Workers reconnect.
+
+Worker identity uses two layers:
+
+- `worker_id` is the user-facing route key. Session IDs are still
+  `<worker_id>/<session_name>`.
+- `worker_instance_id` is generated once on the Worker install and survives
+  display-name or route-key changes. It is used for audit/update correlation and
+  future rename-safe migrations.
 
 ## TODO
 
-- Persist tenant records, workers, layouts, revocations, and audit events in
-  SQLite.
+- Persist workspace layouts, revocations, and broader audit events in SQLite.
 - Add credential revocation and expiry cleanup.
 - Add worker policy: allowed commands, allowed working directories, max sessions.
 - Add session ownership/audit events.
-- Add direct-mode signaling after relay mode is stable.
+- Add direct-first signaling, encrypted P2P transport, relay fallback, Control
+  transport-state UI, and correlation-friendly direct-mode logs.
 
 ## Routing Modes
 
+### Direct Mode
+
+Preferred mode.
+
+```text
+worker <-> control
+hub = signaling + auth + rendezvous + revocation
+```
+
+Pros:
+
+- keeps terminal bytes off Hub when possible
+- lower latency and bandwidth cost
+- preserves Hub as the source of auth, policy, and revocation
+
+Cons:
+
+- NAT traversal can fail
+- requires more visible connection-state handling in Control
+- needs careful key/fingerprint binding and diagnostic logging
+
+Candidates:
+
+- WebRTC data channel
+- same-LAN direct WebSocket
+- WireGuard/Tailscale-like private addresses
+- QUIC hole punching if needed later
+
+Hub responsibilities in direct mode:
+
+- authenticate both sides
+- issue short-lived attach grants
+- exchange endpoint candidates
+- authorize session access
+- interrupt or revoke active direct streams
+- authorize relay fallback when direct negotiation fails
+
 ### Relay Mode
 
-Default mode.
+Fallback mode.
 
 ```text
 worker -> hub <- control
@@ -376,8 +567,8 @@ worker -> hub <- control
 
 Pros:
 
-- works behind NAT
-- simplest user experience
+- works when direct negotiation fails
+- simplest connectivity path
 - one public endpoint
 
 Cons:
@@ -385,30 +576,8 @@ Cons:
 - hub bandwidth and latency bottleneck
 - terminal bytes pass through hub
 
-### Direct Mode
-
-Future optimization.
-
-```text
-worker <-> control
-hub = signaling + auth + rendezvous
-```
-
-Candidates:
-
-- same-LAN direct WebSocket
-- WireGuard/Tailscale-like private addresses
-- WebRTC data channel
-- QUIC hole punching if needed later
-
-Hub responsibilities in direct mode:
-
-- authenticate both sides
-- exchange endpoint candidates
-- authorize session access
-- fall back to relay mode
-
-Direct mode should be optional. Relay mode remains the reliable default.
+Relay mode should be automatic and boring: Control reports that it is falling
+back, records the reason, and keeps the terminal usable.
 
 ![AgentMux relay versus direct mode](assets/visuals/agentmux-7-relay-vs-direct-mode-v1.png)
 
@@ -430,6 +599,20 @@ Benefits:
 - tabs and split panes
 - multi-control fanout
 - eventual replay/session history
+
+The target render mode is `worker_state_xterm`:
+
+```text
+Worker keeps canonical terminal state.
+Control coordinates attach, resize, history paging, and bottom alignment.
+xterm.js remains the final visible renderer for the live terminal.
+```
+
+This mode is mutually exclusive with `live_attach_xterm`. Worker-state mode
+should send current ANSI snapshots and live xterm-compatible updates, while lazy
+history pages are rendered on demand outside xterm scrollback. `cells-v1` and
+row diffs are diagnostic/validation tools unless explicitly requested; they
+should not run in parallel with the production xterm path by default.
 
 The Go CLI should remain a debug tool. The product-grade control should be web.
 

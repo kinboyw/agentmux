@@ -37,15 +37,20 @@ type App struct {
 	streams    map[string]*appSessionStream
 	buffers    map[string]string
 	targets    map[string][]protocol.TerminalTarget
+	targetOpen map[string]bool
+	targetCaps map[string]string
+	targetBusy map[string]bool
 	active     string
 	fullscreen bool
 	events     chan appStreamEvent
+	capEvents  chan appTargetPreviewEvent
 	splitWidth int
 	dragSplit  bool
 	mobileView appMobileView
 	targetFor  string
 	targetSel  int
 	direct     bool
+	loginURL   string
 
 	rawRestore func()
 	keys       appKeyReader
@@ -114,6 +119,13 @@ type appStreamWrite struct {
 	resize bool
 }
 
+type appTargetPreviewEvent struct {
+	sessionID string
+	key       string
+	data      string
+	err       error
+}
+
 type appInputEvent struct {
 	key   string
 	mouse *appMouseEvent
@@ -146,18 +158,56 @@ const (
 	appMobileTerminal
 )
 
+type appMobileTargetNodeKind int
+
+const (
+	appMobileTargetSession appMobileTargetNodeKind = iota
+	appMobileTargetWindow
+	appMobileTargetPane
+)
+
+type appMobileTargetNode struct {
+	kind         appMobileTargetNodeKind
+	sessionID    string
+	windowKey    string
+	windowIndex  int
+	windowName   string
+	windowActive bool
+	paneCount    int
+	paneTotal    int
+	target       protocol.TerminalTarget
+	preview      protocol.TerminalTarget
+	hasPreview   bool
+	open         bool
+	depth        int
+}
+
+type appTargetWindowGroup struct {
+	key        string
+	index      int
+	name       string
+	active     bool
+	targets    []protocol.TerminalTarget
+	preview    protocol.TerminalTarget
+	hasPreview bool
+}
+
 func NewApp(client Client, auth AppAuthResult, in *os.File, out io.Writer) *App {
 	return &App{
-		Client:   client,
-		Auth:     auth,
-		In:       in,
-		Out:      out,
-		loggedIn: client.HubURL != "" && client.Token != "",
-		previews: map[string]string{},
-		buffers:  map[string]string{},
-		targets:  map[string][]protocol.TerminalTarget{},
-		streams:  map[string]*appSessionStream{},
-		events:   make(chan appStreamEvent, 128),
+		Client:     client,
+		Auth:       auth,
+		In:         in,
+		Out:        out,
+		loggedIn:   client.HubURL != "" && client.Token != "",
+		previews:   map[string]string{},
+		buffers:    map[string]string{},
+		targets:    map[string][]protocol.TerminalTarget{},
+		targetOpen: map[string]bool{},
+		targetCaps: map[string]string{},
+		targetBusy: map[string]bool{},
+		streams:    map[string]*appSessionStream{},
+		events:     make(chan appStreamEvent, 128),
+		capEvents:  make(chan appTargetPreviewEvent, 128),
 	}
 }
 
@@ -220,6 +270,7 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		}
 		changed = a.drainStreamEvents(16) || changed
+		changed = a.drainTargetPreviewEvents(16) || changed
 		changed = a.processPendingStreamOutput(appStreamProcessBytesPerLoop) || changed
 		changed = a.flushDueStreamResizes(time.Now()) || changed
 		changed = a.finishResizeSettles(time.Now()) || changed
@@ -296,10 +347,6 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 	case "r":
 		a.refresh(ctx)
 	case "c":
-		if a.direct {
-			a.status = "direct token cannot create sessions"
-			return false
-		}
 		a.promptCreate(ctx)
 	case "s":
 		if a.direct {
@@ -344,7 +391,7 @@ func (a *App) handleKey(ctx context.Context, key string) bool {
 }
 
 func (a *App) handleMobileTargetsKey(ctx context.Context, key string) bool {
-	targets := a.targets[a.targetFor]
+	nodes := a.mobileTargetNodes()
 	switch key {
 	case "q":
 		a.closeAllStreams()
@@ -354,10 +401,15 @@ func (a *App) handleMobileTargetsKey(ctx context.Context, key string) bool {
 			a.targetSel--
 		}
 	case "down", "j":
-		if a.targetSel < len(targets)-1 {
+		if a.targetSel < len(nodes)-1 {
 			a.targetSel++
 		}
-	case "left", "h", "b", "unknown":
+	case "left", "h":
+		if !a.closeSelectedMobileTargetNode() {
+			a.mobileView = appMobileSessions
+			a.status = "sessions"
+		}
+	case "b", "unknown":
 		a.mobileView = appMobileSessions
 		a.status = "sessions"
 	case "r":
@@ -365,13 +417,15 @@ func (a *App) handleMobileTargetsKey(ctx context.Context, key string) bool {
 			a.err = err
 			a.status = "targets failed"
 		}
+	case "right", "l", "o":
+		a.openSelectedMobileTargetNode(ctx)
 	case "enter", "a":
-		if err := a.attachMobileTarget(ctx); err != nil {
+		if err := a.activateMobileTargetNode(ctx); err != nil {
 			a.err = err
 			a.status = "attach failed"
 		}
 	case "?":
-		a.status = "keys: up/down select pane, enter attach, left/Esc back, r refresh, q quit"
+		a.status = "keys: o open/collapse  enter/a attach pane  h/left back  r refresh  q quit"
 	}
 	return false
 }
@@ -459,11 +513,14 @@ func (a *App) handleMobileMouse(ctx context.Context, event appMouseEvent, cols, 
 	index := event.y - 3
 	switch a.mobileView {
 	case appMobileTargets:
-		targets := a.targets[a.targetFor]
-		start := scrollStart(a.targetSel, limit, len(targets))
-		targetIndex := start + index
-		if targetIndex >= 0 && targetIndex < len(targets) {
-			a.targetSel = targetIndex
+		nodes := a.mobileTargetNodes()
+		start := scrollStart(a.targetSel, limit, len(nodes))
+		nodeIndex := start + index
+		if nodeIndex >= 0 && nodeIndex < len(nodes) {
+			a.targetSel = nodeIndex
+			if nodes[nodeIndex].kind != appMobileTargetPane {
+				a.toggleMobileTargetNode(ctx, nodes[nodeIndex])
+			}
 			return true
 		}
 	default:
@@ -584,21 +641,22 @@ func (a *App) refreshPreviewCache(ctx context.Context) {
 	for i := 0; i < workers; i++ {
 		go func() {
 			for session := range jobs {
-				if session.ID == "" {
+				sessionID := canonicalSessionID(session)
+				if sessionID == "" {
 					continue
 				}
-				data, err := a.Client.SessionPreview(ctx, session.ID, previewLines)
+				data, err := a.Client.SessionPreview(ctx, sessionID, previewLines)
 				if err != nil {
-					results <- result{id: session.ID}
+					results <- result{id: sessionID}
 					continue
 				}
-				results <- result{id: session.ID, data: data}
+				results <- result{id: sessionID, data: data}
 			}
 		}()
 	}
 	sent := 0
 	for _, session := range a.sessions {
-		if session.ID == "" {
+		if canonicalSessionID(session) == "" {
 			continue
 		}
 		jobs <- session
@@ -624,19 +682,20 @@ func (a *App) previewCaptureLines() int {
 
 func (a *App) loadSelectedPreview() {
 	session := a.selectedSession()
-	if session.ID == "" {
+	sessionID := canonicalSessionID(session)
+	if sessionID == "" {
 		a.preview = ""
 		return
 	}
-	if stream := a.streams[session.ID]; stream != nil && stream.warming {
-		a.preview = a.previews[session.ID]
+	if stream := a.streams[sessionID]; stream != nil && stream.warming {
+		a.preview = a.previews[sessionID]
 		return
 	}
-	if a.buffers != nil && a.buffers[session.ID] != "" {
-		a.preview = a.buffers[session.ID]
+	if a.buffers != nil && a.buffers[sessionID] != "" {
+		a.preview = a.buffers[sessionID]
 		return
 	}
-	a.preview = a.previews[session.ID]
+	a.preview = a.previews[sessionID]
 }
 
 func (a *App) ensureAppState() {
@@ -649,11 +708,23 @@ func (a *App) ensureAppState() {
 	if a.targets == nil {
 		a.targets = map[string][]protocol.TerminalTarget{}
 	}
+	if a.targetOpen == nil {
+		a.targetOpen = map[string]bool{}
+	}
+	if a.targetCaps == nil {
+		a.targetCaps = map[string]string{}
+	}
+	if a.targetBusy == nil {
+		a.targetBusy = map[string]bool{}
+	}
 	if a.streams == nil {
 		a.streams = map[string]*appSessionStream{}
 	}
 	if a.events == nil {
 		a.events = make(chan appStreamEvent, 128)
+	}
+	if a.capEvents == nil {
+		a.capEvents = make(chan appTargetPreviewEvent, 128)
 	}
 }
 
@@ -661,7 +732,9 @@ func (a *App) closeMissingSessionStreams() {
 	a.ensureAppState()
 	current := map[string]bool{}
 	for _, session := range a.sessions {
-		current[session.ID] = true
+		if sessionID := canonicalSessionID(session); sessionID != "" {
+			current[sessionID] = true
+		}
 	}
 	for sessionID, stream := range a.streams {
 		baseSessionID := appBaseSessionID(sessionID)
@@ -681,10 +754,6 @@ func (a *App) closeMissingSessionStreams() {
 
 func (a *App) promptCreate(ctx context.Context) {
 	if !a.ensureLoggedIn() {
-		return
-	}
-	if a.direct {
-		a.status = "direct token cannot create sessions"
 		return
 	}
 	a.leaveRawForPrompt()
@@ -718,7 +787,8 @@ func (a *App) promptSend(ctx context.Context) {
 		return
 	}
 	session := a.selectedSession()
-	if session.ID == "" {
+	sessionID := canonicalSessionID(session)
+	if sessionID == "" {
 		a.status = "no session selected"
 		return
 	}
@@ -730,7 +800,7 @@ func (a *App) promptSend(ctx context.Context) {
 		a.status = "send canceled"
 		return
 	}
-	if err := a.Client.SendInput(ctx, session.ID, text+"\n"); err != nil {
+	if err := a.Client.SendInput(ctx, sessionID, text+"\n"); err != nil {
 		a.err = err
 		a.status = "send failed"
 		return
@@ -747,19 +817,20 @@ func (a *App) promptStop(ctx context.Context) {
 		return
 	}
 	session := a.selectedSession()
-	if session.ID == "" {
+	sessionID := canonicalSessionID(session)
+	if sessionID == "" {
 		a.status = "no session selected"
 		return
 	}
 	a.leaveRawForPrompt()
 	defer a.enterRawAfterPrompt()
 	fmt.Fprintln(a.Out)
-	confirm := a.promptLine("stop "+session.ID+"? type yes", "")
+	confirm := a.promptLine("stop "+sessionID+"? type yes", "")
 	if confirm != "yes" {
 		a.status = "stop canceled"
 		return
 	}
-	if err := a.Client.StopSession(ctx, session.ID); err != nil {
+	if err := a.Client.StopSession(ctx, sessionID); err != nil {
 		a.err = err
 		a.status = "stop failed"
 		return
@@ -774,27 +845,28 @@ func (a *App) attach(ctx context.Context) error {
 		return nil
 	}
 	session := a.selectedSession()
-	if session.ID == "" {
+	sessionID := canonicalSessionID(session)
+	if sessionID == "" {
 		a.status = "no session selected"
 		return nil
 	}
 	a.ensureAppState()
 	previousActive := a.active
 	previousFullscreen := a.fullscreen
-	a.active = session.ID
+	a.active = sessionID
 	a.fullscreen = false
-	if err := a.ensureStream(ctx, session.ID); err != nil {
+	if err := a.ensureStream(ctx, sessionID); err != nil {
 		a.active = previousActive
 		a.fullscreen = previousFullscreen
 		return err
 	}
-	if stream := a.streams[session.ID]; stream != nil {
+	if stream := a.streams[sessionID]; stream != nil {
 		stream.keepUntil = time.Time{}
 		a.resizeStreamView(stream)
 	}
-	a.status = attachedPreviewStatus(session.ID)
+	a.status = attachedPreviewStatus(sessionID)
 	a.loadSelectedPreview()
-	a.debugf("attach session=%q", session.ID)
+	a.debugf("attach session=%q", sessionID)
 	return nil
 }
 
@@ -806,11 +878,12 @@ func (a *App) openMobileTargets(ctx context.Context) error {
 		return a.attach(ctx)
 	}
 	session := a.selectedSession()
-	if session.ID == "" {
+	sessionID := canonicalSessionID(session)
+	if sessionID == "" {
 		a.status = "no session selected"
 		return nil
 	}
-	targets, err := a.Client.SessionTargets(ctx, session.ID)
+	targets, err := a.Client.SessionTargets(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -818,22 +891,17 @@ func (a *App) openMobileTargets(ctx context.Context) error {
 		return a.attach(ctx)
 	}
 	a.ensureAppState()
-	a.targets[session.ID] = targets
-	if a.targetFor != session.ID {
+	a.targets[sessionID] = targets
+	if a.targetFor != sessionID {
 		a.targetSel = 0
 	}
-	a.targetFor = session.ID
-	if a.targetSel >= len(targets) {
-		a.targetSel = len(targets) - 1
-	}
-	if a.targetSel < 0 {
-		a.targetSel = 0
-	}
+	a.targetFor = sessionID
 	if len(targets) == 1 && targets[0].PaneID == "" {
-		return a.attachTarget(ctx, session.ID, nil)
+		return a.attachTarget(ctx, sessionID, nil)
 	}
+	a.clampMobileTargetSelection()
 	a.mobileView = appMobileTargets
-	a.status = fmt.Sprintf("%d panes in %s", len(targets), session.ID)
+	a.status = fmt.Sprintf("%d panes in %s", len(targets), sessionID)
 	return nil
 }
 
@@ -841,7 +909,7 @@ func (a *App) attachMobileTarget(ctx context.Context) error {
 	sessionID := a.targetFor
 	if sessionID == "" {
 		session := a.selectedSession()
-		sessionID = session.ID
+		sessionID = canonicalSessionID(session)
 	}
 	if sessionID == "" {
 		a.status = "no session selected"
@@ -859,6 +927,345 @@ func (a *App) attachMobileTarget(ctx context.Context) error {
 	}
 	target := targets[a.targetSel]
 	return a.attachTarget(ctx, sessionID, &target)
+}
+
+func (a *App) activateMobileTargetNode(ctx context.Context) error {
+	nodes := a.mobileTargetNodes()
+	if len(nodes) == 0 {
+		return nil
+	}
+	a.clampMobileTargetSelection()
+	node := nodes[a.targetSel]
+	if node.kind != appMobileTargetPane {
+		a.toggleMobileTargetNode(ctx, node)
+		return nil
+	}
+	target := node.target
+	return a.attachTarget(ctx, node.sessionID, &target)
+}
+
+func (a *App) openSelectedMobileTargetNode(ctx context.Context) {
+	nodes := a.mobileTargetNodes()
+	if len(nodes) == 0 {
+		return
+	}
+	a.clampMobileTargetSelection()
+	node := nodes[a.targetSel]
+	if node.kind == appMobileTargetPane {
+		return
+	}
+	a.ensureAppState()
+	key := node.key()
+	a.targetOpen[key] = !node.open
+	if a.targetOpen[key] {
+		a.loadMobileTargetNodePreviews(ctx, node)
+	}
+	a.clampMobileTargetSelection()
+}
+
+func (a *App) loadMobileTargetNodePreviews(ctx context.Context, node appMobileTargetNode) {
+	switch node.kind {
+	case appMobileTargetSession:
+		for _, group := range mobileTargetWindowGroups(a.targets[node.sessionID]) {
+			a.loadMobileWindowTargetPreviews(ctx, node.sessionID, group.key)
+		}
+	case appMobileTargetWindow:
+		a.loadMobileWindowTargetPreviews(ctx, node.sessionID, node.windowKey)
+	}
+}
+
+func (a *App) closeSelectedMobileTargetNode() bool {
+	nodes := a.mobileTargetNodes()
+	if len(nodes) == 0 {
+		return false
+	}
+	a.clampMobileTargetSelection()
+	node := nodes[a.targetSel]
+	a.ensureAppState()
+	switch node.kind {
+	case appMobileTargetSession, appMobileTargetWindow:
+		if node.open {
+			a.targetOpen[node.key()] = false
+			a.clampMobileTargetSelection()
+			return true
+		}
+	case appMobileTargetPane:
+		parentKey := mobileTargetWindowNodeKey(node.sessionID, mobileTargetWindowKey(node.target))
+		if a.targetOpen[parentKey] {
+			a.targetOpen[parentKey] = false
+			a.selectMobileTargetNodeByKey(parentKey)
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) toggleMobileTargetNode(ctx context.Context, node appMobileTargetNode) {
+	if node.kind == appMobileTargetPane {
+		return
+	}
+	a.ensureAppState()
+	key := node.key()
+	a.targetOpen[key] = !node.open
+	if a.targetOpen[key] {
+		a.loadMobileTargetNodePreviews(ctx, node)
+	}
+	a.clampMobileTargetSelection()
+}
+
+func (a *App) clampMobileTargetSelection() {
+	nodes := a.mobileTargetNodes()
+	if len(nodes) == 0 {
+		a.targetSel = 0
+		return
+	}
+	if a.targetSel < 0 {
+		a.targetSel = 0
+	}
+	if a.targetSel >= len(nodes) {
+		a.targetSel = len(nodes) - 1
+	}
+}
+
+func (a *App) selectMobileTargetNodeByKey(key string) {
+	nodes := a.mobileTargetNodes()
+	for i, node := range nodes {
+		if node.key() == key {
+			a.targetSel = i
+			return
+		}
+	}
+	a.clampMobileTargetSelection()
+}
+
+func (node appMobileTargetNode) key() string {
+	switch node.kind {
+	case appMobileTargetSession:
+		return mobileTargetSessionKey(node.sessionID)
+	case appMobileTargetWindow:
+		return mobileTargetWindowNodeKey(node.sessionID, node.windowKey)
+	case appMobileTargetPane:
+		return mobileTargetPaneNodeKey(node.sessionID, node.target)
+	default:
+		return ""
+	}
+}
+
+func (a *App) mobileTargetNodes() []appMobileTargetNode {
+	a.ensureAppState()
+	sessionID := a.targetFor
+	if sessionID == "" {
+		sessionID = canonicalSessionID(a.selectedSession())
+	}
+	if sessionID == "" {
+		return nil
+	}
+	targets := a.targets[sessionID]
+	groups := mobileTargetWindowGroups(targets)
+	sessionKey := mobileTargetSessionKey(sessionID)
+	sessionOpen := a.targetOpen[sessionKey]
+	nodes := []appMobileTargetNode{{
+		kind:      appMobileTargetSession,
+		sessionID: sessionID,
+		paneCount: len(groups),
+		paneTotal: len(targets),
+		open:      sessionOpen,
+		depth:     0,
+	}}
+	if !sessionOpen {
+		return nodes
+	}
+	for _, group := range groups {
+		windowKey := mobileTargetWindowNodeKey(sessionID, group.key)
+		windowOpen := a.targetOpen[windowKey]
+		nodes = append(nodes, appMobileTargetNode{
+			kind:         appMobileTargetWindow,
+			sessionID:    sessionID,
+			windowKey:    group.key,
+			windowIndex:  group.index,
+			windowName:   group.name,
+			windowActive: group.active,
+			paneCount:    len(group.targets),
+			preview:      group.preview,
+			hasPreview:   group.hasPreview,
+			open:         windowOpen,
+			depth:        1,
+		})
+		if !windowOpen {
+			continue
+		}
+		for _, target := range group.targets {
+			nodes = append(nodes, appMobileTargetNode{
+				kind:      appMobileTargetPane,
+				sessionID: sessionID,
+				windowKey: group.key,
+				target:    target,
+				depth:     2,
+			})
+		}
+	}
+	return nodes
+}
+
+func mobileTargetWindowGroups(targets []protocol.TerminalTarget) []appTargetWindowGroup {
+	groups := []appTargetWindowGroup(nil)
+	byKey := map[string]int{}
+	for _, target := range targets {
+		key := mobileTargetWindowKey(target)
+		index, ok := byKey[key]
+		if !ok {
+			index = len(groups)
+			byKey[key] = index
+			groups = append(groups, appTargetWindowGroup{
+				key:    key,
+				index:  target.WindowIndex,
+				name:   target.WindowName,
+				active: target.WindowActive,
+			})
+		}
+		group := &groups[index]
+		if target.WindowName != "" && group.name == "" {
+			group.name = target.WindowName
+		}
+		if target.WindowActive {
+			group.active = true
+		}
+		group.targets = append(group.targets, target)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].index != groups[j].index {
+			return groups[i].index < groups[j].index
+		}
+		if groups[i].name != groups[j].name {
+			return groups[i].name < groups[j].name
+		}
+		return groups[i].key < groups[j].key
+	})
+	for i := range groups {
+		sort.Slice(groups[i].targets, func(left, right int) bool {
+			a := groups[i].targets[left]
+			b := groups[i].targets[right]
+			if a.PaneIndex != b.PaneIndex {
+				return a.PaneIndex < b.PaneIndex
+			}
+			if a.Top != b.Top {
+				return a.Top < b.Top
+			}
+			if a.Left != b.Left {
+				return a.Left < b.Left
+			}
+			return a.PaneID < b.PaneID
+		})
+		groups[i].preview, groups[i].hasPreview = mobileTargetWindowPreviewTarget(groups[i].targets)
+	}
+	return groups
+}
+
+func mobileTargetWindowPreviewTarget(targets []protocol.TerminalTarget) (protocol.TerminalTarget, bool) {
+	if len(targets) == 0 {
+		return protocol.TerminalTarget{}, false
+	}
+	for _, target := range targets {
+		if target.PaneActive {
+			return target, true
+		}
+	}
+	return targets[0], true
+}
+
+func mobileTargetWindowKey(target protocol.TerminalTarget) string {
+	if target.WindowID != "" {
+		return target.WindowID
+	}
+	return fmt.Sprintf("%s|%d|%s", target.SessionName, target.WindowIndex, target.WindowName)
+}
+
+func mobileTargetSessionKey(sessionID string) string {
+	return "session:" + sessionID
+}
+
+func mobileTargetWindowNodeKey(sessionID, windowKey string) string {
+	return "window:" + sessionID + ":" + windowKey
+}
+
+func mobileTargetPaneNodeKey(sessionID string, target protocol.TerminalTarget) string {
+	if target.PaneID != "" {
+		return "pane:" + sessionID + ":" + target.PaneID
+	}
+	return fmt.Sprintf("pane:%s:%s:%d", sessionID, mobileTargetWindowKey(target), target.PaneIndex)
+}
+
+func mobileTargetPreviewKey(sessionID string, target protocol.TerminalTarget) string {
+	if target.PaneID != "" {
+		return appStreamKey(sessionID, &target)
+	}
+	return mobileTargetPaneNodeKey(sessionID, target)
+}
+
+func (a *App) loadMobileWindowTargetPreviews(ctx context.Context, sessionID, windowKey string) {
+	a.ensureAppState()
+	client := a.Client
+	for _, target := range a.targets[sessionID] {
+		if target.PaneID == "" || mobileTargetWindowKey(target) != windowKey {
+			continue
+		}
+		key := mobileTargetPreviewKey(sessionID, target)
+		if a.targetBusy[key] || a.targetCaps[key] != "" || a.buffers[key] != "" {
+			continue
+		}
+		a.targetBusy[key] = true
+		target := target
+		go func() {
+			data, err := client.SessionTargetPreview(ctx, sessionID, 6, &target)
+			a.sendTargetPreviewEvent(appTargetPreviewEvent{sessionID: sessionID, key: key, data: data, err: err})
+		}()
+	}
+}
+
+func (a *App) sendTargetPreviewEvent(event appTargetPreviewEvent) {
+	events := a.capEvents
+	if events == nil {
+		return
+	}
+	select {
+	case events <- event:
+	default:
+		select {
+		case <-events:
+			a.debugf("target preview event queue dropped oldest")
+		default:
+		}
+		select {
+		case events <- event:
+		default:
+			a.debugf("target preview event dropped session=%q key=%q", event.sessionID, event.key)
+		}
+	}
+}
+
+func (a *App) drainTargetPreviewEvents(limit int) bool {
+	a.ensureAppState()
+	changed := false
+	for i := 0; i < limit; i++ {
+		select {
+		case event := <-a.capEvents:
+			a.targetBusy[event.key] = false
+			if event.err != nil {
+				a.debugf("target preview failed session=%q key=%q error=%q", event.sessionID, event.key, event.err.Error())
+				changed = true
+				continue
+			}
+			a.targetCaps[event.key] = event.data
+			if stream := a.streams[event.key]; stream == nil || !stream.seenOutput {
+				a.buffers[event.key] = event.data
+			}
+			a.debugf("target preview loaded session=%q key=%q bytes=%d", event.sessionID, event.key, len(event.data))
+			changed = true
+		default:
+			return changed
+		}
+	}
+	return changed
 }
 
 func (a *App) attachTarget(ctx context.Context, sessionID string, target *protocol.TerminalTarget) error {
@@ -1227,7 +1634,7 @@ func (a *App) applyStreamEvent(event appStreamEvent) {
 		a.queueSessionOutput(event.sessionID, event.data)
 		if stream.warming {
 			stream.quietUntil = time.Now().Add(appStreamWarmupQuiet)
-		} else if a.selectedSession().ID == event.sessionID {
+		} else if canonicalSessionID(a.selectedSession()) == event.sessionID {
 			a.loadSelectedPreview()
 		}
 	}
@@ -1488,7 +1895,7 @@ func (a *App) updateStreamBuffer(stream *appSessionStream) {
 	}
 	a.buffers[stream.sessionID] = stream.view.Render()
 	stream.viewDirty = false
-	if !stream.warming && a.selectedSession().ID == stream.sessionID {
+	if !stream.warming && canonicalSessionID(a.selectedSession()) == stream.sessionID {
 		a.loadSelectedPreview()
 	}
 }
@@ -1504,7 +1911,7 @@ func (a *App) finishWarmStreams(now time.Time) bool {
 			continue
 		}
 		stream.warming = false
-		if a.selectedSession().ID == sessionID {
+		if canonicalSessionID(a.selectedSession()) == sessionID {
 			a.loadSelectedPreview()
 			changed = true
 		}
@@ -1632,6 +2039,8 @@ func (a *App) promptSlash(ctx context.Context) {
 	switch strings.TrimSpace(value) {
 	case "login":
 		a.promptLogin(ctx)
+	case "hub":
+		a.promptHub(ctx)
 	case "refresh", "r":
 		a.refresh(ctx)
 	case "fullscreen", "fs":
@@ -1642,7 +2051,7 @@ func (a *App) promptSlash(ctx context.Context) {
 		}
 		a.enterFullscreen()
 	case "help", "?":
-		a.status = "commands: /login /refresh /fullscreen /help"
+		a.status = "commands: /login /hub /refresh /fullscreen /help"
 	case "":
 		a.status = "command canceled"
 	default:
@@ -1653,17 +2062,16 @@ func (a *App) promptSlash(ctx context.Context) {
 func (a *App) promptLogin(ctx context.Context) {
 	defaultHub := a.Client.HubURL
 	if defaultHub == "" {
-		defaultHub = "http://127.0.0.1:8080"
+		defaultHub = DefaultHubURL()
 	}
-	hubURL := a.promptInline("hub", defaultHub)
-	hubURL = strings.TrimSpace(hubURL)
-	if hubURL == "" {
-		a.status = "login canceled"
-		return
-	}
+	hubURL := NormalizeHubURL(defaultHub)
+	_ = RememberHubURL(hubURL)
 	a.status = "starting login"
+	a.loginURL = ""
 	a.render()
 	auth, err := DeviceLogin(ctx, hubURL, "", "", func(start DeviceStartResponse) {
+		OpenBrowserBestEffort(start.VerificationURLComplete)
+		a.loginURL = start.VerificationURLComplete
 		a.status = "open " + start.VerificationURLComplete + "  code " + start.UserCode
 		a.err = nil
 		a.render()
@@ -1676,8 +2084,63 @@ func (a *App) promptLogin(ctx context.Context) {
 	a.Auth = auth
 	a.Client = auth.Client
 	a.loggedIn = true
+	a.loginURL = ""
 	a.err = nil
 	a.status = "login complete"
+	a.refresh(ctx)
+}
+
+func (a *App) promptHub(ctx context.Context) {
+	defaultHub := a.Client.HubURL
+	if defaultHub == "" {
+		defaultHub = DefaultHubURL()
+	}
+	hubURL := strings.TrimSpace(a.promptInline("hub", defaultHub))
+	if hubURL == "" {
+		a.status = "hub unchanged"
+		return
+	}
+	hubURL = NormalizeHubURL(hubURL)
+	if err := RememberHubURL(hubURL); err != nil {
+		a.err = err
+		a.status = "save hub failed"
+		return
+	}
+	a.switchHub(ctx, hubURL)
+}
+
+func (a *App) switchHub(ctx context.Context, hubURL string) {
+	a.closeAllStreams()
+	a.Client = New(hubURL, "")
+	a.Auth = AppAuthResult{}
+	a.loggedIn = false
+	a.direct = false
+	a.workers = nil
+	a.sessions = nil
+	a.selected = 0
+	a.preview = ""
+	a.loginURL = ""
+	a.previews = map[string]string{}
+	a.buffers = map[string]string{}
+	a.targets = map[string][]protocol.TerminalTarget{}
+	a.targetOpen = map[string]bool{}
+	a.targetCaps = map[string]string{}
+	a.targetBusy = map[string]bool{}
+	a.active = ""
+	a.fullscreen = false
+	a.err = nil
+	a.status = "hub switched; checking local login"
+	a.render()
+	auth, err := ResolveAppAuth(ctx, AppAuthOptions{HubURL: hubURL, DeviceName: "control"})
+	if err != nil {
+		a.err = nil
+		a.status = "hub switched; type /login"
+		return
+	}
+	a.Auth = auth
+	a.Client = auth.Client
+	a.loggedIn = true
+	a.status = "hub switched"
 	a.refresh(ctx)
 }
 
@@ -1765,6 +2228,9 @@ func (a *App) renderWithSize(cols, rows int) {
 		footer += styleMuted("  |  ") + a.debugHUD()
 	}
 	writeLine(a.Out, cols, footer)
+	if a.loginURL != "" {
+		writeLine(a.Out, cols, styleMuted("Login URL: ")+a.loginURL)
+	}
 	if a.active != "" {
 		if a.debugEnabled() {
 			writeLine(a.Out, cols, styleMuted("Ctrl-] detach  Ctrl-F fullscreen  Ctrl-G debug  mouse select/drag split"))
@@ -1829,28 +2295,29 @@ func (a *App) renderMobileSessionsWithSize(cols, rows int) {
 func (a *App) renderMobileTargetsWithSize(cols, rows int) {
 	sessionID := a.targetFor
 	if sessionID == "" {
-		sessionID = a.selectedSession().ID
+		sessionID = canonicalSessionID(a.selectedSession())
 	}
-	writeLine(a.Out, cols, styleTitle("AgentMux")+styleMuted(" / panes"))
+	writeLine(a.Out, cols, styleTitle("AgentMux")+styleMuted(" / targets"))
 	writeLine(a.Out, cols, truncateVisible(styleHeader(sessionID), cols))
-	targets := a.targets[sessionID]
+	nodes := a.mobileTargetNodes()
+	a.clampMobileTargetSelection()
 	limit := max(1, rows-5)
-	start := scrollStart(a.targetSel, limit, len(targets))
+	start := scrollStart(a.targetSel, limit, len(nodes))
 	for row := 0; row < limit; row++ {
 		index := start + row
 		line := ""
-		if len(targets) == 0 && row == 0 {
-			line = "  no panes"
-		} else if index < len(targets) {
+		if len(nodes) == 0 && row == 0 {
+			line = "  no targets"
+		} else if index < len(nodes) {
 			prefix := "  "
 			if index == a.targetSel {
 				prefix = "> "
 			}
-			line = mobileTargetLine(prefix, targets[index])
+			line = a.mobileTargetNodeLine(prefix, nodes[index], cols)
 		}
 		writeLine(a.Out, cols, line)
 	}
-	a.renderMobileFooter(cols, "Enter attach pane  Left/Esc back  r refresh  q quit")
+	a.renderMobileFooter(cols, "o open  enter/a attach pane  h/left back  r refresh  q quit")
 }
 
 func (a *App) renderMobileTerminalWithSize(cols, rows int) {
@@ -1904,6 +2371,9 @@ func (a *App) renderMobileFooter(cols int, help string) {
 		footer += styleMuted(" | ") + styleError(a.err.Error())
 	}
 	writeLine(a.Out, cols, footer)
+	if a.loginURL != "" {
+		writeLine(a.Out, cols, styleMuted("Login URL: ")+a.loginURL)
+	}
 	writeLine(a.Out, cols, styleMuted(help))
 	clearToEnd(a.Out)
 }
@@ -2047,10 +2517,11 @@ func terminalLinesHaveVisibleContent(lines []string) bool {
 
 func (a *App) selectedStreamWarming() bool {
 	session := a.selectedSession()
-	if session.ID == "" || a.streams == nil {
+	sessionID := canonicalSessionID(session)
+	if sessionID == "" || a.streams == nil {
 		return false
 	}
-	stream := a.streams[session.ID]
+	stream := a.streams[sessionID]
 	return stream != nil && stream.warming
 }
 
@@ -2066,7 +2537,7 @@ func (a *App) sessionListLine(row, sessionIndex int, compact bool) string {
 	if sessionIndex == a.selected {
 		prefix = "> "
 	}
-	if session.ID == a.active {
+	if canonicalSessionID(session) == a.active {
 		prefix = styleOK("* ")
 	}
 	if compact {
@@ -2183,6 +2654,16 @@ func (a *App) selectedSession() protocol.SessionView {
 		return protocol.SessionView{}
 	}
 	return a.sessions[a.selected]
+}
+
+func canonicalSessionID(session protocol.SessionView) string {
+	if _, _, ok := protocol.SplitSessionID(session.ID); ok {
+		return session.ID
+	}
+	if session.WorkerID != "" && session.Name != "" {
+		return protocol.SessionID(session.WorkerID, session.Name)
+	}
+	return session.ID
 }
 
 func appStreamKey(sessionID string, target *protocol.TerminalTarget) string {
@@ -2635,6 +3116,99 @@ func mobileSessionLine(prefix string, session protocol.SessionView) string {
 		command = "shell"
 	}
 	return prefix + styleHeader(session.ID) + " " + styleStatus(session.Status) + " " + styleMuted(command)
+}
+
+func (a *App) mobileTargetNodeLine(prefix string, node appMobileTargetNode, cols int) string {
+	switch node.kind {
+	case appMobileTargetSession:
+		marker := "+"
+		if node.open {
+			marker = "-"
+		}
+		detail := fmt.Sprintf(" %d windows %d panes", node.paneCount, node.paneTotal)
+		return prefix + marker + " " + styleHeader(node.sessionID) + styleMuted(detail)
+	case appMobileTargetWindow:
+		marker := "+"
+		if node.open {
+			marker = "-"
+		}
+		name := node.windowName
+		if name == "" {
+			name = fmt.Sprintf("window %d", node.windowIndex)
+		}
+		active := ""
+		if node.windowActive {
+			active = " " + styleOK("*")
+		}
+		line := prefix + "  " + marker + " " + styleHeader(fmt.Sprintf("w%d", node.windowIndex)) + active + " " + name + styleMuted(fmt.Sprintf("  %d panes", node.paneCount))
+		if node.hasPreview {
+			if preview := a.mobileTargetPreviewSummary(node.sessionID, node.preview); preview != "" {
+				available := cols - visibleLen(line) - 3
+				if available >= 10 {
+					line += styleMuted(" | ") + styleMuted(ellipsize(preview, available))
+				}
+			}
+		}
+		return line
+	case appMobileTargetPane:
+		line := prefix + "    " + mobileTargetPaneSummary(node.target)
+		if preview := a.mobileTargetPreviewSummary(node.sessionID, node.target); preview != "" {
+			available := cols - visibleLen(line) - 3
+			if available >= 10 {
+				line += styleMuted(" | ") + styleMuted(ellipsize(preview, available))
+			}
+		}
+		return line
+	default:
+		return prefix
+	}
+}
+
+func mobileTargetPaneSummary(target protocol.TerminalTarget) string {
+	pane := target.PaneID
+	if pane == "" {
+		pane = fmt.Sprintf("p%d", target.PaneIndex)
+	}
+	active := ""
+	if target.PaneActive {
+		active = styleOK("* ")
+	}
+	command := target.Command
+	if command == "" {
+		command = "shell"
+	}
+	size := ""
+	if target.Width > 0 && target.Height > 0 {
+		size = fmt.Sprintf(" %dx%d", target.Width, target.Height)
+	}
+	return active + styleHeader(pane) + " " + styleMuted(command+size)
+}
+
+func (a *App) mobileTargetPreviewSummary(sessionID string, target protocol.TerminalTarget) string {
+	if a == nil {
+		return ""
+	}
+	key := mobileTargetPreviewKey(sessionID, target)
+	if a.buffers != nil && a.buffers[key] != "" {
+		return firstVisiblePreviewLine(a.buffers[key])
+	}
+	if a.targetCaps != nil && a.targetCaps[key] != "" {
+		return firstVisiblePreviewLine(a.targetCaps[key])
+	}
+	if a.targetBusy != nil && a.targetBusy[key] {
+		return "loading"
+	}
+	return ""
+}
+
+func firstVisiblePreviewLine(preview string) string {
+	for _, line := range strings.Split(strings.TrimRight(preview, "\n"), "\n") {
+		plain := strings.TrimSpace(stripControl(line))
+		if plain != "" {
+			return plain
+		}
+	}
+	return ""
 }
 
 func mobileTargetLine(prefix string, target protocol.TerminalTarget) string {

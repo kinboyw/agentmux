@@ -169,6 +169,55 @@ The first optimized attach should receive:
 
 Control should not need historical transcript bytes to draw the current screen.
 
+Rendering rule: Web Control should prefer xterm.js for the production visible
+terminal. `cells-v1` is a state/debug format and should not become a long-term
+replacement terminal renderer. When Worker-owned state needs to restore a Web
+terminal, Worker should send a compact ANSI screen snapshot or replay boundary
+that xterm.js can parse and render. Cell snapshots remain useful for debugging,
+diff validation, non-browser controls, and future protocol checks.
+
+### Final Render Mode Shape
+
+The production Plan B target is `worker_state_xterm`, not a parallel React cell
+renderer:
+
+```text
+Worker = terminal state authority
+Control = attach/history/anchor coordinator
+xterm.js = final visible terminal renderer
+```
+
+Render modes are mutually exclusive per pane:
+
+- `worker_state_xterm`: Worker maintains canonical state and sends current ANSI
+  snapshots plus live xterm-compatible updates. Control writes the current
+  screen and live tail into xterm. History is fetched separately on demand.
+- `live_attach_xterm`: compatibility fallback. Control attaches to a raw
+  backend stream and writes raw output into xterm.
+
+In `worker_state_xterm`, Worker should not also stream `cells-v1`/React-rendered
+diffs by default. `cells-v1` is opt-in diagnostics. This avoids paying for both
+xterm rendering and React cell rendering on the same live stream.
+
+Attach and resize should be bounded by current screen size, not history length:
+
+```text
+attach -> terminal.snapshot(ansi-screen-v1) + live tail
+resize -> terminal.state.reset + terminal.snapshot(ansi-screen-v1)
+scroll up -> terminal.history.request/page
+return bottom -> latest snapshot or buffered live tail alignment
+```
+
+Control should not force lazy history pages into xterm scrollback. xterm owns
+the current terminal surface. Historical pages can be rendered in a virtual
+history view and aligned to the xterm bottom by sequence numbers.
+
+`cells-v1` currently carries text, width, SGR attributes, foreground/background
+color references, underline color, links, cursor position, and screen size.
+ANSI palette colors are transported as `ansi:<index>` so Web Control can map
+them through xterm.js' palette instead of baking a different palette into the
+Worker. Truecolor values are transported as `#rrggbb`.
+
 ### History Transcript
 
 Transcript is append-only historical text suitable for scrollback, search, and
@@ -414,6 +463,27 @@ Fallback modes:
 - `snapshot-only`: initial snapshot plus raw output.
 - `state-v1`: snapshot, diffs, history, and input ack.
 
+Current implementation status:
+
+- Web Control sends `terminal.snapshot.v1` in `control.open.capabilities`.
+- Worker replies with `terminal.mode` and a `terminal.snapshot` before opening
+  the raw backend stream when that capability is requested.
+- The current snapshot source is the existing backend `Capture` path with
+  `ansi-lines-v1` encoding. This is a fast migration bridge, not the final
+  terminal state model.
+- Raw `terminal.output` remains authoritative after the snapshot. CLI/TUI
+  controls do not request snapshot mode yet, so they stay on the original raw
+  attach protocol.
+
+Next PlanB milestones:
+
+- Replace capture-backed snapshots with a Worker-side parser-backed
+  `TerminalState`.
+- Add `terminal.diff` generation after the snapshot boundary.
+- Add history pagination separate from the visible screen snapshot.
+- Add resize policy negotiation: `follow_control`, `fixed`, and
+  `worker_default`.
+
 ## Create Session CWD Model
 
 The current Create Session flow asks Control users to type `cwd` manually. This
@@ -602,6 +672,209 @@ Phase 4:
 - Add command presets per project or Worker.
 - Add tenant/admin policy for whether manual paths are allowed.
 
+## PlanB Decision: Worker-Owned State With Control Viewports
+
+The Worker-side state path should support two terminal modes:
+
+- `state`: Worker owns the terminal state, screen size, scrollback pages, and
+  generation boundaries.
+- `attach`: Worker opens a raw backend stream and Control renders bytes directly.
+
+`auto` should be the default. In `auto`, Control requests state mode first and
+Worker may degrade to attach mode when the backend, parser, or target does not
+support state safely.
+
+### Size Model
+
+PlanB uses three size concepts, but only two should drive remote output:
+
+```text
+process_size       tmux/pty size observed by the remote shell or TUI
+worker_state_size  canonical Worker screen size
+control_viewport   local browser/TUI pane size
+```
+
+`process_size` and `worker_state_size` must stay equal. The remote program sees
+the canonical Worker size, for example `120x36`, and produces output for that
+shape. `control_viewport` is only a viewing window over that canonical screen.
+Control must crop, pad, and scroll; it must not reflow remote terminal output.
+
+This preserves ASCII diagrams, tables, progress bars, and full-screen TUIs. A
+small Control viewport sees a clipped window into the canonical remote screen.
+A large Control viewport sees the canonical screen bottom-aligned with padding.
+
+### Session, Window, And Pane Scope
+
+Worker-owned state must not mean one global state per session. A tmux session can
+contain multiple windows and panes. On small screens, especially mobile TUI,
+Control should use the remote pane as the minimum attach unit instead of trying
+to render the whole remote split layout.
+
+The ownership model is:
+
+```text
+session lifecycle: create/kill/list, credentials, high-level metadata
+state domain:      session + target(window/pane) + generation
+viewport:          per Control pane or mobile tab
+```
+
+For tmux, the stable state key should be built from the target identity:
+
+```text
+worker_id/session_name/window_id/pane_id
+```
+
+If a Control attaches to the whole tmux session/window, Worker can expose a
+composed window target, but pane-level targets should remain independent. Mobile
+Control should avoid rendering multiple remote panes side by side or stacked in
+the same terminal viewport because that shrinks already constrained content and
+changes the user's mental model of the remote pane. Instead, it should support
+multiple pane attachments as switchable focus targets:
+
+- one tab per pane,
+- a focused pane plus preview cards,
+- a pane switcher opened by shortcut,
+- previous/next pane shortcuts,
+- optional worker/session/window/pane breadcrumb in the status line,
+
+without every pane fighting over the same cursor, size, mouse mode, or history
+anchor.
+
+For mobile TUI, the interaction model should be closer to Vim's help pages than
+to a desktop dashboard:
+
+- `?` opens a full-screen help/usage page.
+- `q` closes help or exits the current overlay.
+- `Tab` / `Shift-Tab` switches attached panes.
+- `[` / `]` can switch previous/next remote pane when tab keys are unavailable.
+- `/` enters search/filter mode for worker, session, or pane lists.
+- `Enter` focuses or attaches the selected pane.
+- `Esc` returns to the previous mode.
+
+The help page should show the current mode, available commands, and short usage
+examples. It should be generated from the same keybinding registry used by the
+TUI so documentation and behavior cannot drift.
+
+The fallback attach mode may still attach to the whole tmux session for maximum
+compatibility. PlanB state mode should prefer pane/window targets because they
+are deterministic and compose cleanly on small screens.
+
+### Control TUI Layout Policy
+
+Control TUI should adapt by terminal size and input device:
+
+```text
+desktop TUI: overview, pane list, optional split workspace, command palette
+mobile TUI:  focused pane, tab strip or compact switcher, help overlay
+```
+
+The mobile policy is intentionally conservative:
+
+- never auto-render a remote multi-pane tmux window as multiple local panes;
+- never shrink a pane below a readable width just to preserve remote layout;
+- prefer one remote pane per local view;
+- keep multiple attached panes alive in the background and switch focus without
+  re-attaching when possible;
+- use preview cards/lists for discovery, not for live side-by-side operation.
+
+This keeps Worker state compatible with both Web Workspace and mobile TUI. Web
+can still compose multiple pane targets in a large viewport, while mobile uses
+the same target states through tabs and keyboard navigation.
+
+### Sync And Reset
+
+Control may explicitly mutate the remote size through a paired operation set:
+
+- `sync`: make the remote size equal to the current Control viewport.
+- `reset`: restore the remote size to the Worker default canonical size.
+
+These actions are intentionally explicit. Normal browser pane changes, sidebar
+toggles, tab visibility changes, and split drags should not resize tmux/pty.
+That keeps multi-Control usage stable and avoids accidental remote repaints.
+
+Both `sync` and `reset` are remote-size mutations. They must:
+
+1. resize the underlying tmux/pty process,
+2. set `worker_state_size` to the same size,
+3. increment `generation`,
+4. emit `terminal.state.reset`,
+5. emit a fresh `terminal.snapshot`,
+6. resume diffs for the new generation.
+
+The UI should present them as a pair:
+
+```text
+State · remote 120x36 · viewport 96x31
+[Sync to viewport] [Reset to default]
+```
+
+When multiple Controls are attached, `sync` should be treated as a visible
+remote mutation because it affects every viewer.
+
+### Generation Rule
+
+The current screen state is valid only within one generation:
+
+```text
+same generation: snapshot + diff can be applied
+new generation: discard old pending diffs and wait for the next snapshot
+history: may cross generations with resize boundary markers
+```
+
+`terminal.state.reset` is the boundary event. Control should clear the visible
+screen, preserve history anchors when the user is scrolled up, and wait for the
+next snapshot. If the user is at bottom, the next snapshot should be
+bottom-aligned automatically.
+
+### On-Demand History
+
+Control must not eagerly fetch all history. It should keep:
+
+- the current screen,
+- live diffs after the current snapshot,
+- only history pages explicitly requested by user scrolling.
+
+Older scrollback is requested with `terminal.history.request` and returned as
+`terminal.history.page`. Pages should include sequence ranges and a `has_more`
+flag. Resize events should be represented as history boundary markers instead
+of clearing transcript history.
+
+### Initial Implementation Slice
+
+The first PlanB implementation should be a conservative skeleton:
+
+1. Add protocol fields and messages for terminal mode, state reset, history
+   request/page, and size sync/reset.
+2. Add Worker config for terminal mode and default state size.
+3. Let Control request `transport_mode: auto` and show the negotiated mode.
+4. Keep raw attach as the production fallback.
+5. Implement `sync` and `reset` as explicit remote-size commands even before
+   full cell diffs exist.
+6. Continue using the existing `terminal.snapshot` + raw stream bridge until a
+   real `cells-v1` state engine lands.
+
+This gives users a visible model and gives the codebase stable protocol seams
+without betting the whole terminal experience on a new parser in one step.
+
+Current implementation status:
+
+- `transport_mode: auto`, `terminal.mode`, `terminal.state.reset`, `sync`, and
+  `reset` are wired through Hub, Worker, and Web Control.
+- Web Control opens state-capable streams by default and stops sending ordinary
+  viewport resize messages once Worker negotiates `worker_state`.
+- Worker keeps a bounded transcript ring and can answer
+  `terminal.history.request` with `terminal.history.page`.
+- Worker also maintains a `cells-v1` screen snapshot through the terminal parser,
+  but Web Control no longer requests cell snapshots by default. The production
+  path is `worker_state_xterm`: xterm.js receives ANSI snapshots plus live
+  output, while cell snapshots/diffs remain diagnostics.
+- Web Control can still expose Worker-side cells as an opt-in debug surface in a
+  later iteration. It should not subscribe to cell snapshots on every pane by
+  default.
+- The runtime is still a bridge until a session-level Worker state feed replaces
+  per-Control tmux attach. The immediate performance win is removing parallel
+  cells/diff rendering overhead while preserving xterm as the final renderer.
+
 ## Implementation Phases
 
 ### Phase 1: Instrument Current Behavior
@@ -645,12 +918,22 @@ This phase proves fast attach before solving every diff edge case.
 - Stop using initial raw replay as scrollback.
 - Let Control request older transcript pages when the user scrolls near the top.
 
+Status: protocol and Worker ring/page response exist. Control-side scroll
+triggering and history prepend rendering are still pending.
+
 ### Phase 6: Structured Diffs
 
 - Add `terminal.diff`.
 - Apply diffs in Control after snapshot.
 - Send a full snapshot when diff sync is lost or generation changes.
 - Keep raw stream fallback by capability.
+
+Status: Worker emits conservative row-level `terminal.diff` messages after an
+initial `cells-v1` snapshot. Web Control applies `replace_row` and `cursor`
+ops when generation matches. If size or generation state is not compatible,
+Control waits for the next full snapshot. Cell diffs now preserve SGR color
+metadata, but they are still treated as diagnostics rather than the preferred
+production renderer.
 
 ### Phase 7: Input Ack And Optimistic Echo
 

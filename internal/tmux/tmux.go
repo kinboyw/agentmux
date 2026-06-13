@@ -26,6 +26,13 @@ type Runner interface {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	if name == "tmux" {
+		path, err := ResolvePath()
+		if err != nil {
+			return "", err
+		}
+		name = path
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -47,14 +54,61 @@ type paneGeometry struct {
 }
 
 func CheckAvailable() error {
-	path, err := exec.LookPath("tmux")
-	if err != nil {
-		return fmt.Errorf("tmux was not found in PATH\n\nInstall tmux for durable local sessions:\n  Debian/Ubuntu: sudo apt install tmux\n  Fedora:        sudo dnf install tmux\n  Arch:          sudo pacman -S tmux\n  macOS:         brew install tmux\n\nAgentMux can fall back to the built-in PTY backend, but built-in PTY sessions are lost when the worker process stops")
+	_, err := ResolvePath()
+	return err
+}
+
+func ResolvePath() (string, error) {
+	if configured := strings.TrimSpace(firstNonEmptyEnv("AGENTMUX_TMUX", "AGENTMUX_TMUX_PATH")); configured != "" {
+		if strings.ContainsAny(configured, `/\`) {
+			if executable(configured) {
+				return configured, nil
+			}
+			return "", fmt.Errorf("configured tmux path is not executable: %s", configured)
+		}
+		if path, err := exec.LookPath(configured); err == nil && path != "" {
+			return path, nil
+		}
+		return "", fmt.Errorf("configured tmux command was not found: %s", configured)
 	}
-	if path == "" {
-		return fmt.Errorf("tmux was not found in PATH")
+	if path, err := exec.LookPath("tmux"); err == nil && path != "" {
+		return path, nil
 	}
-	return nil
+	candidates := []string{
+		"/opt/homebrew/bin/tmux",
+		"/usr/local/bin/tmux",
+		"/opt/local/bin/tmux",
+		"/usr/bin/tmux",
+		"/bin/tmux",
+	}
+	for _, candidate := range candidates {
+		if executable(candidate) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("tmux was not found. PATH=%q searched=%s\n\nInstall tmux for durable local sessions:\n  Debian/Ubuntu: sudo apt install tmux\n  Fedora:        sudo dnf install tmux\n  Arch:          sudo pacman -S tmux\n  macOS:         brew install tmux\n\nIf tmux is installed in a custom location, set AGENTMUX_TMUX=/path/to/tmux before starting the Worker. AgentMux can fall back to the built-in PTY backend, but built-in PTY sessions are lost when the worker process stops", os.Getenv("PATH"), strings.Join(candidates, ", "))
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func executable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
+}
+
+func commandError(op string, err error, output string) error {
+	message := strings.TrimSpace(output)
+	if message == "" {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return fmt.Errorf("%s: %w: %s", op, err, message)
 }
 
 func New(runner Runner) Adapter {
@@ -119,8 +173,16 @@ func (a Adapter) Create(ctx context.Context, name, cwd, command string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.Runner.Run(ctx, "tmux", "new-session", "-d", "-s", name, "-c", abs, command); err != nil {
-		return fmt.Errorf("tmux new-session: %w", err)
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("working directory %q is not accessible on worker: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("working directory %q is not a directory", abs)
+	}
+	output, err := a.Runner.Run(ctx, "tmux", "new-session", "-d", "-s", name, "-c", abs, command)
+	if err != nil {
+		return commandError("tmux new-session", err, output)
 	}
 	return nil
 }
@@ -524,7 +586,11 @@ func (a Adapter) Open(ctx context.Context, name string, cols int, rows int) (ses
 	if err := sessionbackend.ValidateSessionName(name); err != nil {
 		return nil, err
 	}
-	return pty.StartTmuxAttach(ctx, name, cols, rows)
+	tmuxPath, err := ResolvePath()
+	if err != nil {
+		return nil, err
+	}
+	return pty.StartCommand(ctx, tmuxPath, []string{"attach-session", "-t", name}, "", cols, rows)
 }
 
 func (a Adapter) Targets(ctx context.Context, name string) ([]sessionbackend.TerminalTarget, error) {
@@ -597,6 +663,19 @@ func (a Adapter) OpenTarget(ctx context.Context, target sessionbackend.TerminalT
 		return nil, err
 	}
 	return stream, nil
+}
+
+func (a Adapter) CaptureTarget(ctx context.Context, target sessionbackend.TerminalTarget, lines int) (string, error) {
+	if target.PaneID == "" {
+		return a.Capture(ctx, target.SessionName, lines)
+	}
+	if err := validateTmuxPaneID(target.PaneID); err != nil {
+		return "", err
+	}
+	if lines <= 0 {
+		lines = 80
+	}
+	return a.capturePaneScrollback(ctx, target.PaneID, lines)
 }
 
 func validateTmuxPaneID(value string) error {

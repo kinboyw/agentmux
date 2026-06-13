@@ -21,6 +21,16 @@ AgentMux 的核心设计是让 agent 无感。Codex、Claude、Gemini、OpenCode
 
 ## 快速开始
 
+当本地没有配置 Hub 时，AgentMux 客户端默认连接公共 Hub：
+`https://agentmux.kinboy.wang`。
+
+```bash
+agentmux-tui
+agentmux worker join --join 'amx_sig_...' --name "$(hostname)"
+```
+
+使用 `--hub` 或 `AGENTMUX_HUB`/`AGENTMUX_CONTROL_HUB` 可以切换到私有 Hub。
+
 如果你已经打开了一个 AgentMux Hub 落地页，直接复用当前 Hub：
 
 1. 点击 `生成接入信令`。

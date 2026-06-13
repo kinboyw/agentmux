@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"private/agentmux/internal/appconfig"
 	"private/agentmux/internal/credentialcache"
 )
 
@@ -97,6 +98,41 @@ func TestResolveAppAuthLoadsLatestControlCredentialBeforeLogin(t *testing.T) {
 	}
 	if auth.Source != "cache" || auth.Client.HubURL != "https://hub.example.com" || auth.Client.Token != "amx_cred_control" {
 		t.Fatalf("expected cached auth before login, got: %+v", auth)
+	}
+}
+
+func TestDefaultHubURLUsesSavedControlHub(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AGENTMUX_CONTROL_HUB", "")
+	t.Setenv("AGENTMUX_HUB", "")
+	if err := appconfig.SaveControlHubURL(" wss://hub.example.com/path?token=secret "); err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultHubURL(); got != "https://hub.example.com" {
+		t.Fatalf("unexpected default hub: %q", got)
+	}
+}
+
+func TestDefaultHubURLUsesSystemDefaultWhenUnconfigured(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("AGENTMUX_CONTROL_HUB", "")
+	t.Setenv("AGENTMUX_HUB", "")
+	if got := DefaultHubURL(); got != SystemDefaultHubURL {
+		t.Fatalf("unexpected default hub: %q", got)
+	}
+}
+
+func TestRememberHubURLNormalizesAndSaves(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := RememberHubURL("wss://hub.example.com/ws/"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := appconfig.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ControlHubURL != "https://hub.example.com" {
+		t.Fatalf("unexpected saved hub: %q", cfg.ControlHubURL)
 	}
 }
 

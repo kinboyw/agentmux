@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Show the current reliable relay mode and future direct-mode optimization.
+Show the preferred direct mode and automatic relay fallback.
 
 ## Recommended Placement
 
@@ -16,7 +16,7 @@ Show the current reliable relay mode and future direct-mode optimization.
 
 ## Positive Prompt
 
-Split-screen technical comparison diagram for AgentMux routing modes. Left panel titled "Relay Mode Now": Worker connects outbound to Hub, Control connects to Hub, terminal bytes route through Hub. Show this as a simple triangle with Hub at top center, Worker and Control at bottom corners, green WSS lines passing through Hub. Right panel titled "Direct Mode Later": Hub remains as signaling/auth broker, but Worker and Control have a direct data channel between them with Hub coordinating candidates. Use dotted line from Hub to both endpoints labeled "signaling + auth", and solid line between Worker and Control labeled "direct stream". Dark technical background, restrained green and blue accents, minimal readable labels. Clearly mark relay as reliable default and direct as optional future.
+Split-screen technical comparison diagram for AgentMux routing modes. Left panel titled "Direct Mode Preferred": Hub remains as signaling/auth broker, Worker and Control have a direct encrypted data channel between them, and Hub coordinates grants, candidates, and revocation. Use dotted lines from Hub to both endpoints labeled "signaling + auth + revoke", and a solid line between Worker and Control labeled "encrypted direct stream". Right panel titled "Relay Fallback": Worker connects outbound to Hub, Control connects to Hub, terminal bytes route through Hub only after direct negotiation fails. Show this as a simple triangle with Hub at top center, Worker and Control at bottom corners, muted WSS lines passing through Hub. Dark technical background, restrained green and blue accents, minimal readable labels. Clearly mark direct as preferred and relay as automatic fallback.
 
 ## Negative Prompt
 
@@ -24,7 +24,7 @@ P2P crypto network imagery, overly complex NAT traversal diagrams, dozens of arr
 
 ## Review Checklist
 
-- Relay mode path clearly goes through Hub.
-- Direct mode still uses Hub for auth/signaling.
-- Direct mode is visually future/optional, not current default.
+- Direct mode is visually primary and preferred.
+- Relay mode path clearly goes through Hub as fallback.
+- Direct mode still uses Hub for auth, signaling, and revocation.
 - Worker and Control roles remain consistent.

@@ -3,6 +3,8 @@ package tmux
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -42,6 +44,33 @@ func TestListParsesTmuxPanes(t *testing.T) {
 	}
 	if sessionByName(sessions, "attached").Status != "attached" {
 		t.Fatalf("unexpected status: %+v", sessions)
+	}
+}
+
+func TestResolvePathUsesConfiguredTmuxPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTMUX_TMUX", path)
+	got, err := ResolvePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("unexpected tmux path: %q", got)
+	}
+}
+
+func TestResolvePathRejectsConfiguredNonExecutable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(path, []byte("not executable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTMUX_TMUX", path)
+	if _, err := ResolvePath(); err == nil || !strings.Contains(err.Error(), "not executable") {
+		t.Fatalf("expected non-executable error, got %v", err)
 	}
 }
 
@@ -117,6 +146,31 @@ func TestCreateRejectsBadName(t *testing.T) {
 	adapter := New(&fakeRunner{})
 	if err := adapter.Create(context.Background(), "bad name", ".", "bash"); err == nil {
 		t.Fatal("expected invalid name error")
+	}
+}
+
+func TestCreateRejectsMissingWorkingDirectory(t *testing.T) {
+	called := false
+	adapter := New(fakeRunnerFunc(func(context.Context, string, ...string) (string, error) {
+		called = true
+		return "", nil
+	}))
+	err := adapter.Create(context.Background(), "demo", filepath.Join(t.TempDir(), "missing"), "bash")
+	if err == nil || !strings.Contains(err.Error(), "working directory") {
+		t.Fatalf("expected working directory error, got %v", err)
+	}
+	if called {
+		t.Fatal("expected missing working directory to fail before tmux is invoked")
+	}
+}
+
+func TestCreateIncludesTmuxOutputOnFailure(t *testing.T) {
+	adapter := New(fakeRunnerFunc(func(context.Context, string, ...string) (string, error) {
+		return "duplicate session: demo\n", fmt.Errorf("exit status 1")
+	}))
+	err := adapter.Create(context.Background(), "demo", t.TempDir(), "bash")
+	if err == nil || !strings.Contains(err.Error(), "duplicate session: demo") {
+		t.Fatalf("expected tmux output in error, got %v", err)
 	}
 }
 

@@ -72,15 +72,15 @@ Check -> ResolveRelease -> Download -> Verify -> Stage -> Swap -> PostAction
 ```
 
 The updater must never overwrite the running executable directly. It stages the
-new binary next to the current install, verifies it, atomically swaps a symlink
-or file path, and keeps the previous binary for rollback.
+new binary next to the current install, verifies it, atomically swaps the
+installed file path, and keeps the previous binary for rollback.
 
 ### 3. npx-Style Cached Run
 
 Used when the user wants to run a role without mutating the installed binary.
 
 ```bash
-agentmux run control@latest --hub https://hub.example.com
+agentmux run control@latest
 agentmux run control@v0.1.0 --hub https://hub.example.com
 ```
 
@@ -403,7 +403,8 @@ devices
 update_jobs
   id
   tenant_id
-  device_id
+  worker_id
+  worker_instance_id
   requested_by
   target_version
   status
@@ -417,18 +418,22 @@ update_jobs
 update_events
   id
   job_id
+  worker_id
+  worker_instance_id
+  status
   level
   message
   created_at
 ```
 
-Runtime state can still be rebuilt from Worker reconnects. Update history should
-remain durable because it is operational audit data.
+Runtime connection state can still be rebuilt from Worker reconnects. Worker
+registry records, software inventory, update jobs, and update events are
+persisted by SQLite-backed Hubs so Web Control can show offline Workers and
+survive Hub restarts.
 
-The first remote Worker update implementation keeps update jobs in Hub memory.
-That is enough for a manual Web Control action and reconnect-based success
-confirmation, but it is not an audit trail. Persist `update_jobs` and
-`update_events` before enabling fleet-wide or unattended update policies.
+The in-memory development Hub keeps the same API shape but is not an audit
+trail. Fleet-wide or unattended update policies should require SQLite
+persistence plus release signature verification.
 
 ## UX
 

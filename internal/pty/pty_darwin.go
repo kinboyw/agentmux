@@ -2,6 +2,7 @@ package pty
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -14,8 +15,9 @@ import (
 )
 
 type Terminal struct {
-	master *os.File
-	cmd    *exec.Cmd
+	master    *os.File
+	cmd       *exec.Cmd
+	slaveName string
 }
 
 func StartTmuxAttach(ctx context.Context, session string, cols int, rows int) (*Terminal, error) {
@@ -23,7 +25,7 @@ func StartTmuxAttach(ctx context.Context, session string, cols int, rows int) (*
 }
 
 func StartCommand(ctx context.Context, name string, args []string, cwd string, cols int, rows int) (*Terminal, error) {
-	master, slave, err := openPTY(cols, rows)
+	master, slave, slaveName, err := openPTY(cols, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +54,7 @@ func StartCommand(ctx context.Context, name string, args []string, cwd string, c
 		return nil, err
 	}
 	_ = slave.Close()
-	return &Terminal{master: master, cmd: cmd}, nil
+	return &Terminal{master: master, cmd: cmd, slaveName: slaveName}, nil
 }
 
 func (t *Terminal) Wait() error {
@@ -75,7 +77,18 @@ func (t *Terminal) Write(p []byte) (int, error) {
 }
 
 func (t *Terminal) Resize(cols int, rows int) error {
-	return setWinsize(t.master.Fd(), cols, rows)
+	if err := setWinsize(t.master.Fd(), cols, rows); err == nil {
+		return nil
+	}
+	if t.slaveName == "" {
+		return setWinsize(t.master.Fd(), cols, rows)
+	}
+	slave, err := os.OpenFile(t.slaveName, os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		return fmt.Errorf("open pty slave %s for resize: %w", t.slaveName, err)
+	}
+	defer slave.Close()
+	return setWinsize(slave.Fd(), cols, rows)
 }
 
 func (t *Terminal) Close() error {
@@ -110,34 +123,36 @@ func (t *Terminal) CopyOutput(ctx context.Context, writers func([]byte)) error {
 	}
 }
 
-func openPTY(cols int, rows int) (*os.File, *os.File, error) {
+func openPTY(cols int, rows int) (*os.File, *os.File, string, error) {
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", fmt.Errorf("open /dev/ptmx: %w", err)
 	}
 	if err := ioctl(master.Fd(), unix.TIOCPTYGRANT, 0); err != nil {
 		_ = master.Close()
-		return nil, nil, err
+		return nil, nil, "", fmt.Errorf("grant pty: %w", err)
 	}
 	if err := ioctl(master.Fd(), unix.TIOCPTYUNLK, 0); err != nil {
 		_ = master.Close()
-		return nil, nil, err
+		return nil, nil, "", fmt.Errorf("unlock pty: %w", err)
 	}
 	name := make([]byte, 128)
 	if err := ioctl(master.Fd(), unix.TIOCPTYGNAME, uintptr(unsafe.Pointer(&name[0]))); err != nil {
 		_ = master.Close()
-		return nil, nil, err
+		return nil, nil, "", fmt.Errorf("resolve pty slave: %w", err)
 	}
-	if err := setWinsize(master.Fd(), cols, rows); err != nil {
-		_ = master.Close()
-		return nil, nil, err
-	}
-	slave, err := os.OpenFile(cString(name), os.O_RDWR|unix.O_NOCTTY, 0)
+	slaveName := cString(name)
+	slave, err := os.OpenFile(slaveName, os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
 		_ = master.Close()
-		return nil, nil, err
+		return nil, nil, "", fmt.Errorf("open pty slave %s: %w", slaveName, err)
 	}
-	return master, slave, nil
+	if err := setWinsize(slave.Fd(), cols, rows); err != nil {
+		_ = master.Close()
+		_ = slave.Close()
+		return nil, nil, "", fmt.Errorf("set pty window size: %w", err)
+	}
+	return master, slave, slaveName, nil
 }
 
 func setWinsize(fd uintptr, cols int, rows int) error {

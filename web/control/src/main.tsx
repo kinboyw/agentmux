@@ -5,13 +5,17 @@ import {
   Activity,
   Bug,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Copy,
+  Ellipsis,
   Eye,
   ExternalLink,
   Github,
   Globe,
+  History,
   Keyboard,
   LayoutGrid,
   LogIn,
@@ -26,6 +30,8 @@ import {
   ShieldCheck,
   SplitSquareHorizontal,
   SplitSquareVertical,
+  Star,
+  UnfoldHorizontal,
   Unplug,
   UserPlus,
   UserRound,
@@ -41,8 +47,15 @@ import { Select } from "./components/ui/select";
 import { Card } from "./components/ui/card";
 import { cn, controlDeviceId, makeStreamId, wsBaseFromLocation } from "./lib/utils";
 
+const xtermTheme = {
+  background: "#050607",
+  foreground: "#eef2f3",
+  cursor: "#35c98f",
+} as const;
+
 type WorkerView = {
   id: string;
+  worker_instance_id?: string;
   tenant_id?: string;
   name: string;
   addr: string;
@@ -85,11 +98,30 @@ type SessionView = {
 type MainView = "overview" | "workspace";
 type SplitDirection = "horizontal" | "vertical";
 type DropZone = "left" | "right" | "top" | "bottom" | "center";
+type AttachMode = "current" | "new-tab";
+
+type TerminalTargetView = {
+  session_name?: string;
+  window_id?: string;
+  window_index?: number;
+  window_name?: string;
+  window_active?: boolean;
+  pane_id?: string;
+  pane_index?: number;
+  pane_active?: boolean;
+  cwd?: string;
+  command?: string;
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+};
 
 type PaneNode = {
   type: "pane";
   id: string;
   sessionId?: string;
+  target?: TerminalTargetView;
 };
 
 type SplitNode = {
@@ -152,13 +184,14 @@ type Toast = Status & {
   sticky?: boolean;
 };
 
-type RefreshOptions = {
-	silent?: boolean;
-	notifyWorkerEvents?: boolean;
-};
-
 type AuthMode = "login" | "register";
 type AccessMode = "none" | "admin" | "account" | "direct";
+
+type RefreshOptions = {
+  silent?: boolean;
+  notifyWorkerEvents?: boolean;
+  accessModeOverride?: AccessMode;
+};
 
 type AuthCredentialPayload = {
   credential: string;
@@ -200,19 +233,142 @@ type HubVersionPayload = {
 type WorkerUpdateJob = {
   id: string;
   worker_id: string;
+  worker_instance_id?: string;
   target_version: string;
   repo?: string;
   status: string;
   message?: string;
+  events?: WorkerUpdateEvent[];
   created_at?: string;
   updated_at?: string;
   finished_at?: string;
+};
+
+type WorkerUpdateEvent = {
+  id: string;
+  job_id: string;
+  worker_id: string;
+  worker_instance_id?: string;
+  status: string;
+  message?: string;
+  created_at?: string;
+};
+
+type TerminalSize = {
+  cols?: number;
+  rows?: number;
+};
+
+type TerminalModePayload = {
+  mode?: string;
+  render_mode?: string;
+  resize_policy?: string;
+  remote_size?: TerminalSize;
+  viewport_size?: TerminalSize;
+  default_size?: TerminalSize;
+  fallback?: string;
+};
+
+type TerminalHistoryLine = {
+  seq_start?: number;
+  seq_end?: number;
+  generation?: number;
+  text: string;
+  flags?: string[];
+};
+
+type TerminalHistoryPage = {
+  start_seq?: number;
+  end_seq?: number;
+  has_more?: boolean;
+  lines?: TerminalHistoryLine[];
+};
+
+type TerminalCursor = {
+  x?: number;
+  y?: number;
+  visible?: boolean;
+};
+
+type TerminalCell = {
+  t?: string;
+  w?: number;
+  fg?: string;
+  bg?: string;
+  bold?: boolean;
+  faint?: boolean;
+  italic?: boolean;
+  blink?: boolean;
+  reverse?: boolean;
+  conceal?: boolean;
+  strike?: boolean;
+  underline?: string;
+  ul?: string;
+  link?: string;
+};
+
+type TerminalCellSnapshot = {
+  version?: string;
+  generation?: number;
+  cols?: number;
+  rows?: number;
+  cursor?: TerminalCursor;
+  lines?: TerminalCell[][];
+};
+
+type TerminalDiffOp = {
+  op?: string;
+  row?: number;
+  cells?: TerminalCell[];
+  cursor?: TerminalCursor;
+};
+
+type TerminalDiffPayload = {
+  generation?: number;
+  from_seq?: number;
+  to_seq?: number;
+  ops?: TerminalDiffOp[];
 };
 
 type WorkerSessionGroup = {
   worker: WorkerView | null;
   workerId: string;
   sessions: SessionView[];
+};
+
+type MobileTargetBrowser = {
+  session: SessionView;
+  mode: AttachMode;
+  loading: boolean;
+  error?: string;
+  targets: TerminalTargetView[];
+  level: "windows" | "panes";
+  windowKey?: string;
+};
+
+type SessionTargetSummary = {
+  windows: number;
+  panes: number;
+};
+
+type FavoritePane = {
+  sessionId: string;
+  target: TerminalTargetView;
+  label: string;
+  detail: string;
+};
+
+type FavoritesState = {
+  sessions: string[];
+  panes: FavoritePane[];
+};
+
+type TargetWindowGroup = {
+  key: string;
+  index: number;
+  name: string;
+  active: boolean;
+  targets: TerminalTargetView[];
 };
 
 type SignalPayload = {
@@ -259,15 +415,32 @@ const initialUser = readStoredUser();
 const initialTerminalSettings = readTerminalSettings();
 const initialWorkspaceState = readWorkspaceState();
 const initialRecentCWDs = readRecentCWDs();
+const initialFavorites = readFavorites();
+
+function useMediaQuery(mediaQuery: string) {
+  const [matches, setMatches] = React.useState(() => (typeof window === "undefined" ? false : window.matchMedia(mediaQuery).matches));
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia(mediaQuery);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [mediaQuery]);
+
+  return matches;
+}
 
 function App() {
+  const compactLayout = useMediaQuery("(max-width: 767px)");
   const [token, setToken] = React.useState(initialToken);
   const [tokenExpiresAt, setTokenExpiresAt] = React.useState(initialTokenExpiresAt);
   const [refreshToken, setRefreshToken] = React.useState(initialRefreshToken);
   const [refreshExpiresAt, setRefreshExpiresAt] = React.useState(initialRefreshExpiresAt);
   const [workers, setWorkers] = React.useState<WorkerView[]>([]);
   const [sessions, setSessions] = React.useState<SessionView[]>([]);
-  const [sidebarOpen, setSidebarOpen] = React.useState(true);
+  const [sidebarOpen, setSidebarOpen] = React.useState(() => typeof window === "undefined" ? true : window.matchMedia("(min-width: 768px)").matches);
   const [authOpen, setAuthOpen] = React.useState(false);
   const [authMode, setAuthMode] = React.useState<AuthMode>("login");
   const [authForm, setAuthForm] = React.useState({ email: "", password: "", name: "" });
@@ -276,6 +449,7 @@ function App() {
   const [workerFilter, setWorkerFilter] = React.useState("all");
   const [directSessionId, setDirectSessionId] = React.useState("");
   const [tokenDraft, setTokenDraft] = React.useState(initialToken);
+  const [signalDraft, setSignalDraft] = React.useState(initialSignal);
   const [joinSignal, setJoinSignal] = React.useState<SignalPayload | null>(null);
   const [createOpen, setCreateOpen] = React.useState(false);
   const [joinOpen, setJoinOpen] = React.useState(false);
@@ -287,9 +461,14 @@ function App() {
   const [tabs, setTabs] = React.useState<WorkspaceTab[]>(initialWorkspaceState.tabs);
   const [activeTabId, setActiveTabId] = React.useState(initialWorkspaceState.activeTabId);
   const [recentCWDs, setRecentCWDs] = React.useState<RecentCWDState>(initialRecentCWDs);
+  const [favorites, setFavorites] = React.useState<FavoritesState>(initialFavorites);
   const [previewStates, setPreviewStates] = React.useState<Record<string, PreviewState>>({});
+  const [targetPreviewStates, setTargetPreviewStates] = React.useState<Record<string, PreviewState>>({});
+  const [sessionTargetSummaries, setSessionTargetSummaries] = React.useState<Record<string, SessionTargetSummary>>({});
   const [hubVersion, setHubVersion] = React.useState<HubVersionPayload | null>(null);
   const [workerUpdateJobs, setWorkerUpdateJobs] = React.useState<Record<string, WorkerUpdateJob>>({});
+  const [actionLoading, setActionLoading] = React.useState<Record<string, boolean>>({});
+  const [mobileTargets, setMobileTargets] = React.useState<MobileTargetBrowser | null>(null);
   const [pendingFocusSessionId, setPendingFocusSessionId] = React.useState<string | null>(null);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
   const [toasts, setToasts] = React.useState<Toast[]>([]);
@@ -309,8 +488,8 @@ function App() {
   const webUpdateToastShown = React.useRef(false);
   const [status, setStatus] = React.useState<Status>({
     tone: "idle",
-    title: "No session attached",
-    detail: "Open a session from the sidebar.",
+    title: initialToken || initialSignal ? "Connecting" : "Control access required",
+    detail: initialToken || initialSignal ? "Preparing browser access." : "Sign in, enter a Direct Token, or exchange a signal.",
   });
   const [createForm, setCreateForm] = React.useState<CreateSessionForm>({
     worker_id: "",
@@ -356,6 +535,13 @@ function App() {
   }, [token, tokenExpiresAt, refreshToken, refreshExpiresAt]);
 
   React.useEffect(() => {
+    if (!compactLayout) {
+      setSidebarOpen(true);
+      setMobileTargets(null);
+    }
+  }, [compactLayout]);
+
+  React.useEffect(() => {
     localStorage.setItem("agentmux.workspace_state", JSON.stringify({ tabs, activeTabId }));
   }, [tabs, activeTabId]);
 
@@ -387,9 +573,9 @@ function App() {
     if (!token.trim()) return;
     const poll = () => {
       if (!authRef.current.token.trim()) return;
-      void refreshAll(authRef.current.token, { silent: true, notifyWorkerEvents: true });
+      void refreshInventory(authRef.current.token, { silent: true, notifyWorkerEvents: true });
     };
-    const timer = window.setInterval(poll, 10_000);
+    const timer = window.setInterval(poll, 15_000);
     window.addEventListener("focus", poll);
     return () => {
       window.clearInterval(timer);
@@ -445,23 +631,17 @@ function App() {
 
   React.useEffect(() => {
     if (!token.trim() || accessMode === "direct") return;
-    const hasActiveJobs = Object.values(workerUpdateJobs).some((job) => workerUpdateJobActive(job.status));
-    if (!hasActiveJobs) return;
+    const activeWorkerIDs = Object.entries(workerUpdateJobs)
+      .filter(([, job]) => workerUpdateJobActive(job.status))
+      .map(([workerID]) => workerID);
+    if (activeWorkerIDs.length === 0) return;
     const timer = window.setInterval(() => {
-      for (const workerID of Object.keys(workerUpdateJobs)) {
+      for (const workerID of activeWorkerIDs) {
         void refreshWorkerUpdateJobs(workerID);
       }
     }, 2_000);
     return () => window.clearInterval(timer);
   }, [token, accessMode, workerUpdateJobs]);
-
-  React.useEffect(() => {
-    if (!token.trim() || accessMode === "direct" || workers.length === 0) return;
-    for (const worker of workers) {
-      if (!workerHasCapability(worker, "worker.update.apply")) continue;
-      void refreshWorkerUpdateJobs(worker.id);
-    }
-  }, [token, accessMode, workers]);
 
   React.useEffect(() => {
     if (!createForm.worker_id && workers[0]) {
@@ -486,23 +666,40 @@ function App() {
   }, [pendingFocusSessionId, sessions, workerFilter]);
 
   async function exchangeSignal(signal: string) {
-    setStatus({ tone: "warn", title: "Exchanging signal", detail: "Requesting a browser credential." });
-    const res = await fetch("/api/exchange", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        signal,
-        role: "control",
-        device_id: controlDeviceId(),
-        device_name: browserDeviceName(),
-      }),
-    });
-    if (!res.ok) {
-      setStatus({ tone: "err", title: "Signal exchange failed", detail: await res.text() });
+    const nextSignal = signal.trim();
+    if (!nextSignal) {
+      setStatus({ tone: "warn", title: "Missing signal", detail: "Enter a Worker or Control signal." });
       return;
     }
-    const data = await res.json();
-    await acceptCredential(data, "Signal credential ready");
+    const actionKey = "auth:signal";
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
+    setStatus({ tone: "warn", title: "Exchanging signal", detail: "Requesting a browser credential." });
+    try {
+      const res = await fetch("/api/exchange", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          signal: nextSignal,
+          role: "control",
+          device_id: controlDeviceId(),
+          device_name: browserDeviceName(),
+        }),
+      });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: "Signal exchange failed", detail: await res.text() });
+        return;
+      }
+      const data = await res.json();
+      await acceptCredential(data, "Signal credential ready");
+    } finally {
+      setActionBusy(actionKey, false);
+    }
+  }
+
+  function submitSignal(event: React.FormEvent) {
+    event.preventDefault();
+    void exchangeSignal(signalDraft);
   }
 
   async function apiFetch(path: string, init: RequestInit = {}, authToken = authRef.current.token) {
@@ -533,6 +730,12 @@ function App() {
       setCurrentUser(null);
       localStorage.removeItem("agentmux.user");
     }
+    await refreshInventory(nextToken, { ...options, accessModeOverride: nextAccessMode });
+  }
+
+  async function refreshInventory(authToken = authRef.current.token, options: RefreshOptions = {}) {
+    const nextToken = await ensureFreshAccessToken(authToken);
+    if (nextToken) localStorage.setItem("agentmux.token", nextToken);
     const sessionsRes = await apiFetch("/api/sessions", {}, nextToken);
     if (!sessionsRes.ok) {
       if (!options.silent) {
@@ -540,32 +743,39 @@ function App() {
       }
       return;
     }
-    const sessionsPayload = await sessionsRes.json();
-    const nextSessions = sessionsPayload.sessions || [];
-    let nextWorkers: WorkerView[] = [];
-    if (nextAccessMode !== "direct") {
-      const workersRes = await apiFetch("/api/workers", {}, nextToken);
-      if (!workersRes.ok) {
-        if (!options.silent) {
-          setStatus({ tone: "err", title: "Workers unavailable", detail: `${workersRes.status}` });
-        }
-        return;
-      }
-      const workersPayload = await workersRes.json();
-      nextWorkers = workersPayload.workers || [];
-      if (options.notifyWorkerEvents && workerEventsReady.current) {
-        notifyWorkerEvents(workersRef.current, nextWorkers);
-      }
-      workersRef.current = nextWorkers;
-      workerEventsReady.current = true;
-    } else {
-      workersRef.current = [];
-      workerEventsReady.current = false;
-    }
+	const sessionsPayload = await sessionsRes.json();
+	const nextSessions = sessionsPayload.sessions || [];
+	let nextWorkers: WorkerView[] = [];
+	const workersRes = await apiFetch("/api/workers", {}, nextToken);
+	if (!workersRes.ok) {
+	  if (!options.silent) {
+	    setStatus({ tone: "err", title: "Workers unavailable", detail: `${workersRes.status}` });
+	  }
+	  return;
+	}
+	const workersPayload = await workersRes.json();
+	nextWorkers = workersPayload.workers || [];
+	if (options.notifyWorkerEvents && workerEventsReady.current) {
+	  notifyWorkerEvents(workersRef.current, nextWorkers);
+	}
+	workersRef.current = nextWorkers;
+	workerEventsReady.current = true;
     setWorkers(nextWorkers);
     setSessions(nextSessions);
     if (!options.silent) {
-      setStatus({ tone: "ok", title: nextAccessMode === "direct" ? "Direct token connected" : "Hub synced", detail: nextAccessMode === "direct" ? `${nextSessions.length} sessions` : `${nextWorkers.length} workers · ${nextSessions.length} sessions` });
+      const effectiveAccessMode = options.accessModeOverride || accessMode;
+      setStatus({ tone: "ok", title: effectiveAccessMode === "direct" ? "Direct token connected" : "Hub synced", detail: `${nextWorkers.length} workers · ${nextSessions.length} sessions` });
+    }
+  }
+
+  async function refreshAllFromButton() {
+    const actionKey = "refresh";
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
+    try {
+      await refreshAll();
+    } finally {
+      setActionBusy(actionKey, false);
     }
   }
 
@@ -605,8 +815,24 @@ function App() {
     setToasts((items) => items.filter((toast) => toast.id !== id));
   }
 
+  function setActionBusy(key: string, busy: boolean) {
+    setActionLoading((items) => {
+      if (busy) return { ...items, [key]: true };
+      const next = { ...items };
+      delete next[key];
+      return next;
+    });
+  }
+
+  function isActionBusy(key: string) {
+    return Boolean(actionLoading[key]);
+  }
+
   async function createSession(event: React.FormEvent) {
     event.preventDefault();
+    const actionKey = "session:create";
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
     const payload = {
       ...createForm,
       worker_id: createForm.worker_id.trim(),
@@ -615,68 +841,125 @@ function App() {
       command: createForm.command.trim(),
     };
     const targetSessionID = `${payload.worker_id}/${payload.name}`;
-    const res = await apiFetch("/api/sessions", { method: "POST", body: JSON.stringify(payload) });
-    if (!res.ok) {
-      setStatus({ tone: "err", title: "Create failed", detail: await res.text() });
-      return;
+    try {
+      const res = await apiFetch("/api/sessions", { method: "POST", body: JSON.stringify(payload) });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: "Create failed", detail: await res.text() });
+        return;
+      }
+      rememberRecentCWD(payload.worker_id, payload.cwd);
+      setStatus({ tone: "ok", title: "Session created", detail: targetSessionID });
+      setCreateOpen(false);
+      setWorkerFilter(payload.worker_id);
+      void focusCreatedSession(targetSessionID, payload.worker_id);
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    rememberRecentCWD(payload.worker_id, payload.cwd);
-    setStatus({ tone: "ok", title: "Session created", detail: targetSessionID });
-    setCreateOpen(false);
-    setWorkerFilter(payload.worker_id);
-    void focusCreatedSession(targetSessionID, payload.worker_id);
   }
 
-  function rememberRecentCWD(workerID: string, cwd: string) {
-    const normalized = cwd.trim() || ".";
-    setRecentCWDs((current) => {
-      const next = {
-        ...current,
+	  function rememberRecentCWD(workerID: string, cwd: string) {
+	    const normalized = cwd.trim() || ".";
+	    setRecentCWDs((current) => {
+	      const next = {
+	        ...current,
         [workerID]: uniqueStrings([normalized, ...(current[workerID] || [])], 8),
       };
       localStorage.setItem("agentmux.recent_cwds", JSON.stringify(next));
-      return next;
-    });
-  }
+	      return next;
+	    });
+	  }
 
-  async function killSession(session: SessionView) {
-    const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}`, {
-      method: "DELETE",
-    });
-    if (!res.ok) {
-      setStatus({ tone: "err", title: "Exit failed", detail: await res.text() });
-      return;
+	  function updateFavorites(update: React.SetStateAction<FavoritesState>) {
+	    setFavorites((current) => {
+	      const next = typeof update === "function" ? (update as (value: FavoritesState) => FavoritesState)(current) : update;
+	      localStorage.setItem("agentmux.favorites", JSON.stringify(next));
+	      return next;
+	    });
+	  }
+
+	  function toggleSessionFavorite(sessionId: string) {
+	    updateFavorites((current) => {
+	      const exists = current.sessions.includes(sessionId);
+	      return {
+	        ...current,
+	        sessions: exists ? current.sessions.filter((id) => id !== sessionId) : [...current.sessions, sessionId],
+	      };
+	    });
+	  }
+
+	  function togglePaneFavorite(session: SessionView, target: TerminalTargetView, index: number) {
+	    const key = favoritePaneKey(session.id, target);
+	    updateFavorites((current) => {
+	      const exists = current.panes.some((pane) => favoritePaneKey(pane.sessionId, pane.target) === key);
+	      return {
+	        ...current,
+	        panes: exists
+	          ? current.panes.filter((pane) => favoritePaneKey(pane.sessionId, pane.target) !== key)
+	          : [
+	              ...current.panes,
+	              {
+	                sessionId: session.id,
+	                target,
+	                label: `${session.name || session.id} ${terminalTargetShortLabel(target) || terminalTargetLabel(target, index)}`,
+	                detail: terminalTargetDetail(target),
+	              },
+	            ],
+	      };
+	    });
+	  }
+
+	  async function killSession(session: SessionView) {
+    const actionKey = `session:kill:${session.id}`;
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
+    try {
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: "Exit failed", detail: await res.text() });
+        return;
+      }
+      setStatus({ tone: "warn", title: "Exit queued", detail: `${session.worker_id}/${session.name}` });
+      setTabs((items) =>
+        items.map((tab) => {
+          const nextLayout = clearSessionFromLayout(tab.layout, session.id);
+          const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
+          return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab, nextLayout) };
+        }),
+      );
+      window.setTimeout(() => void refreshInventory(), 700);
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    setStatus({ tone: "warn", title: "Exit queued", detail: `${session.worker_id}/${session.name}` });
-    setTabs((items) =>
-      items.map((tab) => {
-        const nextLayout = clearSessionFromLayout(tab.layout, session.id);
-        const nextActivePane = findPane(nextLayout, tab.activePane) ? tab.activePane : firstPaneId(nextLayout);
-        return { ...tab, layout: nextLayout, activePane: nextActivePane, title: titleForTab(tab, nextLayout) };
-      }),
-    );
-    window.setTimeout(() => void refreshAll(), 700);
   }
 
   async function submitAuth(event: React.FormEvent) {
     event.preventDefault();
+    const actionKey = `auth:${authMode}`;
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
     const path = authMode === "register" ? "/api/auth/register" : "/api/auth/login";
-    const res = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        email: authForm.email,
-        password: authForm.password,
-        name: authForm.name,
-        device_id: controlDeviceId(),
-        device_name: browserDeviceName(),
-      }),
-    });
-    if (!res.ok) {
-      setStatus({ tone: "err", title: authMode === "register" ? "Registration failed" : "Login failed", detail: errorDetailFromResponseText(res.status, await res.text()) });
-      return;
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: authForm.email,
+          password: authForm.password,
+          name: authForm.name,
+          device_id: controlDeviceId(),
+          device_name: browserDeviceName(),
+        }),
+      });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: authMode === "register" ? "Registration failed" : "Login failed", detail: errorDetailFromResponseText(res.status, await res.text()) });
+        return;
+      }
+      await acceptCredential(await res.json(), authMode === "register" ? "Account created" : "Signed in");
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    await acceptCredential(await res.json(), authMode === "register" ? "Account created" : "Signed in");
   }
 
   async function acceptCredential(data: AuthCredentialPayload, title: string) {
@@ -693,25 +976,32 @@ function App() {
   }
 
   async function applyDirectToken() {
+    const actionKey = "auth:direct-token";
+    if (isActionBusy(actionKey)) return;
     const nextToken = tokenDraft.trim();
     if (!nextToken) {
       setStatus({ tone: "warn", title: "Missing token", detail: "Enter a control credential or dev token." });
       return;
     }
-    setToken(nextToken);
-    setTokenExpiresAt("");
-    setRefreshToken("");
-    setRefreshExpiresAt("");
-	setCurrentUser(null);
-	setAccessMode("direct");
-	setJoinSignal(null);
-    localStorage.setItem("agentmux.token", nextToken);
-    localStorage.removeItem("agentmux.token_expires_at");
-    localStorage.removeItem("agentmux.refresh_token");
-    localStorage.removeItem("agentmux.refresh_expires_at");
-    localStorage.removeItem("agentmux.user");
-    setAuthOpen(false);
-    await refreshAll(nextToken);
+    setActionBusy(actionKey, true);
+    try {
+      setToken(nextToken);
+      setTokenExpiresAt("");
+      setRefreshToken("");
+      setRefreshExpiresAt("");
+      setCurrentUser(null);
+      setAccessMode("direct");
+      setJoinSignal(null);
+      localStorage.setItem("agentmux.token", nextToken);
+      localStorage.removeItem("agentmux.token_expires_at");
+      localStorage.removeItem("agentmux.refresh_token");
+      localStorage.removeItem("agentmux.refresh_expires_at");
+      localStorage.removeItem("agentmux.user");
+      setAuthOpen(false);
+      await refreshInventory(nextToken, { accessModeOverride: "direct" });
+    } finally {
+      setActionBusy(actionKey, false);
+    }
   }
 
   function signOut() {
@@ -815,17 +1105,20 @@ function App() {
       setStatus({ tone: "warn", title: "Direct token is limited", detail: "Direct Token access can connect to shared sessions, but cannot generate new Worker signals." });
       return;
     }
+    if (joinLoading) return;
     setJoinLoading(true);
-    const res = await apiFetch("/api/signals", { method: "POST" });
-    if (!res.ok) {
+    try {
+      const res = await apiFetch("/api/signals", { method: "POST" });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: "Signal generation failed", detail: signalGenerationErrorDetail(res.status, await res.text()) });
+        return;
+      }
+      const data = (await res.json()) as SignalPayload;
+      setJoinSignal(data);
+      setStatus({ tone: "ok", title: "Join signal ready", detail: `${data.tenant_id} · expires ${new Date(data.expires_at).toLocaleString()}` });
+    } finally {
       setJoinLoading(false);
-      setStatus({ tone: "err", title: "Signal generation failed", detail: signalGenerationErrorDetail(res.status, await res.text()) });
-      return;
     }
-    const data = (await res.json()) as SignalPayload;
-    setJoinSignal(data);
-    setJoinLoading(false);
-    setStatus({ tone: "ok", title: "Join signal ready", detail: `${data.tenant_id} · expires ${new Date(data.expires_at).toLocaleString()}` });
   }
 
   async function openJoinModal() {
@@ -848,7 +1141,13 @@ function App() {
         setSessions(nextSessions);
         const found = nextSessions.find((session: SessionView) => session.id === sessionID);
         if (found) {
-          await attach(found.id);
+          if (accessMode === "direct") {
+            setDirectSessionId(found.id);
+            setWorkerFilter(workerID);
+            setStatus({ tone: "ok", title: "Session ready", detail: found.id });
+            return;
+          }
+          await attachSession(found);
           setWorkerFilter(workerID);
           setPendingFocusSessionId(found.id);
           setStatus({ tone: "ok", title: "Session ready", detail: found.id });
@@ -857,18 +1156,25 @@ function App() {
       }
       await sleep(350);
     }
-    await refreshAll();
+    await refreshInventory();
   }
 
   async function startOAuth(provider: "github" | "google") {
-    const res = await fetch(`/api/auth/oauth/${provider}?device_id=${encodeURIComponent(controlDeviceId())}`);
-    const text = await res.text();
-    if (!res.ok) {
-      setStatus({ tone: "warn", title: `${provider} OAuth not configured`, detail: errorDetail(text) });
-      return;
+    const actionKey = `auth:oauth:${provider}`;
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
+    try {
+      const res = await fetch(`/api/auth/oauth/${provider}?device_id=${encodeURIComponent(controlDeviceId())}`);
+      const text = await res.text();
+      if (!res.ok) {
+        setStatus({ tone: "warn", title: `${provider} OAuth not configured`, detail: errorDetail(text) });
+        return;
+      }
+      const data = JSON.parse(text);
+      if (data.url) window.location.href = data.url;
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    const data = JSON.parse(text);
-    if (data.url) window.location.href = data.url;
   }
 
   function updateTab(tabId: string, update: (tab: WorkspaceTab) => WorkspaceTab) {
@@ -893,9 +1199,10 @@ function App() {
     updateTab(tabId, (tab) => ({ ...tab, title, renamed: true }));
   }
 
-  function focusAttachedSession(sessionId: string) {
+  function focusAttachedSession(sessionId: string, target?: TerminalTargetView | null) {
+    const targetKey = terminalTargetKey(target);
     for (const tab of tabs) {
-      const pane = collectPanes(tab.layout).find((candidate) => candidate.sessionId === sessionId);
+      const pane = collectPanes(tab.layout).find((candidate) => candidate.sessionId === sessionId && terminalTargetKey(candidate.target) === targetKey);
       if (!pane) continue;
       setActiveTabId(tab.id);
       setActivePaneForTab(tab.id, pane.id);
@@ -905,21 +1212,127 @@ function App() {
     return false;
   }
 
-  async function attach(sessionId: string, target: "current" | "new-tab" = "current") {
+  async function attach(sessionId: string, mode: AttachMode = "current", target?: TerminalTargetView | null) {
     await ensureFreshAccessToken();
-    if (focusAttachedSession(sessionId)) return;
+    const terminalTarget = normalizeTerminalTarget(target);
+    if (focusAttachedSession(sessionId, terminalTarget)) return;
     setMainView("workspace");
-    if (target === "new-tab") {
-      const tab = newWorkspaceTab(sessionId, workspaceTitleForSession(sessionId));
+    if (mode === "new-tab") {
+      const tab = newWorkspaceTab(sessionId, workspaceTitleForSession(sessionId, terminalTarget), terminalTarget);
       setTabs((items) => [...items, tab]);
       setActiveTabId(tab.id);
       return;
     }
-    setLayoutForTab(activeTabId, (node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId })));
+    setLayoutForTab(activeTabId, (node) => updatePane(node, activePane, (pane) => ({ ...pane, sessionId, target: terminalTarget })));
   }
 
-  function createWorkspaceTab(sessionId?: string) {
-    const tab = newWorkspaceTab(sessionId, sessionId ? workspaceTitleForSession(sessionId) : `Workspace ${tabs.length + 1}`);
+  async function attachSession(session: SessionView, mode: AttachMode = "current") {
+    if (compactLayout && accessMode !== "direct") {
+      await openMobileTargetBrowser(session, mode);
+      return;
+    }
+    await attach(session.id, mode);
+  }
+
+  async function openMobileTargetBrowser(session: SessionView, mode: AttachMode) {
+    setSidebarOpen(true);
+    setMobileTargets({ session, mode, loading: true, targets: [], level: "windows" });
+    try {
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}/targets`);
+      if (!res.ok) {
+        const detail = errorDetailFromResponseText(res.status, await res.text());
+        setMobileTargets({ session, mode, loading: false, error: detail, targets: [], level: "panes" });
+        setStatus({ tone: "warn", title: "Pane targets unavailable", detail: `${session.id} · ${detail}` });
+        return;
+      }
+	      const payload = (await res.json()) as { targets?: unknown[] };
+	      const targets = (payload.targets || []).map(normalizeTerminalTarget).filter((target): target is TerminalTargetView => Boolean(target));
+	      const groups = groupTerminalTargetsByWindow(targets);
+	      setSessionTargetSummaries((items) => ({ ...items, [session.id]: sessionTargetSummary(targets) }));
+	      if (groups.length === 1 && groups[0].targets.length === 1 && groups[0].targets[0]?.pane_id) {
+	        setMobileTargets(null);
+	        setSidebarOpen(false);
+	        await attach(session.id, mode, groups[0].targets[0]);
+	        return;
+	      }
+	      const expandedGroup = groups.find((group) => group.active) || groups[0];
+      setMobileTargets({
+        session,
+        mode,
+        loading: false,
+        targets,
+        level: "windows",
+        windowKey: expandedGroup?.key,
+      });
+      if (expandedGroup) loadTargetPreviews(session, expandedGroup.targets);
+      if (!targets.length) {
+        setStatus({ tone: "warn", title: "No pane targets", detail: session.id });
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setMobileTargets({ session, mode, loading: false, error: detail, targets: [], level: "panes" });
+      setStatus({ tone: "err", title: "Pane targets failed", detail });
+    }
+  }
+
+	  function selectMobileTargetWindow(windowKey: string) {
+	    const current = mobileTargets;
+	    if (!current) return;
+	    const nextWindowKey = current.windowKey === windowKey ? undefined : windowKey;
+	    setMobileTargets({ ...current, level: "windows", windowKey: nextWindowKey });
+	    if (!nextWindowKey) return;
+	    const group = groupTerminalTargetsByWindow(current.targets).find((item) => item.key === windowKey);
+	    if (group) loadTargetPreviews(current.session, group.targets);
+	  }
+
+  function backMobileTargetLevel() {
+    setMobileTargets(null);
+  }
+
+  async function attachMobileTarget(target?: TerminalTargetView | null) {
+    if (!mobileTargets) return;
+    const { session, mode } = mobileTargets;
+    setMobileTargets(null);
+    setSidebarOpen(false);
+    await attach(session.id, mode, target?.pane_id ? target : null);
+  }
+
+  function loadTargetPreviews(session: SessionView, targets: TerminalTargetView[]) {
+    for (const target of targets) {
+      if (!target.pane_id) continue;
+      void loadTargetPreview(session, target);
+    }
+  }
+
+  async function loadTargetPreview(session: SessionView, target: TerminalTargetView, force = false) {
+    const key = targetPreviewKey(session.id, target);
+    const current = targetPreviewStates[key];
+    if (!force && (current?.loading || (current?.loadedAt && Date.now() - current.loadedAt < 45_000))) return;
+    setTargetPreviewStates((items) => ({ ...items, [key]: { ...items[key], loading: true, error: "" } }));
+    const params = terminalTargetPreviewParams(target, 12);
+    const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}/preview?${params}`);
+    if (!res.ok) {
+      const detail = errorDetailFromResponseText(res.status, await res.text());
+      setTargetPreviewStates((items) => ({
+        ...items,
+        [key]: { loading: false, error: detail, loadedAt: Date.now() },
+      }));
+      return;
+    }
+    const payload = (await res.json()) as { data?: string; scope?: string };
+    setTargetPreviewStates((items) => ({
+      ...items,
+      [key]: {
+        loading: false,
+        data: stripAnsi(payload.data || ""),
+        scope: payload.scope || "pane",
+        loadedAt: Date.now(),
+      },
+    }));
+  }
+
+  function createWorkspaceTab(sessionId?: string, target?: TerminalTargetView) {
+    const tab = newWorkspaceTab(sessionId, sessionId ? workspaceTitleForSession(sessionId, target) : `Workspace ${tabs.length + 1}`, target);
     setTabs((items) => [...items, tab]);
     setActiveTabId(tab.id);
     setMainView("workspace");
@@ -968,15 +1381,23 @@ function App() {
   }
 
   async function updateWorker(worker: WorkerView, patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) {
-    const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}`, {
-      method: "PATCH",
-      body: JSON.stringify(patch),
-    });
-    if (!res.ok) {
-      setStatus({ tone: "err", title: "Worker update failed", detail: await res.text() });
-      return;
+    const patchKey = Object.keys(patch).sort().join(",") || "settings";
+    const actionKey = `worker:update:${worker.id}:${patchKey}`;
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
+    try {
+      const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: "Worker update failed", detail: await res.text() });
+        return;
+      }
+      await refreshInventory();
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    await refreshAll();
   }
 
   async function refreshWorkerUpdateJobs(workerID: string) {
@@ -987,48 +1408,62 @@ function App() {
     if (!latest) return;
     setWorkerUpdateJobs((items) => ({ ...items, [workerID]: latest }));
     if (!workerUpdateJobActive(latest.status)) {
-      await refreshAll(authRef.current.token, { silent: true });
+      await refreshInventory(authRef.current.token, { silent: true });
     }
   }
 
   async function updateWorkerBinary(worker: WorkerView) {
+    const actionKey = `worker:binary:${worker.id}`;
+    if (isActionBusy(actionKey)) return;
     const backend = (worker.backend || "").toLowerCase();
     const allowDisruptive = backend !== "tmux";
     if (allowDisruptive && !window.confirm(`Update ${workerDisplayLabel(worker)}?\n\nBackend ${backend || "unknown"} may lose in-process sessions when the worker restarts.`)) {
       return;
     }
     const targetVersion = normalizeComparableVersion(hubVersion?.version || "") ? hubVersion?.version || "latest" : "latest";
-    const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}/updates`, {
-      method: "POST",
-      body: JSON.stringify({ version: targetVersion, allow_disruptive_restart: allowDisruptive }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      setStatus({ tone: "err", title: "Worker update failed", detail: errorDetailFromResponseText(res.status, text) });
-      pushToast({ tone: "err", title: "Worker update failed", detail: `${workerDisplayLabel(worker)} · ${errorDetailFromResponseText(res.status, text)}` });
-      return;
+    setActionBusy(actionKey, true);
+    try {
+      const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}/updates`, {
+        method: "POST",
+        body: JSON.stringify({ version: targetVersion, allow_disruptive_restart: allowDisruptive }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        setStatus({ tone: "err", title: "Worker update failed", detail: errorDetailFromResponseText(res.status, text) });
+        pushToast({ tone: "err", title: "Worker update failed", detail: `${workerDisplayLabel(worker)} · ${errorDetailFromResponseText(res.status, text)}` });
+        return;
+      }
+      const payload = await res.json();
+      const job = payload?.job as WorkerUpdateJob | undefined;
+      if (job) {
+        setWorkerUpdateJobs((items) => ({ ...items, [worker.id]: job }));
+      }
+      const jobId = job?.id || "queued";
+      setStatus({ tone: "ok", title: "Worker update queued", detail: `${workerDisplayLabel(worker)} · ${jobId}` });
+      pushToast({ tone: "ok", title: "Worker update queued", detail: `${workerDisplayLabel(worker)} · ${targetVersion}` });
+      await refreshInventory();
+      void refreshWorkerUpdateJobs(worker.id);
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    const payload = await res.json();
-    const job = payload?.job as WorkerUpdateJob | undefined;
-    if (job) {
-      setWorkerUpdateJobs((items) => ({ ...items, [worker.id]: job }));
-    }
-    const jobId = job?.id || "queued";
-    setStatus({ tone: "ok", title: "Worker update queued", detail: `${workerDisplayLabel(worker)} · ${jobId}` });
-    pushToast({ tone: "ok", title: "Worker update queued", detail: `${workerDisplayLabel(worker)} · ${targetVersion}` });
-    await refreshAll();
-    void refreshWorkerUpdateJobs(worker.id);
   }
 
   async function evictWorker(worker: WorkerView) {
     if (!window.confirm(`Evict worker ${workerDisplayLabel(worker)}?`)) return;
-    const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}`, { method: "DELETE" });
-    if (!res.ok) {
-      setStatus({ tone: "err", title: "Worker eviction failed", detail: await res.text() });
-      return;
+    const actionKey = `worker:evict:${worker.id}`;
+    if (isActionBusy(actionKey)) return;
+    setActionBusy(actionKey, true);
+    try {
+      const res = await apiFetch(`/api/workers/${encodeURIComponent(worker.id)}`, { method: "DELETE" });
+      if (!res.ok) {
+        setStatus({ tone: "err", title: "Worker eviction failed", detail: await res.text() });
+        return;
+      }
+      setStatus({ tone: "warn", title: "Worker evicted", detail: worker.id });
+      await refreshInventory();
+    } finally {
+      setActionBusy(actionKey, false);
     }
-    setStatus({ tone: "warn", title: "Worker evicted", detail: worker.id });
-    await refreshAll();
   }
 
   function updateWorkerTerminalSettings(workerId: string, next: WorkerTerminalSettings) {
@@ -1061,7 +1496,7 @@ function App() {
     if (payload.kind === "session") {
       const pane = zone === "center" ? undefined : newPane(payload.sessionId);
       setLayoutForTab(tabId, (node) => {
-        if (zone === "center") return updatePane(node, targetPaneId, (pane) => ({ ...pane, sessionId: payload.sessionId }));
+        if (zone === "center") return updatePane(node, targetPaneId, (pane) => ({ ...pane, sessionId: payload.sessionId, target: undefined }));
         return insertPaneRelative(node, targetPaneId, zone, pane!).node;
       });
       setActivePaneForTab(tabId, pane?.id || targetPaneId);
@@ -1092,20 +1527,48 @@ function App() {
   const activeSessionIds = new Set(
     tabs.flatMap((tab) => collectPanes(tab.layout).map((pane) => pane.sessionId).filter((id): id is string => Boolean(id))),
   );
+  const needsAccess = accessMode === "none" || !token.trim();
   const directAccess = accessMode === "direct";
+
+  if (needsAccess) {
+    return (
+      <AccessGate
+        authMode={authMode}
+        authForm={authForm}
+        token={tokenDraft}
+        signal={signalDraft}
+        status={status}
+        onModeChange={setAuthMode}
+        onFormChange={setAuthForm}
+        onTokenChange={setTokenDraft}
+        onSignalChange={setSignalDraft}
+        onSubmitAuth={submitAuth}
+        onSubmitSignal={submitSignal}
+        onApplyDirectToken={() => void applyDirectToken()}
+        onOAuth={(provider) => void startOAuth(provider)}
+        authSubmitting={isActionBusy(`auth:${authMode}`)}
+        directTokenLoading={isActionBusy("auth:direct-token")}
+        signalLoading={isActionBusy("auth:signal")}
+        oauthLoading={(provider) => isActionBusy(`auth:oauth:${provider}`)}
+      />
+    );
+  }
 
   if (directAccess) {
     return (
-      <div className="flex h-screen bg-background text-foreground">
-        <SimpleDirectControlView
-          sessions={sessions}
-          selectedSessionId={directSessionId}
-          token={token}
-          onSelectSession={setDirectSessionId}
-          onRefresh={() => void refreshAll()}
-          onSignIn={() => setAuthOpen(true)}
-          setStatus={setStatus}
-        />
+      <div className="flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen">
+	<SimpleDirectControlView
+	  workers={workerOptions}
+	  sessions={sessions}
+	  selectedSessionId={directSessionId}
+	  token={token}
+	  onSelectSession={setDirectSessionId}
+	  onRefresh={() => void refreshAllFromButton()}
+	  onCreateSession={() => setCreateOpen(true)}
+	  onSignIn={() => setAuthOpen(true)}
+          refreshLoading={isActionBusy("refresh")}
+	  setStatus={setStatus}
+	/>
         <ToastViewport toasts={toasts} onDismiss={dismissToast} />
         <AuthModal
           open={authOpen}
@@ -1119,16 +1582,36 @@ function App() {
           onTokenChange={setTokenDraft}
           onSubmit={submitAuth}
           onApplyDirectToken={() => void applyDirectToken()}
-          onOAuth={(provider) => void startOAuth(provider)}
-          onLogout={signOut}
-        />
+	  onOAuth={(provider) => void startOAuth(provider)}
+	  onLogout={signOut}
+          submitting={isActionBusy(`auth:${authMode}`)}
+          directTokenLoading={isActionBusy("auth:direct-token")}
+          oauthLoading={(provider) => isActionBusy(`auth:oauth:${provider}`)}
+	/>
+	<CreateSessionModal
+	  open={createOpen}
+	  createForm={createForm}
+	  workerSearch={workerSearch}
+	  workers={filteredCreateWorkers}
+	  cwdOptions={createCWDOptions}
+	  onClose={() => setCreateOpen(false)}
+	  onSubmit={createSession}
+	  onWorkerSearchChange={setWorkerSearch}
+	  onFormChange={setCreateForm}
+	  onSelectCWD={(cwd) => setCreateForm((form) => ({ ...form, cwd }))}
+          submitting={isActionBusy("session:create")}
+	/>
       </div>
     );
   }
 
   return (
-    <div className="flex h-screen bg-background text-foreground">
-      <aside className={cn("flex h-full shrink-0 flex-col border-r border-border bg-card transition-all", sidebarOpen ? "w-80" : "w-0 overflow-hidden")}>
+    <div className="relative flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen">
+      {sidebarOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/60 md:hidden" onClick={() => setSidebarOpen(false)} aria-label="Close sessions drawer" /> : null}
+      <aside className={cn(
+        "fixed inset-y-0 left-0 z-40 flex h-full w-[min(88vw,20rem)] shrink-0 flex-col border-r border-border bg-card transition-all duration-200 md:static md:z-auto md:translate-x-0",
+        sidebarOpen ? "translate-x-0 md:w-80" : "-translate-x-full md:w-0 md:overflow-hidden",
+      )}>
         <div className="flex h-14 items-center justify-between border-b border-border px-3">
           <div className="flex items-center gap-2 text-sm font-semibold">
             <img src="/agentmux-mark.svg" alt="" className="h-5 w-5 rounded-md" />
@@ -1138,22 +1621,72 @@ function App() {
             <ChevronLeft className="h-4 w-4" />
           </Button>
         </div>
+        {mobileTargets ? (
+	          <MobileTargetNavigator
+	            state={mobileTargets}
+	            previewStates={targetPreviewStates}
+	            favorites={favorites}
+	            onBack={backMobileTargetLevel}
+	            onSelectWindow={selectMobileTargetWindow}
+	            onAttachTarget={(target) => void attachMobileTarget(target)}
+	            onAttachSession={() => void attachMobileTarget(null)}
+	            onRefreshPreview={(target) => void loadTargetPreview(mobileTargets.session, target, true)}
+	            onTogglePaneFavorite={(target, index) => togglePaneFavorite(mobileTargets.session, target, index)}
+	          />
+        ) : (
         <div className="min-h-0 flex-1 overflow-auto p-1.5">
           <div className="mb-2 flex items-center gap-2 px-1">
             <div className="flex-1 text-xs font-medium uppercase text-muted-foreground">Sessions</div>
-            <Button variant="ghost" size="icon-sm" onClick={() => void refreshAll()} title="Refresh workers and sessions">
+            <Button variant="ghost" size="icon-sm" onClick={() => void refreshAllFromButton()} loading={isActionBusy("refresh")} title="Refresh workers and sessions">
               <RefreshCw className="h-4 w-4" />
             </Button>
           </div>
-          <div className="mb-3 px-1">
-            <Select value={workerFilter} onChange={(event) => setWorkerFilter(event.target.value)} className="h-8 text-xs">
-              <option value="all">All workers</option>
-              {workerOptions.map((worker) => (
-                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)} · {workerStatusLabel(worker)}</option>
-              ))}
-            </Select>
-          </div>
-          <div className="space-y-1">
+	          <div className="mb-3 px-1">
+	            <Select value={workerFilter} onChange={(event) => setWorkerFilter(event.target.value)} className="h-8 text-xs">
+	              <option value="all">All workers</option>
+	              {workerOptions.map((worker) => (
+	                <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)} · {workerStatusLabel(worker)}</option>
+	              ))}
+	            </Select>
+	          </div>
+	          {favorites.sessions.length || favorites.panes.length ? (
+	            <div className="mb-3 space-y-1 rounded-md border border-border bg-background/70 p-1.5">
+	              <div className="px-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">Favorites</div>
+	              {favorites.sessions.map((sessionId) => {
+	                const session = sessions.find((item) => item.id === sessionId);
+	                if (!session) return null;
+	                return (
+	                  <button
+	                    key={sessionId}
+	                    type="button"
+	                    className="flex w-full min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left hover:bg-secondary"
+	                    onClick={() => void attachSession(session)}
+	                  >
+	                    <Star className="h-3.5 w-3.5 shrink-0 fill-primary text-primary" />
+	                    <span className="min-w-0 flex-1 truncate text-xs">{session.name || session.id}</span>
+	                    <StatusBadge>session</StatusBadge>
+	                  </button>
+	                );
+	              })}
+	              {favorites.panes.map((favorite) => {
+	                const session = sessions.find((item) => item.id === favorite.sessionId);
+	                if (!session) return null;
+	                return (
+	                  <button
+	                    key={favoritePaneKey(favorite.sessionId, favorite.target)}
+	                    type="button"
+	                    className="flex w-full min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left hover:bg-secondary"
+	                    onClick={() => void attach(session.id, "current", favorite.target)}
+	                  >
+	                    <Star className="h-3.5 w-3.5 shrink-0 fill-primary text-primary" />
+	                    <span className="min-w-0 flex-1 truncate text-xs">{favorite.label}</span>
+	                    <StatusBadge>pane</StatusBadge>
+	                  </button>
+	                );
+	              })}
+	            </div>
+	          ) : null}
+	          <div className="space-y-1">
             {sessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions.</div> : null}
             {sessions.length > 0 && groupedSessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions for this worker.</div> : null}
             {groupedSessions.map((group) => (
@@ -1168,37 +1701,63 @@ function App() {
                   </div>
                 </div>
                 {group.sessions.map((session) => (
-                  <div
-                    key={session.id}
-                    className={cn(
-                      "rounded-md border border-transparent hover:border-border hover:bg-secondary",
-                      activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
-                    )}
-                  >
-                    <div className="flex items-start gap-1">
-                      <button
+	                  <div
+	                    key={session.id}
+	                    className={cn(
+	                      "rounded-md border border-transparent hover:border-border hover:bg-secondary",
+	                      activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
+	                    )}
+	                  >
+	                    <div className="flex items-start gap-1">
+	                      <button
                         ref={(node) => {
                           sessionButtonRefs.current[session.id] = node;
                         }}
                         type="button"
                         draggable
                         className="min-w-0 flex-1 px-2 py-1.5 text-left"
-                        onClick={() => void attach(session.id)}
+                        onClick={() => {
+                          void attachSession(session);
+                        }}
                         onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
                         onDragEnd={() => setDropTarget(null)}
-                      >
-                        <div className="flex min-w-0 items-center gap-1.5">
+	                      >
+	                        {(() => {
+	                          const targetSummary = sessionTargetSummaries[session.id];
+	                          return targetSummary ? (
+	                            <div className="mb-1 flex flex-wrap items-center gap-1">
+	                              <StatusBadge>session</StatusBadge>
+	                              <StatusBadge>{targetSummary.windows} window{targetSummary.windows === 1 ? "" : "s"}</StatusBadge>
+	                              <StatusBadge>{targetSummary.panes} pane{targetSummary.panes === 1 ? "" : "s"}</StatusBadge>
+	                            </div>
+	                          ) : (
+	                            <div className="mb-1 flex flex-wrap items-center gap-1">
+	                              <StatusBadge>session</StatusBadge>
+	                            </div>
+	                          );
+	                        })()}
+	                        <div className="flex min-w-0 items-center gap-1.5">
                           <div className="truncate text-sm font-medium">{session.name || session.id}</div>
                           <BackendBadge value={sessionBackendLabel(session, group.worker)} />
                         </div>
                         <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
                         <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
                       </button>
-                      <div className="mt-1 mr-1 flex shrink-0 items-center gap-1">
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          onClick={() => void attach(session.id, "new-tab")}
+	                      <div className="mt-1 mr-1 flex shrink-0 items-center gap-1">
+	                        <Button
+	                          variant={favorites.sessions.includes(session.id) ? "secondary" : "ghost"}
+	                          size="icon-sm"
+	                          onClick={() => toggleSessionFavorite(session.id)}
+	                          title={favorites.sessions.includes(session.id) ? "Remove session favorite" : "Favorite session"}
+	                        >
+	                          <Star className={cn("h-4 w-4", favorites.sessions.includes(session.id) && "fill-primary text-primary")} />
+	                        </Button>
+	                        <Button
+	                          variant="ghost"
+	                          size="icon-sm"
+                          onClick={() => {
+                            void attachSession(session, "new-tab");
+                          }}
                           title="Open in new tab"
                         >
                           <Plus className="h-4 w-4" />
@@ -1207,6 +1766,7 @@ function App() {
                           variant="ghost"
                           size="icon-sm"
                           onClick={() => void killSession(session)}
+                          loading={isActionBusy(`session:kill:${session.id}`)}
                           title="Exit session"
                         >
                           <Power className="h-4 w-4" />
@@ -1219,12 +1779,13 @@ function App() {
             ))}
           </div>
         </div>
+        )}
         <div className="grid grid-cols-2 gap-2 border-t border-border p-3">
           <Button variant="secondary" onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" />
             Create
           </Button>
-          <Button variant="secondary" onClick={() => void openJoinModal()} title={canGenerateJoinSignal ? "Generate Worker join commands" : "Direct Token cannot generate Worker join commands"}>
+          <Button variant="secondary" onClick={() => void openJoinModal()} loading={joinLoading} title={canGenerateJoinSignal ? "Generate Worker join commands" : "Direct Token cannot generate Worker join commands"}>
             <UserPlus className="h-4 w-4" />
             Join
           </Button>
@@ -1232,14 +1793,14 @@ function App() {
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-11 items-center justify-between border-b border-border bg-card px-2">
-          <div className="flex min-w-0 items-center gap-2">
+        <header className="flex min-h-11 items-center justify-between gap-2 border-b border-border bg-card px-2 py-1">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
             {!sidebarOpen ? (
-              <Button variant="ghost" size="icon-sm" onClick={() => setSidebarOpen(true)} title="Show sidebar">
+              <Button variant="ghost" size="icon-sm" className="shrink-0" onClick={() => setSidebarOpen(true)} title="Show sessions">
                 <ChevronRight className="h-4 w-4" />
               </Button>
             ) : null}
-            <div className="flex items-center gap-1 rounded-md border border-primary/40 bg-primary/10 p-0.5 shadow-sm shadow-primary/10">
+            <div className="flex shrink-0 items-center gap-1 rounded-md border border-primary/40 bg-primary/10 p-0.5 shadow-sm shadow-primary/10">
               <Button
                 variant={mainView === "overview" ? "default" : "ghost"}
                 size="sm"
@@ -1247,7 +1808,7 @@ function App() {
                 onClick={() => setMainView("overview")}
               >
                 <Server className="h-3.5 w-3.5" />
-                Overview
+                <span className="hidden sm:inline">Overview</span>
               </Button>
               <Button
                 variant={mainView === "workspace" ? "default" : "ghost"}
@@ -1256,15 +1817,15 @@ function App() {
                 onClick={() => setMainView("workspace")}
               >
                 <LayoutGrid className="h-3.5 w-3.5" />
-                Workspace
+                <span className="hidden sm:inline">Workspace</span>
               </Button>
             </div>
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium">{status.title}</div>
               <div className="truncate text-xs text-muted-foreground">{status.detail}</div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <div className="hidden max-w-[280px] min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 py-1 sm:flex">
               <div className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
                 <UserRound className="h-3.5 w-3.5" />
@@ -1276,7 +1837,7 @@ function App() {
             </div>
             <Button variant="secondary" size="sm" onClick={() => setAuthOpen(true)}>
               {currentUser ? <UserRound className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
-              {currentUser ? "Account" : "Sign in"}
+              <span className="hidden sm:inline">{currentUser ? "Account" : "Sign in"}</span>
             </Button>
             <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
           </div>
@@ -1295,14 +1856,15 @@ function App() {
               workerUpdateJobs={workerUpdateJobs}
               onWorkerFilterChange={setWorkerFilter}
               onSessionSearchChange={setSessionSearch}
-              onAttach={(session) => void attach(session.id)}
-              onAttachNewTab={(session) => void attach(session.id, "new-tab")}
+              onAttach={(session) => void attachSession(session)}
+              onAttachNewTab={(session) => void attachSession(session, "new-tab")}
               onDetach={(session) => detachSession(session.id)}
               onLoadPreview={(session, force) => void loadSessionPreview(session, force)}
               onKillSession={(session) => void killSession(session)}
               onUpdateWorker={(worker, patch) => void updateWorker(worker, patch)}
               onUpdateWorkerBinary={(worker) => void updateWorkerBinary(worker)}
               onEvictWorker={(worker) => void evictWorker(worker)}
+              isActionBusy={isActionBusy}
             />
           </div>
           <div className={cn("absolute inset-0 min-h-0 min-w-0", mainView === "workspace" ? "block" : "invisible pointer-events-none")}>
@@ -1326,6 +1888,7 @@ function App() {
               onDropPayload={dropOnPane}
               onTerminalSettingsChange={updateWorkerTerminalSettings}
               setStatus={setStatus}
+              compact={compactLayout}
             />
           </div>
         </div>
@@ -1345,6 +1908,9 @@ function App() {
         onApplyDirectToken={() => void applyDirectToken()}
         onOAuth={(provider) => void startOAuth(provider)}
         onLogout={signOut}
+        submitting={isActionBusy(`auth:${authMode}`)}
+        directTokenLoading={isActionBusy("auth:direct-token")}
+        oauthLoading={(provider) => isActionBusy(`auth:oauth:${provider}`)}
       />
       <CreateSessionModal
         open={createOpen}
@@ -1357,6 +1923,7 @@ function App() {
         onWorkerSearchChange={setWorkerSearch}
         onFormChange={setCreateForm}
         onSelectCWD={(cwd) => setCreateForm((form) => ({ ...form, cwd }))}
+        submitting={isActionBusy("session:create")}
       />
       <JoinSignalModal
         open={joinOpen}
@@ -1370,10 +1937,128 @@ function App() {
   );
 }
 
+function AccessGate({
+  authMode,
+  authForm,
+  token,
+  signal,
+  status,
+  onModeChange,
+  onFormChange,
+  onTokenChange,
+  onSignalChange,
+  onSubmitAuth,
+  onSubmitSignal,
+  onApplyDirectToken,
+  onOAuth,
+  authSubmitting,
+  directTokenLoading,
+  signalLoading,
+  oauthLoading,
+}: {
+  authMode: AuthMode;
+  authForm: { email: string; password: string; name: string };
+  token: string;
+  signal: string;
+  status: Status;
+  onModeChange: (mode: AuthMode) => void;
+  onFormChange: (form: { email: string; password: string; name: string }) => void;
+  onTokenChange: (token: string) => void;
+  onSignalChange: (signal: string) => void;
+  onSubmitAuth: (event: React.FormEvent) => void;
+  onSubmitSignal: (event: React.FormEvent) => void;
+  onApplyDirectToken: () => void;
+  onOAuth: (provider: "github" | "google") => void;
+  authSubmitting: boolean;
+  directTokenLoading: boolean;
+  signalLoading: boolean;
+  oauthLoading: (provider: "github" | "google") => boolean;
+}) {
+  return (
+    <div className="grid h-[100dvh] overflow-auto bg-background p-3 text-foreground sm:p-6">
+      <div className="mx-auto flex w-full max-w-md flex-col justify-center py-6">
+        <div className="mb-4 flex items-center gap-2">
+          <img src="/agentmux-mark.svg" alt="" className="h-7 w-7 rounded-md" />
+          <div>
+            <div className="text-base font-semibold">AgentMux Control</div>
+            <div className="text-xs text-muted-foreground">Sign in or enter a shared access token.</div>
+          </div>
+        </div>
+        <Card className="overflow-hidden bg-card shadow-2xl">
+          <div className="border-b border-border px-4 py-3">
+            <div className="flex items-center gap-2">
+              <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium">{status.title}</div>
+                <div className="truncate text-xs text-muted-foreground">{status.detail}</div>
+              </div>
+            </div>
+          </div>
+          <div className="space-y-4 p-4">
+            <div className="grid grid-cols-2 rounded-md bg-secondary p-1">
+              <Button variant={authMode === "login" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("login")} type="button">
+                <LogIn className="h-4 w-4" />
+                Sign in
+              </Button>
+              <Button variant={authMode === "register" ? "default" : "ghost"} size="sm" onClick={() => onModeChange("register")} type="button">
+                <UserPlus className="h-4 w-4" />
+                Register
+              </Button>
+            </div>
+            <form className="space-y-2" onSubmit={onSubmitAuth}>
+              <Input type="email" value={authForm.email} onChange={(event) => onFormChange({ ...authForm, email: event.target.value })} placeholder="email" autoComplete="email" />
+              {authMode === "register" ? (
+                <Input value={authForm.name} onChange={(event) => onFormChange({ ...authForm, name: event.target.value })} placeholder="display name" autoComplete="name" />
+              ) : null}
+              <Input type="password" value={authForm.password} onChange={(event) => onFormChange({ ...authForm, password: event.target.value })} placeholder="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} />
+              <Button variant="secondary" className="w-full" type="submit" loading={authSubmitting}>
+                {authMode === "register" ? <UserPlus className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
+                {authMode === "register" ? "Create account" : "Sign in"}
+              </Button>
+            </form>
+            <div className="grid grid-cols-2 gap-2">
+              <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")} loading={oauthLoading("github")}>
+                <Github className="h-4 w-4" />
+                GitHub
+              </Button>
+              <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")} loading={oauthLoading("google")}>
+                <Globe className="h-4 w-4" />
+                Google
+              </Button>
+            </div>
+            <form
+              className="space-y-2 rounded-md border border-border bg-background/80 p-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onApplyDirectToken();
+              }}
+            >
+              <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
+              <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
+              <Button variant="secondary" className="w-full" type="submit" loading={directTokenLoading}>
+                <RefreshCw className="h-4 w-4" />
+                Use token
+              </Button>
+            </form>
+            <form className="space-y-2 rounded-md border border-border bg-background/80 p-3" onSubmit={onSubmitSignal}>
+              <div className="text-xs font-medium uppercase text-muted-foreground">Signal</div>
+              <Input value={signal} onChange={(event) => onSignalChange(event.target.value)} placeholder="join or control signal" spellCheck={false} />
+              <Button variant="secondary" className="w-full" type="submit" loading={signalLoading}>
+                <UserPlus className="h-4 w-4" />
+                Exchange signal
+              </Button>
+            </form>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 function ToastViewport({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: string) => void }) {
   if (!toasts.length) return null;
   return (
-    <div className="pointer-events-none fixed right-3 top-14 z-[70] flex w-[min(360px,calc(100vw-24px))] flex-col gap-2">
+    <div className="pointer-events-none fixed left-2 right-2 top-12 z-[70] flex flex-col gap-2 sm:left-auto sm:right-3 sm:top-14 sm:w-[min(360px,calc(100vw-24px))]">
       {toasts.map((toast) => (
         <div
           key={toast.id}
@@ -1414,96 +2099,361 @@ function ToastViewport({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id:
   );
 }
 
+function MobileTargetNavigator({
+  state,
+  previewStates,
+  favorites,
+  onBack,
+  onSelectWindow,
+  onAttachTarget,
+  onAttachSession,
+  onRefreshPreview,
+  onTogglePaneFavorite,
+}: {
+  state: MobileTargetBrowser;
+  previewStates: Record<string, PreviewState>;
+  favorites: FavoritesState;
+  onBack: () => void;
+  onSelectWindow: (windowKey: string) => void;
+  onAttachTarget: (target: TerminalTargetView) => void;
+  onAttachSession: () => void;
+  onRefreshPreview: (target: TerminalTargetView) => void;
+  onTogglePaneFavorite: (target: TerminalTargetView, index: number) => void;
+}) {
+  const groups = groupTerminalTargetsByWindow(state.targets);
+  const selectedWindowKey = state.windowKey || "";
+  const [expandedDetails, setExpandedDetails] = React.useState<Record<string, boolean>>({});
+
+  return (
+    <div className="min-h-0 flex-1 overflow-auto p-2">
+      <div className="mb-2 flex items-center gap-2">
+        <Button variant="ghost" size="icon-sm" onClick={onBack} title="Back to sessions">
+          <ChevronLeft className="h-4 w-4" />
+        </Button>
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold">{state.session.name || state.session.id}</div>
+          <div className="truncate text-[11px] text-muted-foreground">Select a window, then attach a pane</div>
+        </div>
+      </div>
+
+      {state.loading ? (
+        <div className="rounded-md border border-dashed border-border px-3 py-8 text-center text-sm text-muted-foreground">Loading panes...</div>
+      ) : state.error ? (
+        <div className="space-y-2">
+          <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+            <div className="font-medium">Pane targets unavailable</div>
+            <div className="mt-1 text-xs text-amber-100/80">{state.error}</div>
+          </div>
+          <Button variant="secondary" className="w-full" onClick={onAttachSession}>
+            <Monitor className="h-4 w-4" />
+            Open session
+          </Button>
+        </div>
+      ) : groups.length ? (
+        <div className="space-y-1">
+          {groups.map((group) => (
+            <div key={group.key} className="overflow-hidden rounded-md border border-border bg-background/70">
+              <button
+                type="button"
+                className="flex w-full min-w-0 items-center justify-between gap-2 px-2 py-2 text-left transition-colors hover:bg-secondary"
+                onClick={() => onSelectWindow(group.key)}
+              >
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium">{targetWindowLabel(group)}</div>
+                  <div className="truncate text-xs text-muted-foreground">{group.targets.length} pane{group.targets.length === 1 ? "" : "s"}</div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  {group.active ? <StatusBadge tone="ok">active</StatusBadge> : null}
+                  <ChevronRight className={cn("h-4 w-4 text-muted-foreground transition-transform", group.key === selectedWindowKey && "rotate-90")} />
+                </div>
+              </button>
+              {group.key === selectedWindowKey ? (
+	                <div className="space-y-1 border-t border-border p-1.5">
+	                  {group.targets.map((target, index) => {
+	                    const preview = previewStates[targetPreviewKey(state.session.id, target)];
+	                    const targetKey = terminalTargetKey(target) || String(index);
+	                    const favorite = favorites.panes.some((pane) => favoritePaneKey(pane.sessionId, pane.target) === favoritePaneKey(state.session.id, target));
+	                    const detailExpanded = Boolean(expandedDetails[targetKey]);
+	                    return (
+	                      <div
+	                        key={targetKey}
+	                        className="flex w-full min-w-0 items-stretch gap-2 rounded-md border border-transparent p-1.5 text-left transition-colors hover:border-border hover:bg-secondary"
+	                      >
+	                        <button type="button" className="min-w-0 flex-1 self-center text-left" onClick={() => target.pane_id ? onAttachTarget(target) : onAttachSession()}>
+	                          <div className="flex min-w-0 items-center gap-1.5">
+	                            <div className="truncate text-sm font-medium">{terminalTargetLabel(target, index)}</div>
+	                            {target.pane_active ? <StatusBadge tone="ok">active</StatusBadge> : null}
+	                          </div>
+	                          <div className={cn("text-xs leading-4 text-muted-foreground", detailExpanded ? "max-h-24 overflow-auto break-words" : "max-h-8 overflow-hidden break-words")}>
+	                            {terminalTargetDetail(target)}
+	                          </div>
+	                        </button>
+	                        <div className="flex shrink-0 flex-col items-end gap-1">
+	                          <div className="flex items-center gap-1">
+	                            <Button
+	                              variant={favorite ? "secondary" : "ghost"}
+	                              size="icon-sm"
+	                              type="button"
+	                              onClick={() => onTogglePaneFavorite(target, index)}
+	                              title={favorite ? "Remove pane favorite" : "Favorite pane"}
+	                            >
+	                              <Star className={cn("h-4 w-4", favorite && "fill-primary text-primary")} />
+	                            </Button>
+	                            <PanePreviewCanvas preview={preview} onRefresh={(event) => {
+	                              event.preventDefault();
+	                              event.stopPropagation();
+	                              onRefreshPreview(target);
+	                            }} />
+	                          </div>
+	                          <Button
+	                            variant="ghost"
+	                            size="xs"
+	                            type="button"
+	                            className="h-6 px-1.5 text-[11px]"
+	                            onClick={() => setExpandedDetails((items) => ({ ...items, [targetKey]: !items[targetKey] }))}
+	                          >
+	                            {detailExpanded ? "Less" : "More"}
+	                          </Button>
+	                        </div>
+	                      </div>
+	                    );
+	                  })}
+	                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <div className="rounded-md border border-dashed border-border px-3 py-8 text-center text-sm text-muted-foreground">No panes found.</div>
+          <Button variant="secondary" className="w-full" onClick={onAttachSession}>
+            <Monitor className="h-4 w-4" />
+            Open session
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PanePreviewCanvas({
+  preview,
+  onRefresh,
+}: {
+  preview?: PreviewState;
+  onRefresh: (event: React.MouseEvent<HTMLCanvasElement>) => void;
+}) {
+  const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ratio = window.devicePixelRatio || 1;
+    const width = 136;
+    const height = 72;
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.fillStyle = "#050607";
+    context.fillRect(0, 0, width, height);
+    context.strokeStyle = preview?.error ? "rgba(248,113,113,0.65)" : "rgba(53,201,143,0.45)";
+    context.strokeRect(0.5, 0.5, width - 1, height - 1);
+    context.font = "8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    context.textBaseline = "top";
+    context.fillStyle = preview?.error ? "#fca5a5" : "#d7e2df";
+    const text = preview?.loading ? "loading..." : preview?.error ? "preview error" : preview?.data?.trimEnd() || "no output";
+    const lines = text.split(/\r?\n/).slice(-8);
+    lines.forEach((line, index) => {
+      context.fillText(line.slice(0, 32), 5, 5 + index * 8);
+    });
+  }, [preview?.data, preview?.error, preview?.loading, preview?.loadedAt]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="h-[72px] w-[136px] shrink-0 rounded border border-border bg-[#050607]"
+      onClick={onRefresh}
+      title={preview?.loadedAt ? `Preview ${formatRelativeTime(new Date(preview.loadedAt).toISOString())}` : "Refresh preview"}
+    />
+  );
+}
+
 function SimpleDirectControlView({
+  workers,
   sessions,
   selectedSessionId,
   token,
   onSelectSession,
   onRefresh,
+  onCreateSession,
   onSignIn,
+  refreshLoading,
   setStatus,
 }: {
+  workers: WorkerView[];
   sessions: SessionView[];
   selectedSessionId: string;
   token: string;
   onSelectSession: (sessionId: string) => void;
   onRefresh: () => void;
+  onCreateSession: () => void;
   onSignIn: () => void;
+  refreshLoading: boolean;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
 }) {
+  const compactLayout = useMediaQuery("(max-width: 767px)");
+  const [sidebarOpen, setSidebarOpen] = React.useState(() => typeof window === "undefined" ? true : window.matchMedia("(min-width: 768px)").matches);
+  const workerByID = React.useMemo(() => new Map(workers.map((worker) => [worker.id, worker])), [workers]);
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) || null;
+  const selectedWorker = selectedSession ? workerByID.get(selectedSession.worker_id) || null : workers[0] || null;
   const pane = React.useMemo(() => ({ type: "pane" as const, id: "direct-pane", sessionId: selectedSession?.id }), [selectedSession?.id]);
+
+  React.useEffect(() => {
+    if (!compactLayout) setSidebarOpen(true);
+  }, [compactLayout]);
+
   return (
-    <div className="flex h-full min-h-0 w-full bg-background">
-      <aside className="flex h-full w-80 shrink-0 flex-col border-r border-border bg-card">
+    <div className="relative flex h-full min-h-0 w-full overflow-hidden bg-background">
+      {sidebarOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/60 md:hidden" onClick={() => setSidebarOpen(false)} aria-label="Close sessions drawer" /> : null}
+      <aside className={cn(
+        "fixed inset-y-0 left-0 z-40 flex h-full w-[min(88vw,20rem)] shrink-0 flex-col border-r border-border bg-card transition-all duration-200 md:static md:z-auto md:translate-x-0",
+        sidebarOpen ? "translate-x-0 md:w-80" : "-translate-x-full md:w-0 md:overflow-hidden",
+      )}>
         <div className="flex h-14 items-center justify-between border-b border-border px-3">
           <div className="flex items-center gap-2 text-sm font-semibold">
             <img src="/agentmux-mark.svg" alt="" className="h-5 w-5 rounded-md" />
             AgentMux
           </div>
-          <Button variant="ghost" size="icon-sm" onClick={onRefresh} title="Refresh sessions">
+          <Button variant="ghost" size="icon-sm" onClick={onRefresh} loading={refreshLoading} title="Refresh sessions">
             <RefreshCw className="h-4 w-4" />
           </Button>
         </div>
-        <div className="border-b border-border px-3 py-2">
-          <div className="text-xs font-medium uppercase text-muted-foreground">Direct Token</div>
-          <div className="mt-1 text-sm font-medium">Session access</div>
-        </div>
-        <div className="min-h-0 flex-1 overflow-auto p-2">
-          {sessions.length === 0 ? <div className="px-2 py-4 text-sm text-muted-foreground">No sessions.</div> : null}
-          <div className="space-y-1">
-            {sessions.map((session) => (
-              <button
+	<div className="border-b border-border px-3 py-2">
+	  <div className="text-xs font-medium uppercase text-muted-foreground">Direct Token</div>
+	  <div className="mt-1 text-sm font-medium">Session access</div>
+	  <div className="mt-1 text-xs text-muted-foreground">{workers.length} workers · {sessions.length} sessions</div>
+	</div>
+	<div className="min-h-0 flex-1 overflow-auto p-2">
+	  <div className="mb-3 space-y-1">
+	    <div className="px-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">Workers</div>
+	    {workers.length === 0 ? <div className="rounded-md border border-dashed border-border px-2 py-3 text-xs text-muted-foreground">No worker is registered for this token.</div> : null}
+	    {workers.map((worker) => (
+	      <div key={worker.id} className="rounded-md border border-border bg-background/70 px-2 py-2">
+	        <div className="flex min-w-0 items-center justify-between gap-2">
+	          <div className="min-w-0">
+	            <div className="truncate text-sm font-medium">{workerDisplayLabel(worker)}</div>
+	            <div className="truncate text-xs text-muted-foreground">{worker.addr || worker.id}</div>
+	          </div>
+	          <StatusBadge tone={workerIsOnline(worker) ? "ok" : "warn"}>{workerStatusLabel(worker)}</StatusBadge>
+	        </div>
+	        <div className="mt-1 flex flex-wrap gap-1">
+	          <BackendBadge value={worker.backend} />
+	          {worker.software?.version ? <StatusBadge>{worker.software.version}</StatusBadge> : null}
+	          {workerPlatformLabel(worker) ? <StatusBadge>{workerPlatformLabel(worker)}</StatusBadge> : null}
+	        </div>
+	      </div>
+	    ))}
+	  </div>
+	  <div className="mb-1 px-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">Sessions</div>
+	  {sessions.length === 0 ? <div className="rounded-md border border-dashed border-border px-2 py-3 text-sm text-muted-foreground">No sessions yet. Create one on an online worker.</div> : null}
+	  <div className="space-y-1">
+	    {sessions.map((session) => (
+	      <button
                 key={session.id}
                 type="button"
                 className={cn(
                   "w-full rounded-md border px-2 py-2 text-left transition-colors",
                   selectedSession?.id === session.id ? "border-primary/50 bg-primary/10" : "border-transparent hover:border-border hover:bg-secondary",
                 )}
-                onClick={() => onSelectSession(session.id)}
-              >
-                <div className="truncate text-sm font-medium">{session.name || session.id}</div>
-                <div className="truncate text-xs text-muted-foreground">{session.worker_id} · {session.status || "unknown"}</div>
-                <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="border-t border-border p-3">
-          <Button variant="secondary" className="w-full" onClick={onSignIn}>
-            <LogIn className="h-4 w-4" />
-            Sign in for full control
-          </Button>
-        </div>
+                onClick={() => {
+                  if (compactLayout) setSidebarOpen(false);
+                  onSelectSession(session.id);
+                }}
+	      >
+		<div className="truncate text-sm font-medium">{session.name || session.id}</div>
+		<div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+		  <span className="truncate">{session.worker_id} · {session.status || "unknown"}</span>
+		  <BackendBadge value={sessionBackendLabel(session, workerByID.get(session.worker_id) || null)} />
+		</div>
+		<div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
+	      </button>
+	    ))}
+	  </div>
+	</div>
+	<div className="grid grid-cols-2 gap-2 border-t border-border p-3">
+	  <Button variant="secondary" onClick={onCreateSession} disabled={!workers.some(workerCanStartSession)}>
+	    <Plus className="h-4 w-4" />
+	    Create
+	  </Button>
+	  <Button variant="secondary" onClick={onSignIn}>
+	    <LogIn className="h-4 w-4" />
+	    Sign in
+	  </Button>
+	</div>
       </aside>
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-11 items-center justify-between border-b border-border bg-card px-3">
-          <div className="min-w-0">
-            <div className="truncate text-sm font-medium">{selectedSession?.id || "Select a session"}</div>
-            <div className="truncate text-xs text-muted-foreground">Direct Token view</div>
-          </div>
-          <StatusBadge tone="warn">limited</StatusBadge>
-        </header>
-        <div className="min-h-0 flex-1">
-          <TerminalPane
-            pane={pane}
-            session={selectedSession}
-            worker={null}
-            active
-            interactive={Boolean(selectedSession)}
-            terminalSettings={{ workers: {} }}
-            token={token}
-            onFocus={() => {}}
-            onSplit={() => {}}
-            onClose={() => {}}
-            dropTarget={null}
-            onDropTarget={() => {}}
-            onDropPayload={() => {}}
-            onTerminalSettingsChange={() => {}}
-            setStatus={setStatus}
-            simple
-          />
-        </div>
+        <header className="flex min-h-11 items-center justify-between gap-2 border-b border-border bg-card px-2 py-1 sm:px-3">
+	  <div className="flex min-w-0 flex-1 items-center gap-2">
+	    {!sidebarOpen ? (
+	      <Button variant="ghost" size="icon-sm" className="shrink-0" onClick={() => setSidebarOpen(true)} title="Show sessions">
+	        <ChevronRight className="h-4 w-4" />
+	      </Button>
+	    ) : null}
+	    <div className="min-w-0">
+	    <div className="truncate text-sm font-medium">{selectedSession?.id || "Select a session"}</div>
+	    <div className="truncate text-xs text-muted-foreground">
+	      {selectedWorker ? `${workerDisplayLabel(selectedWorker)} · ${selectedWorker.backend || "backend unknown"}` : "Direct Token view"}
+	    </div>
+	    </div>
+	  </div>
+	  <StatusBadge tone="warn">limited</StatusBadge>
+	</header>
+	<div className="min-h-0 flex-1">
+	  {selectedSession ? (
+	    <TerminalPane
+	      pane={pane}
+	      session={selectedSession}
+	      worker={selectedWorker}
+	      active
+	      interactive
+	      terminalSettings={{ workers: {} }}
+	      token={token}
+	      onFocus={() => {}}
+	      onSplit={() => {}}
+	      onClose={() => {}}
+	      dropTarget={null}
+	      onDropTarget={() => {}}
+	      onDropPayload={() => {}}
+	      onTerminalSettingsChange={() => {}}
+	      setStatus={setStatus}
+	      simple
+	    />
+	  ) : (
+	    <div className="flex h-full items-center justify-center p-6">
+	      <div className="w-full max-w-xl rounded-md border border-border bg-card p-4">
+	        <div className="text-sm font-semibold">Direct Token workspace</div>
+	        <div className="mt-1 text-sm text-muted-foreground">Create a session on an online worker, then attach to it here.</div>
+	        <div className="mt-4 grid gap-2">
+	          {workers.map((worker) => (
+	            <div key={worker.id} className="flex items-center justify-between gap-3 rounded-md border border-border bg-background px-3 py-2">
+	              <div className="min-w-0">
+	                <div className="truncate text-sm font-medium">{workerDisplayLabel(worker)}</div>
+	                <div className="truncate text-xs text-muted-foreground">{worker.backend || "backend unknown"} · {worker.addr || worker.id}</div>
+	              </div>
+	              <StatusBadge tone={workerIsOnline(worker) ? "ok" : "warn"}>{workerStatusLabel(worker)}</StatusBadge>
+	            </div>
+	          ))}
+	        </div>
+	        <Button className="mt-4" variant="secondary" onClick={onCreateSession} disabled={!workers.some(workerCanStartSession)}>
+	          <Plus className="h-4 w-4" />
+	          Create session
+	        </Button>
+	      </div>
+	    </div>
+	  )}
+	</div>
       </main>
     </div>
   );
@@ -1529,6 +2479,7 @@ function OverviewPage({
   onUpdateWorker,
   onUpdateWorkerBinary,
   onEvictWorker,
+  isActionBusy,
 }: {
   workers: WorkerView[];
   sessions: SessionView[];
@@ -1549,6 +2500,7 @@ function OverviewPage({
   onUpdateWorker: (worker: WorkerView, patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
   onUpdateWorkerBinary: (worker: WorkerView) => void;
   onEvictWorker: (worker: WorkerView) => void;
+  isActionBusy: (key: string) => boolean;
 }) {
   const workerByID = React.useMemo(() => new Map(workers.map((worker) => [worker.id, worker])), [workers]);
   const onlineWorkers = workers.filter(workerIsOnline).length;
@@ -1557,15 +2509,14 @@ function OverviewPage({
 
   return (
     <div className="h-full overflow-auto bg-background">
-      <div className="space-y-4 p-4">
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-          <MetricTile label="Workers" value={`${onlineWorkers}/${workers.length}`} detail={`${enabledWorkers} enabled`} />
-          <MetricTile label="Sessions" value={`${allSessions.length}`} detail={`${previewSessions.length} visible`} />
-          <MetricTile label="Attached" value={`${activeSessionIds.size}`} detail="workspace panes and tabs" />
-          <MetricTile label="Preview" value="active pane" detail="attach opens the whole session" />
-        </div>
+      <div className="space-y-3 p-2 sm:space-y-4 sm:p-4">
+	        <div className="grid grid-cols-3 gap-1.5 sm:gap-2 xl:max-w-3xl">
+	          <MetricTile label="Workers" value={`${onlineWorkers}/${workers.length}`} detail={`${enabledWorkers} enabled`} />
+	          <MetricTile label="Sessions" value={`${allSessions.length}`} detail={`${previewSessions.length} visible`} />
+	          <MetricTile label="Attached" value={`${activeSessionIds.size}`} detail="workspace panes and tabs" />
+	        </div>
 
-        <div className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <div className="grid gap-3 xl:grid-cols-[360px_minmax(0,1fr)] xl:gap-4">
           <section className="min-w-0 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <div>
@@ -1590,6 +2541,11 @@ function OverviewPage({
                   onUpdate={(patch) => onUpdateWorker(worker, patch)}
                   onUpdateBinary={() => onUpdateWorkerBinary(worker)}
                   onEvict={() => onEvictWorker(worker)}
+                  enabledLoading={isActionBusy(`worker:update:${worker.id}:enabled`)}
+                  traceLoading={isActionBusy(`worker:update:${worker.id}:trace_enabled`)}
+                  debugLoading={isActionBusy(`worker:update:${worker.id}:debug_enabled`)}
+                  binaryLoading={isActionBusy(`worker:binary:${worker.id}`)}
+                  evictLoading={isActionBusy(`worker:evict:${worker.id}`)}
                 />
               ))}
             </div>
@@ -1599,16 +2555,16 @@ function OverviewPage({
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <div className="text-sm font-semibold">Session Preview</div>
-                <div className="text-xs text-muted-foreground">Preview shows active pane output; attach opens the full session.</div>
+                <div className="text-xs text-muted-foreground">Preview shows active pane output.</div>
               </div>
-              <div className="flex min-w-[320px] flex-1 flex-wrap justify-end gap-2">
-                <Select value={workerFilter} onChange={(event) => onWorkerFilterChange(event.target.value)} className="h-8 max-w-[220px] text-xs">
+              <div className="flex w-full flex-1 flex-wrap justify-end gap-2 sm:min-w-[320px]">
+                <Select value={workerFilter} onChange={(event) => onWorkerFilterChange(event.target.value)} className="h-8 w-full text-xs sm:max-w-[220px]">
                   <option value="all">All workers</option>
                   {workers.map((worker) => (
                     <option key={worker.id} value={worker.id}>{workerDisplayLabel(worker)} · {workerStatusLabel(worker)}</option>
                   ))}
                 </Select>
-                <div className="relative min-w-[220px] flex-1 sm:max-w-xs">
+                <div className="relative min-w-0 flex-1 sm:min-w-[220px] sm:max-w-xs">
                   <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                   <Input
                     value={sessionSearch}
@@ -1622,7 +2578,7 @@ function OverviewPage({
             {previewSessions.length === 0 ? (
               <EmptyState title="No sessions" detail="Create a session or adjust the current filter." />
             ) : (
-              <div className="grid gap-2 md:grid-cols-2 2xl:grid-cols-3">
+              <div className="grid gap-2 sm:grid-cols-2 2xl:grid-cols-3">
                 {previewSessions.map((session) => (
                   <SessionPreviewCard
                     key={session.id}
@@ -1635,6 +2591,7 @@ function OverviewPage({
                     onDetach={() => onDetach(session)}
                     onLoadPreview={(force) => onLoadPreview(session, force)}
                     onKill={() => onKillSession(session)}
+                    killLoading={isActionBusy(`session:kill:${session.id}`)}
                   />
                 ))}
               </div>
@@ -1648,10 +2605,10 @@ function OverviewPage({
 
 function MetricTile({ label, value, detail }: { label: string; value: string; detail: string }) {
   return (
-    <div className="rounded-md border border-border bg-card px-3 py-2">
-      <div className="text-[11px] font-medium uppercase text-muted-foreground">{label}</div>
-      <div className="mt-1 text-lg font-semibold">{value}</div>
-      <div className="truncate text-xs text-muted-foreground">{detail}</div>
+    <div className="min-w-0 rounded-md border border-border bg-card px-2 py-1.5 sm:px-3 sm:py-2">
+      <div className="truncate text-[10px] font-medium uppercase text-muted-foreground sm:text-[11px]">{label}</div>
+      <div className="mt-0.5 truncate text-base font-semibold sm:mt-1 sm:text-lg">{value}</div>
+      <div className="hidden truncate text-xs text-muted-foreground sm:block">{detail}</div>
     </div>
   );
 }
@@ -1666,6 +2623,11 @@ function WorkerCard({
   onUpdate,
   onUpdateBinary,
   onEvict,
+  enabledLoading,
+  traceLoading,
+  debugLoading,
+  binaryLoading,
+  evictLoading,
 }: {
   worker: WorkerView;
   selected: boolean;
@@ -1676,6 +2638,11 @@ function WorkerCard({
   onUpdate: (patch: Partial<Pick<WorkerView, "enabled" | "trace_enabled" | "debug_enabled">>) => void;
   onUpdateBinary: () => void;
   onEvict: () => void;
+  enabledLoading: boolean;
+  traceLoading: boolean;
+  debugLoading: boolean;
+  binaryLoading: boolean;
+  evictLoading: boolean;
 }) {
   const enabled = workerEnabled(worker);
   const online = workerIsOnline(worker);
@@ -1684,28 +2651,136 @@ function WorkerCard({
   const updateActive = updateJob ? workerUpdateJobActive(updateJob.status) : false;
   const updateFailed = updateJob?.status === "failed";
   const showUpdateNotice = Boolean(updateRecommended || updateActive || updateFailed);
+  const opsRef = React.useRef<HTMLDivElement | null>(null);
+  const [opsOpen, setOpsOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!opsOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (opsRef.current?.contains(event.target as Node)) return;
+      setOpsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [opsOpen]);
+
   return (
     <Card className={cn("space-y-3 bg-card p-3 transition-colors", selected && "border-primary/50 bg-primary/10")}>
-      <button type="button" className="flex w-full min-w-0 items-start gap-2 text-left" onClick={onSelect}>
-        <div className={cn("grid h-8 w-8 shrink-0 place-items-center rounded-md", online ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300")}>
-          <Server className="h-4 w-4" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <div className="truncate text-sm font-semibold">{workerDisplayLabel(worker)}</div>
-            <BackendBadge value={worker.backend} />
+      <div className="flex items-start gap-2">
+        <button type="button" className="flex min-w-0 flex-1 items-start gap-2 text-left" onClick={onSelect}>
+          <div className={cn("grid h-8 w-8 shrink-0 place-items-center rounded-md", online ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300")}>
+            <Server className="h-4 w-4" />
           </div>
-          <div className="truncate text-xs text-muted-foreground">{worker.addr || worker.id}</div>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
-            <StatusBadge tone={online ? "ok" : "warn"}>{workerStatusLabel(worker)}</StatusBadge>
-            <StatusBadge tone={enabled ? "ok" : "err"}>{enabled ? "enabled" : "disabled"}</StatusBadge>
-            <StatusBadge>{sessionCount} sessions</StatusBadge>
-            {worker.software?.version ? <StatusBadge>{worker.software.version}</StatusBadge> : null}
-            {workerPlatformLabel(worker) ? <StatusBadge>{workerPlatformLabel(worker)}</StatusBadge> : null}
-            {workerProtocolLabel(worker) ? <StatusBadge>{workerProtocolLabel(worker)}</StatusBadge> : null}
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <div className="truncate text-sm font-semibold">{workerDisplayLabel(worker)}</div>
+              <BackendBadge value={worker.backend} />
+            </div>
+            <div className="truncate text-xs text-muted-foreground">{worker.addr || worker.id}</div>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <StatusBadge tone={online ? "ok" : "warn"}>{workerStatusLabel(worker)}</StatusBadge>
+              <StatusBadge tone={enabled ? "ok" : "err"}>{enabled ? "enabled" : "disabled"}</StatusBadge>
+              <StatusBadge>{sessionCount} sessions</StatusBadge>
+              {worker.software?.version ? <StatusBadge>{worker.software.version}</StatusBadge> : null}
+              {workerPlatformLabel(worker) ? <StatusBadge>{workerPlatformLabel(worker)}</StatusBadge> : null}
+              {workerProtocolLabel(worker) ? <StatusBadge>{workerProtocolLabel(worker)}</StatusBadge> : null}
+            </div>
           </div>
+        </button>
+        <div ref={opsRef} className="relative shrink-0">
+          <Button
+            variant={opsOpen ? "secondary" : "ghost"}
+            size="xs"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setOpsOpen((value) => !value);
+            }}
+            title="Worker operations"
+            aria-expanded={opsOpen}
+          >
+            <Ellipsis className="h-3.5 w-3.5" />
+            Ops
+          </Button>
+          {opsOpen ? (
+            <div className="absolute right-0 top-full z-40 mt-1 flex w-44 flex-col gap-1 rounded-md border border-border bg-card p-1 shadow-lg">
+              <Button
+                variant={enabled ? "secondary" : "ghost"}
+                size="sm"
+                type="button"
+                className="w-full justify-start"
+                onClick={() => {
+                  setOpsOpen(false);
+                  onUpdate({ enabled: !enabled });
+                }}
+                loading={enabledLoading}
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                {enabled ? "Disable" : "Enable"}
+              </Button>
+              <Button
+                variant={worker.trace_enabled ? "secondary" : "ghost"}
+                size="sm"
+                type="button"
+                className="w-full justify-start"
+                onClick={() => {
+                  setOpsOpen(false);
+                  onUpdate({ trace_enabled: !worker.trace_enabled });
+                }}
+                loading={traceLoading}
+              >
+                <Activity className="h-3.5 w-3.5" />
+                Trace
+              </Button>
+              <Button
+                variant={worker.debug_enabled ? "secondary" : "ghost"}
+                size="sm"
+                type="button"
+                className="w-full justify-start"
+                onClick={() => {
+                  setOpsOpen(false);
+                  onUpdate({ debug_enabled: !worker.debug_enabled });
+                }}
+                loading={debugLoading}
+              >
+                <Bug className="h-3.5 w-3.5" />
+                Debug
+              </Button>
+              <Button
+                variant={updateRecommended || updateJob ? "secondary" : "ghost"}
+                size="sm"
+                type="button"
+                className="w-full justify-start"
+                onClick={() => {
+                  setOpsOpen(false);
+                  onUpdateBinary();
+                }}
+                disabled={!canUpdate || updateActive}
+                loading={binaryLoading}
+                title={canUpdate ? "Update worker to latest release" : "Worker update is unavailable"}
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                {updateActive ? "Updating" : "Update"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                className="w-full justify-start"
+                onClick={() => {
+                  setOpsOpen(false);
+                  onEvict();
+                }}
+                loading={evictLoading}
+                title="Evict worker"
+              >
+                <Unplug className="h-3.5 w-3.5" />
+                Evict
+              </Button>
+            </div>
+          ) : null}
         </div>
-      </button>
+      </div>
       {showUpdateNotice ? (
         <button
           type="button"
@@ -1714,39 +2789,18 @@ function WorkerCard({
             updateFailed ? "border-red-500/35 bg-red-500/10 text-red-200" : "border-amber-500/35 bg-amber-500/10 text-amber-100",
           )}
           onClick={updateActive || !canUpdate ? undefined : onUpdateBinary}
-          disabled={updateActive || !canUpdate}
+          disabled={updateActive || !canUpdate || binaryLoading}
           title={updateJob ? workerUpdateJobDetail(updateJob) : `Update to ${recommendedVersion || "latest"}`}
         >
           <span className="min-w-0 truncate">
             {updateJob ? workerUpdateJobLabel(updateJob) : `Update available: ${worker.software?.version || "unknown"} -> ${recommendedVersion || "latest"}`}
           </span>
-          {updateActive ? <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 shrink-0" />}
+          {updateActive || binaryLoading ? <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 shrink-0" />}
         </button>
       ) : null}
-      <div className="grid grid-cols-5 gap-1">
-        <Button variant={enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ enabled: !enabled })}>
-          <ShieldCheck className="h-3.5 w-3.5" />
-          {enabled ? "Disable" : "Enable"}
-        </Button>
-        <Button variant={worker.trace_enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ trace_enabled: !worker.trace_enabled })}>
-          <Activity className="h-3.5 w-3.5" />
-          Trace
-        </Button>
-        <Button variant={worker.debug_enabled ? "secondary" : "ghost"} size="xs" type="button" onClick={() => onUpdate({ debug_enabled: !worker.debug_enabled })}>
-          <Bug className="h-3.5 w-3.5" />
-          Debug
-        </Button>
-        <Button variant={updateRecommended || updateJob ? "secondary" : "ghost"} size="xs" type="button" onClick={onUpdateBinary} disabled={!canUpdate || updateActive} title={canUpdate ? "Update worker to latest release" : "Worker update is unavailable"}>
-          <RefreshCw className="h-3.5 w-3.5" />
-          {updateActive ? "Updating" : "Update"}
-        </Button>
-        <Button variant="ghost" size="xs" type="button" onClick={onEvict} title="Evict worker">
-          <Unplug className="h-3.5 w-3.5" />
-          Evict
-        </Button>
-      </div>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
         <span>Last seen {formatRelativeTime(worker.last_seen)}</span>
+        {worker.worker_instance_id ? <span>instance {shortID(worker.worker_instance_id)}</span> : null}
         {worker.software?.service_backend ? <span>service {worker.software.service_backend}</span> : null}
         {worker.software?.update_policy ? <span>updates {worker.software.update_policy}</span> : null}
       </div>
@@ -1764,6 +2818,7 @@ function SessionPreviewCard({
   onDetach,
   onLoadPreview,
   onKill,
+  killLoading,
 }: {
   session: SessionView;
   worker: WorkerView | null;
@@ -1774,6 +2829,7 @@ function SessionPreviewCard({
   onDetach: () => void;
   onLoadPreview: (force?: boolean) => void;
   onKill: () => void;
+  killLoading: boolean;
 }) {
   React.useEffect(() => {
     onLoadPreview(false);
@@ -1782,7 +2838,7 @@ function SessionPreviewCard({
   const previewText = preview?.data?.trimEnd() || "";
   return (
     <Card
-      className={cn("group flex min-h-[260px] flex-col overflow-hidden bg-card transition-colors", active && "border-primary/50 bg-primary/10")}
+      className={cn("group flex min-h-[220px] flex-col overflow-hidden bg-card transition-colors sm:min-h-[260px]", active && "border-primary/50 bg-primary/10")}
       draggable
       onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
     >
@@ -1804,12 +2860,12 @@ function SessionPreviewCard({
           <span>{preview?.scope || "active_pane"}</span>
           <span>{preview?.loadedAt ? formatRelativeTime(new Date(preview.loadedAt).toISOString()) : "not loaded"}</span>
         </div>
-        <pre className="h-32 overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-4 text-[#d7e2df]">
+        <pre className="h-24 overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-4 text-[#d7e2df] sm:h-32">
           {preview?.loading ? "Loading active pane preview..." : preview?.error ? `Preview unavailable: ${preview.error}` : previewText || "No active pane output yet."}
         </pre>
       </button>
-      <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-2">
-        <div className="flex items-center gap-1">
+      <div className="flex flex-wrap items-center justify-between gap-1 border-t border-border px-2 py-2">
+        <div className="flex flex-wrap items-center gap-1">
           {active ? (
             <Button variant="secondary" size="xs" type="button" onClick={onDetach}>
               <Unplug className="h-3.5 w-3.5" />
@@ -1827,10 +2883,10 @@ function SessionPreviewCard({
           </Button>
         </div>
         <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon-sm" type="button" onClick={() => onLoadPreview(true)} title="Refresh active pane preview">
+          <Button variant="ghost" size="icon-sm" type="button" onClick={() => onLoadPreview(true)} loading={Boolean(preview?.loading)} title="Refresh active pane preview">
             <RefreshCw className="h-4 w-4" />
           </Button>
-          <Button variant="ghost" size="icon-sm" type="button" onClick={onKill} title="Exit session">
+          <Button variant="ghost" size="icon-sm" type="button" onClick={onKill} loading={killLoading} title="Exit session">
             <Power className="h-4 w-4" />
           </Button>
         </div>
@@ -1843,6 +2899,7 @@ function WorkspaceView({
   tabs,
   activeTabId,
   visible,
+  compact,
   sessionByID,
   workerByID,
   terminalSettings,
@@ -1863,6 +2920,7 @@ function WorkspaceView({
   tabs: WorkspaceTab[];
   activeTabId: string;
   visible: boolean;
+  compact: boolean;
   sessionByID: Map<string, SessionView>;
   workerByID: Map<string, WorkerView>;
   terminalSettings: TerminalSettings;
@@ -1884,6 +2942,13 @@ function WorkspaceView({
   const [editingTabId, setEditingTabId] = React.useState("");
   const [editingTitle, setEditingTitle] = React.useState("");
   const editInputRef = React.useRef<HTMLInputElement | null>(null);
+  const activeTab = React.useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0], [tabs, activeTabId]);
+  const compactPanes = React.useMemo(() => (activeTab ? collectPanes(activeTab.layout) : []), [activeTab]);
+  const compactNode = React.useMemo(() => {
+    if (!activeTab) return null;
+    return findPane(activeTab.layout, activeTab.activePane) || findPane(activeTab.layout, firstPaneId(activeTab.layout)) || activeTab.layout;
+  }, [activeTab]);
+  const compactActivePane = compactNode?.type === "pane" ? compactNode.id : activeTab?.activePane || "";
 
   React.useEffect(() => {
     if (!editingTabId) return;
@@ -1913,7 +2978,7 @@ function WorkspaceView({
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background">
-      <div className="flex h-9 items-center gap-2 border-b border-border bg-card px-2">
+      <div className="flex min-h-9 items-center gap-2 border-b border-border bg-card px-2 py-1">
         <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {tabs.map((tab) => (
@@ -1922,7 +2987,7 @@ function WorkspaceView({
               role="button"
               tabIndex={0}
               className={cn(
-                "flex h-7 min-w-[112px] max-w-[260px] shrink-0 items-center rounded-md border px-2 text-xs transition-colors",
+                "flex h-7 min-w-[96px] max-w-[220px] shrink-0 items-center rounded-md border px-2 text-xs transition-colors sm:min-w-[112px] sm:max-w-[260px]",
                 tab.id === activeTabId ? "border-primary/50 bg-primary/10 text-foreground" : "border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground",
               )}
               onClick={() => onActiveTabChange(tab.id)}
@@ -1982,8 +3047,52 @@ function WorkspaceView({
           <Plus className="h-4 w-4" />
         </Button>
       </div>
+      {compact && activeTab && compactPanes.length > 1 ? (
+        <div className="flex min-h-8 items-center gap-1 overflow-x-auto border-b border-border bg-background px-2 py-1 md:hidden">
+          {compactPanes.map((pane, index) => {
+            const session = pane.sessionId ? sessionByID.get(pane.sessionId) : null;
+            const activePane = pane.id === activeTab.activePane;
+            return (
+              <button
+                key={pane.id}
+                type="button"
+                className={cn(
+                  "flex h-6 min-w-[72px] max-w-[160px] shrink-0 items-center justify-center rounded-md border px-2 text-[11px] transition-colors",
+                  activePane ? "border-primary/50 bg-primary/10 text-foreground" : "border-border bg-card text-muted-foreground",
+                )}
+                onClick={() => onFocusPane(activeTab.id, pane.id)}
+                title={pane.sessionId || `Pane ${index + 1}`}
+              >
+                <span className="truncate">{session?.name || pane.sessionId || `Pane ${index + 1}`}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
       <div className="relative min-h-0 flex-1">
-        {tabs.map((tab) => (
+        {compact && activeTab && compactNode ? (
+          <div className="absolute inset-0 min-h-0 min-w-0">
+            <LayoutRenderer
+              tabId={activeTab.id}
+              node={compactNode}
+              activePane={visible ? compactActivePane : ""}
+              interactive={visible}
+              sessionByID={sessionByID}
+              workerByID={workerByID}
+              terminalSettings={terminalSettings}
+              token={token}
+              onFocusPane={onFocusPane}
+              onSplitPane={onSplitPane}
+              onClosePane={onClosePane}
+              dropTarget={dropTarget}
+              onDropTarget={onDropTarget}
+              onDropPayload={onDropPayload}
+              onTerminalSettingsChange={onTerminalSettingsChange}
+              setStatus={setStatus}
+              simple
+            />
+          </div>
+        ) : tabs.map((tab) => (
           <div key={tab.id} className={cn("absolute inset-0 min-h-0 min-w-0", tab.id === activeTabId ? "block" : "invisible pointer-events-none")}>
             <LayoutRenderer
               tabId={tab.id}
@@ -2039,6 +3148,21 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
   );
 }
 
+function ModalShell({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
+  return (
+    <div
+      className="absolute inset-0 z-50 flex items-end justify-center bg-black/60 p-2 backdrop-blur-sm sm:items-center sm:p-4"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="w-full" onPointerDown={(event) => event.stopPropagation()}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function AuthModal({
   open,
   authMode,
@@ -2053,6 +3177,9 @@ function AuthModal({
   onApplyDirectToken,
   onOAuth,
   onLogout,
+  submitting,
+  directTokenLoading,
+  oauthLoading,
 }: {
   open: boolean;
   authMode: AuthMode;
@@ -2067,12 +3194,15 @@ function AuthModal({
   onApplyDirectToken: () => void;
   onOAuth: (provider: "github" | "google") => void;
   onLogout: () => void;
+  submitting: boolean;
+  directTokenLoading: boolean;
+  oauthLoading: (provider: "github" | "google") => boolean;
 }) {
   if (!open) return null;
 
-  return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <Card className="w-full max-w-md bg-card/95 shadow-2xl">
+	  return (
+	    <ModalShell onClose={onClose}>
+	      <Card className="mx-auto max-h-[calc(100dvh-1rem)] w-full max-w-md overflow-hidden bg-card/95 shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
             <div className="text-sm font-semibold">Control access</div>
@@ -2084,7 +3214,7 @@ function AuthModal({
             <X className="h-4 w-4" />
           </Button>
         </div>
-        <div className="space-y-4 p-4">
+        <div className="max-h-[calc(100dvh-6rem)] space-y-4 overflow-auto p-4">
           {currentUser ? (
             <div className="space-y-4">
               <div className="rounded-md border border-border bg-background/80 p-3">
@@ -2122,17 +3252,17 @@ function AuthModal({
                   <Input value={authForm.name} onChange={(event) => onFormChange({ ...authForm, name: event.target.value })} placeholder="display name" autoComplete="name" />
                 ) : null}
                 <Input type="password" value={authForm.password} onChange={(event) => onFormChange({ ...authForm, password: event.target.value })} placeholder="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} />
-                <Button variant="secondary" className="w-full" type="submit">
+                <Button variant="secondary" className="w-full" type="submit" loading={submitting}>
                   {authMode === "register" ? <UserPlus className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
                   {authMode === "register" ? "Create account" : "Sign in"}
                 </Button>
               </form>
               <div className="grid grid-cols-2 gap-2">
-                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")}>
+                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")} loading={oauthLoading("github")}>
                   <Github className="h-4 w-4" />
                   GitHub
                 </Button>
-                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")}>
+                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")} loading={oauthLoading("google")}>
                   <Globe className="h-4 w-4" />
                   Google
                 </Button>
@@ -2140,7 +3270,7 @@ function AuthModal({
               <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
                 <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
                 <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
-                <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken}>
+                <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken} loading={directTokenLoading}>
                   <RefreshCw className="h-4 w-4" />
                   Use token
                 </Button>
@@ -2148,10 +3278,10 @@ function AuthModal({
             </>
           )}
         </div>
-      </Card>
-    </div>
-  );
-}
+	      </Card>
+	    </ModalShell>
+	  );
+	}
 
 function SignalCommand({ title, value, mono = true, href = false }: { title: string; value: string; mono?: boolean; href?: boolean }) {
   const [copied, setCopied] = React.useState(false);
@@ -2214,9 +3344,9 @@ function JoinSignalModal({
 }) {
   if (!open) return null;
 
-  return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <Card className="w-full max-w-2xl bg-card/95 shadow-2xl">
+	  return (
+	    <ModalShell onClose={onClose}>
+	      <Card className="mx-auto max-h-[calc(100dvh-1rem)] w-full max-w-2xl overflow-hidden bg-card/95 shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
             <div className="text-sm font-semibold">Join Worker</div>
@@ -2226,7 +3356,7 @@ function JoinSignalModal({
             <X className="h-4 w-4" />
           </Button>
         </div>
-        <div className="space-y-4 p-4">
+        <div className="max-h-[calc(100dvh-6rem)] space-y-4 overflow-auto p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="text-xs text-muted-foreground">
               {tokenReady ? "Use the Worker command for machines and share the Direct Token or token URL with anonymous Control devices." : "Direct Token access cannot generate new Worker signals."}
@@ -2255,10 +3385,10 @@ function JoinSignalModal({
             </div>
           )}
         </div>
-      </Card>
-    </div>
-  );
-}
+	      </Card>
+	    </ModalShell>
+	  );
+	}
 
 function CreateSessionModal({
   open,
@@ -2271,6 +3401,7 @@ function CreateSessionModal({
   onWorkerSearchChange,
   onFormChange,
   onSelectCWD,
+  submitting,
 }: {
   open: boolean;
   createForm: CreateSessionForm;
@@ -2282,12 +3413,13 @@ function CreateSessionModal({
   onWorkerSearchChange: (value: string) => void;
   onFormChange: React.Dispatch<React.SetStateAction<CreateSessionForm>>;
   onSelectCWD: (cwd: string) => void;
+  submitting: boolean;
 }) {
   if (!open) return null;
 
-  return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <Card className="w-full max-w-lg bg-card/95 shadow-2xl">
+	  return (
+	    <ModalShell onClose={onClose}>
+	      <Card className="mx-auto max-h-[calc(100dvh-1rem)] w-full max-w-lg overflow-hidden bg-card/95 shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <div>
             <div className="text-sm font-semibold">Create session</div>
@@ -2297,7 +3429,7 @@ function CreateSessionModal({
             <X className="h-4 w-4" />
           </Button>
         </div>
-        <form className="space-y-3 p-4" onSubmit={onSubmit}>
+        <form className="max-h-[calc(100dvh-6rem)] space-y-3 overflow-auto p-4" onSubmit={onSubmit}>
           <div className="space-y-2">
             <div className="text-xs font-medium uppercase text-muted-foreground">Worker</div>
             <div className="relative">
@@ -2343,18 +3475,18 @@ function CreateSessionModal({
             ) : null}
           </div>
           <Input value={createForm.command} onChange={(event) => onFormChange((form) => ({ ...form, command: event.target.value }))} placeholder="command" />
-          <div className="flex justify-end gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             <Button variant="ghost" type="button" onClick={onClose}>Cancel</Button>
-            <Button type="submit">
+            <Button type="submit" loading={submitting}>
               <Plus className="h-4 w-4" />
               Create Session
             </Button>
           </div>
         </form>
-      </Card>
-    </div>
-  );
-}
+	      </Card>
+	    </ModalShell>
+	  );
+	}
 
 function LayoutRenderer({
   tabId,
@@ -2497,20 +3629,78 @@ function TerminalPane({
   const socket = React.useRef<WebSocket | null>(null);
   const streamId = React.useRef("");
   const lastSize = React.useRef({ cols: 0, rows: 0 });
+  const viewportSizeRef = React.useRef<TerminalSize>({});
+  const resizePolicy = React.useRef("pending");
+  const historyLoadingRef = React.useRef(false);
+  const historyBeforeSeq = React.useRef<number | undefined>(undefined);
+  const historyAutoRequested = React.useRef(false);
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
   const activeRef = React.useRef(interactive);
+  const mouseDownButton = React.useRef("");
+  const mobileActionsRef = React.useRef<HTMLDivElement | null>(null);
+  const inlineStateScreenRef = React.useRef<HTMLDivElement | null>(null);
+  const modalStateScreenRef = React.useRef<HTMLDivElement | null>(null);
   const [prefixRecorderOpen, setPrefixRecorderOpen] = React.useState(false);
+  const [mobileActionsOpen, setMobileActionsOpen] = React.useState(false);
+  const [terminalMode, setTerminalMode] = React.useState<TerminalModePayload>({});
+  const [viewportSize, setViewportSize] = React.useState<TerminalSize>({});
+  const [historyOpen, setHistoryOpen] = React.useState(false);
+  const [historyLines, setHistoryLines] = React.useState<TerminalHistoryLine[]>([]);
+  const [historyLoading, setHistoryLoading] = React.useState(false);
+  const [historyError, setHistoryError] = React.useState("");
+  const [historyHasMore, setHistoryHasMore] = React.useState(false);
+  const [stateOpen, setStateOpen] = React.useState(false);
+  const [cellSnapshot, setCellSnapshot] = React.useState<TerminalCellSnapshot | null>(null);
+  const [stateRenderer, setStateRenderer] = React.useState(false);
+  const [statePanX, setStatePanX] = React.useState(0);
+  const [statePanY, setStatePanY] = React.useState(0);
   const backend = sessionBackendLabel(session || undefined, worker);
   const isTmux = backend.toLowerCase() === "tmux";
   const workerTerminalSettings = workerTerminalSettingsFor(terminalSettings, worker?.id);
   const tmuxPrefix = workerTerminalSettings.tmuxPrefix || defaultTmuxPrefix;
   const tmuxPrefixLabel = displayControlSequence(tmuxPrefix);
+  const paneTargetKey = terminalTargetKey(pane.target);
+  const attachedLabel = terminalPaneAttachedLabel(pane, session);
+  const workerStateMode = Boolean(pane.sessionId && terminalMode.mode && terminalMode.mode !== "attach");
+  const viewportHint = terminalViewportHint(terminalMode.remote_size, viewportSize);
+  const statePanMaxX = terminalStatePanMaxX(cellSnapshot, viewportSize);
+  const statePanMaxY = terminalStatePanMaxY(cellSnapshot, viewportSize);
+  const stateViewActive = Boolean(workerStateMode && stateRenderer && cellSnapshot);
+  const hasMobileActions = Boolean((isTmux && !simple) || workerStateMode || !simple);
 
   React.useEffect(() => {
     activeRef.current = interactive;
   }, [interactive]);
+
+  React.useEffect(() => {
+    const nodes = [inlineStateScreenRef.current, modalStateScreenRef.current].filter((node): node is HTMLDivElement => Boolean(node));
+    if (!nodes.length) return;
+    const disposers = nodes.map((node) => {
+      const onWheel = (event: WheelEvent) => handleStateWheel(event, node);
+      node.addEventListener("wheel", onWheel, { passive: false });
+      return () => node.removeEventListener("wheel", onWheel);
+    });
+    return () => {
+      for (const dispose of disposers) dispose();
+    };
+  }, [stateViewActive, stateOpen, statePanX, statePanY, statePanMaxX, statePanMaxY, cellSnapshot, viewportSize]);
+
+  React.useEffect(() => {
+    if (!mobileActionsOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (mobileActionsRef.current?.contains(event.target as Node)) return;
+      setMobileActionsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [mobileActionsOpen]);
+
+  React.useEffect(() => {
+    setStatePanX((value) => clampNumber(value, 0, statePanMaxX));
+    setStatePanY((value) => clampNumber(value, 0, statePanMaxY));
+  }, [statePanMaxX, statePanMaxY]);
 
   function sendControlInput(data: string) {
     if (!pane.sessionId || !streamId.current || !socket.current) return;
@@ -2520,6 +3710,137 @@ function TerminalPane({
   function sendTmuxPrefix() {
     sendControlInput(tmuxPrefix);
     terminal.current?.focus();
+  }
+
+  function sendSizeSync() {
+    if (!pane.sessionId || !streamId.current || !socket.current) return;
+    const size = currentTerminalSize();
+    if (!size) return;
+    sendEnvelope(socket.current, "terminal.size.sync", pane.sessionId, streamId.current, { ...size, source: "control_viewport" });
+    setStatus({ tone: "warn", title: "Syncing remote size", detail: `${size.cols}x${size.rows}` });
+    terminal.current?.focus();
+  }
+
+  function sendSizeReset() {
+    if (!pane.sessionId || !streamId.current || !socket.current) return;
+    sendEnvelope(socket.current, "terminal.size.reset", pane.sessionId, streamId.current, { source: "worker_default" });
+    setStatus({ tone: "warn", title: "Resetting remote size", detail: "Worker default terminal size" });
+    terminal.current?.focus();
+  }
+
+  function requestHistoryPage(manual = false) {
+    if (!pane.sessionId || !streamId.current || !socket.current || socket.current.readyState !== WebSocket.OPEN) return;
+    if (resizePolicy.current !== "worker_state" && !manual) return;
+    if (historyLoadingRef.current) return;
+    historyLoadingRef.current = true;
+    setHistoryOpen(true);
+    setHistoryLoading(true);
+    setHistoryError("");
+    sendEnvelope(socket.current, "terminal.history.request", pane.sessionId, streamId.current, {
+      before_seq: historyBeforeSeq.current,
+      limit_lines: 300,
+    });
+  }
+
+  function openHistoryPanel() {
+    setHistoryOpen(true);
+    if (historyLines.length === 0) {
+      requestHistoryPage(true);
+    }
+  }
+
+  function nudgeStatePan(delta: number) {
+    setStatePanX((value) => clampNumber(value + delta, 0, statePanMaxX));
+    terminal.current?.focus();
+  }
+
+  function nudgeStatePanY(delta: number) {
+    setStatePanY((value) => clampNumber(value + delta, 0, statePanMaxY));
+    terminal.current?.focus();
+  }
+
+  function handleStateWheel(event: WheelEvent, target: HTMLDivElement) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (stateViewActive) {
+      if (event.deltaY < 0) sendTerminalMouseAt(target, event, "wheel_up");
+      if (event.deltaY > 0) sendTerminalMouseAt(target, event, "wheel_down");
+      if (event.deltaX < 0) sendTerminalMouseAt(target, event, "wheel_left");
+      if (event.deltaX > 0) sendTerminalMouseAt(target, event, "wheel_right");
+    }
+    if (event.shiftKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) {
+      const delta = event.deltaX || event.deltaY;
+      if (!delta || statePanMaxX <= 0) return;
+      nudgeStatePan(delta > 0 ? 4 : -4);
+      return;
+    }
+    if (!event.deltaY) return;
+    if (statePanMaxY <= 0 && event.deltaY < 0) {
+      requestHistoryPage(false);
+      return;
+    }
+    if (event.deltaY < 0 && statePanY >= statePanMaxY) {
+      requestHistoryPage(false);
+      return;
+    }
+    nudgeStatePanY(event.deltaY > 0 ? -3 : 3);
+  }
+
+  function sendTerminalMouse(event: React.PointerEvent<HTMLDivElement>, button: string, options: { motion?: boolean; release?: boolean } = {}) {
+    return sendTerminalMouseAt(event.currentTarget, event, button, options);
+  }
+
+  function sendTerminalMouseAt(target: HTMLDivElement, event: Pick<MouseEvent, "clientX" | "clientY" | "shiftKey" | "altKey" | "ctrlKey">, button: string, options: { motion?: boolean; release?: boolean } = {}) {
+    if (!stateViewActive || !cellSnapshot || !socket.current || socket.current.readyState !== WebSocket.OPEN || !pane.sessionId) return false;
+    const rect = target.getBoundingClientRect();
+    const viewportCols = Math.max(1, Math.min(viewportSize.cols || cellSnapshot.cols || 80, cellSnapshot.cols || viewportSize.cols || 80));
+    const viewportRows = Math.max(1, Math.min(viewportSize.rows || cellSnapshot.rows || 24, cellSnapshot.rows || viewportSize.rows || 24));
+    const localCol = clampNumber(Math.floor(((event.clientX - rect.left) / Math.max(rect.width, 1)) * viewportCols), 0, viewportCols - 1);
+    const localRow = clampNumber(Math.floor(((event.clientY - rect.top) / Math.max(rect.height, 1)) * viewportRows), 0, viewportRows - 1);
+    const rowStart = cellViewportStartRow(cellSnapshot, viewportSize, statePanY);
+    const x = clampNumber(statePanX + localCol, 0, Math.max(0, (cellSnapshot.cols || viewportCols) - 1));
+    const y = clampNumber(rowStart + localRow, 0, Math.max(0, (cellSnapshot.rows || viewportRows) - 1));
+    sendEnvelope(socket.current, "terminal.mouse", pane.sessionId, streamId.current, {
+      x,
+      y,
+      button,
+      motion: options.motion === true,
+      release: options.release === true,
+      shift: event.shiftKey,
+      alt: event.altKey,
+      ctrl: event.ctrlKey,
+      source: "web_state_renderer",
+    });
+    return true;
+  }
+
+  function handleStatePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+    const button = pointerButtonName(event.button);
+    if (!button) return;
+    mouseDownButton.current = button;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    sendTerminalMouse(event, button);
+    terminal.current?.focus();
+  }
+
+  function handleStatePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (!mouseDownButton.current) return;
+    sendTerminalMouse(event, mouseDownButton.current, { motion: true });
+  }
+
+  function handleStatePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+    const button = mouseDownButton.current || pointerButtonName(event.button);
+    mouseDownButton.current = "";
+    if (!button) return;
+    sendTerminalMouse(event, button, { release: true });
+  }
+
+  function currentTerminalSize() {
+    const term = terminal.current;
+    if (!term) return null;
+    return { cols: term.cols, rows: term.rows };
   }
 
   function configureTmuxPrefix() {
@@ -2541,7 +3862,7 @@ function TerminalPane({
       scrollback: 5000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
       fontSize: 14,
-      theme: { background: "#050607", foreground: "#eef2f3", cursor: "#35c98f" },
+      theme: xtermTheme,
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -2550,6 +3871,23 @@ function TerminalPane({
     terminal.current = term;
     fit.current = fitAddon;
     term.focus();
+    resizePolicy.current = "pending";
+    viewportSizeRef.current = {};
+    historyBeforeSeq.current = undefined;
+    historyAutoRequested.current = false;
+    historyLoadingRef.current = false;
+    setTerminalMode({});
+    setViewportSize({});
+    setHistoryLines([]);
+    setHistoryOpen(false);
+    setHistoryLoading(false);
+    setHistoryError("");
+    setHistoryHasMore(false);
+    setStateOpen(false);
+    setCellSnapshot(null);
+    setStateRenderer(false);
+    setStatePanX(0);
+    setStatePanY(0);
 
     streamId.current = makeStreamId(pane.sessionId);
     const ws = new WebSocket(`${wsBaseFromLocation()}/ws/control?token=${encodeURIComponent(token)}`);
@@ -2560,7 +3898,12 @@ function TerminalPane({
       const rect = terminalRef.current.getBoundingClientRect();
       if (rect.width < 20 || rect.height < 20) return;
       fitAddon.fit();
-      return { cols: term.cols, rows: term.rows };
+      const size = { cols: term.cols, rows: term.rows };
+      if (viewportSizeRef.current.cols !== size.cols || viewportSizeRef.current.rows !== size.rows) {
+        viewportSizeRef.current = size;
+        setViewportSize(size);
+      }
+      return size;
     };
     const fitAndSendResize = () => {
       const size = fitTerminal();
@@ -2568,7 +3911,9 @@ function TerminalPane({
       if (term.cols === lastSize.current.cols && term.rows === lastSize.current.rows) return;
       lastSize.current = size;
       if (ws.readyState === WebSocket.OPEN) {
-        sendEnvelope(ws, "terminal.resize", pane.sessionId!, streamId.current, size);
+        if (resizePolicy.current === "follow_control") {
+          sendEnvelope(ws, "terminal.resize", pane.sessionId!, streamId.current, size);
+        }
       }
     };
     const scheduleFit = () => {
@@ -2581,9 +3926,16 @@ function TerminalPane({
 
     ws.addEventListener("open", () => {
       const size = fitTerminal();
-      sendEnvelope(ws, "control.open", pane.sessionId!, streamId.current, size || { cols: term.cols, rows: term.rows });
+      sendEnvelope(ws, "control.open", pane.sessionId!, streamId.current, {
+        ...(size || { cols: term.cols, rows: term.rows }),
+        target: pane.target,
+        capabilities: ["terminal.snapshot.v1", "terminal.state_reset.v1", "terminal.size_control.v1", "terminal.history.v1"],
+        transport_mode: "auto",
+        render_mode: "worker_state_xterm",
+        resize_policy: "worker_state",
+      });
       if (size) lastSize.current = size;
-      setStatus({ tone: "ok", title: `Attached ${pane.sessionId}`, detail: streamId.current });
+      setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: streamId.current });
       scheduleFit();
     });
     ws.addEventListener("message", (event) => {
@@ -2593,11 +3945,69 @@ function TerminalPane({
         if (payload.encoding === "base64") term.write(base64ToBytes(payload.data || ""));
         else term.write(payload.data || "");
       }
+      if (env.type === "terminal.snapshot") {
+        const payload = env.payload || {};
+        if (payload.encoding === "ansi-screen-v1") {
+          term.reset();
+          term.write(payload.data || "");
+        }
+        if (payload.encoding === "ansi-lines-v1") {
+          term.reset();
+          term.write(snapshotLinesToTerminal(payload.data || ""));
+        }
+        if (payload.encoding === "cells-v1" && payload.cells) {
+          setCellSnapshot({ ...(payload.cells as TerminalCellSnapshot), generation: payload.generation });
+          setTerminalMode((current) => ({
+            ...current,
+            remote_size: { cols: payload.cols, rows: payload.rows },
+          }));
+        }
+      }
+      if (env.type === "terminal.diff") {
+        const payload = (env.payload || {}) as TerminalDiffPayload;
+        setCellSnapshot((current) => applyTerminalDiff(current, payload));
+      }
+      if (env.type === "terminal.state.reset") {
+        const payload = env.payload || {};
+        term.reset();
+        setCellSnapshot(null);
+        setTerminalMode((current) => ({
+          ...current,
+          remote_size: { cols: payload.cols, rows: payload.rows },
+          default_size: payload.default_size || current.default_size,
+        }));
+        setStatePanX(0);
+        setStatePanY(0);
+        setStatus({ tone: "warn", title: "Remote terminal resized", detail: `${payload.reason || "state reset"} · ${payload.cols || "?"}x${payload.rows || "?"}` });
+      }
+      if (env.type === "terminal.mode") {
+        const payload = (env.payload || {}) as TerminalModePayload;
+        resizePolicy.current = payload.resize_policy || (payload.mode === "attach" ? "follow_control" : "worker_state");
+        setTerminalMode(payload);
+        if (payload.mode) setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: terminalModeDetail(payload) });
+        scheduleFit();
+      }
+      if (env.type === "terminal.history.page") {
+        const payload = (env.payload || {}) as TerminalHistoryPage;
+        const nextLines = payload.lines || [];
+        setHistoryLines((current) => (historyBeforeSeq.current ? [...nextLines, ...current] : nextLines));
+        historyBeforeSeq.current = payload.start_seq || nextLines[0]?.seq_start || historyBeforeSeq.current;
+        setHistoryHasMore(Boolean(payload.has_more));
+        setHistoryLoading(false);
+        historyLoadingRef.current = false;
+        setHistoryError("");
+        if (nextLines.length > 0) setHistoryOpen(true);
+      }
       if (env.type === "error") {
+        if (historyLoadingRef.current) {
+          historyLoadingRef.current = false;
+          setHistoryLoading(false);
+          setHistoryError(env.payload?.message || "history request failed");
+        }
         setStatus({ tone: "err", title: "Remote error", detail: env.payload?.message || "unknown error" });
       }
     });
-    ws.addEventListener("close", () => setStatus({ tone: "warn", title: `Detached ${pane.sessionId}`, detail: "The browser stream closed." }));
+    ws.addEventListener("close", () => setStatus({ tone: "warn", title: `Detached ${attachedLabel}`, detail: "The browser stream closed." }));
     const helperTextarea = terminalRef.current.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
     const onCompositionStart = () => {
       composing.current = true;
@@ -2652,6 +4062,12 @@ function TerminalPane({
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
       return false;
     });
+    const scrollDisposable = term.onScroll((position) => {
+      if (position > 2) return;
+      if (historyAutoRequested.current || historyLoadingRef.current) return;
+      historyAutoRequested.current = true;
+      requestHistoryPage(false);
+    });
     const onDocumentKeyDown = (event: KeyboardEvent) => {
       if (terminalInputSuppressed()) return;
       if (!activeRef.current || event.defaultPrevented) return;
@@ -2675,6 +4091,7 @@ function TerminalPane({
 
     return () => {
       dataDisposable.dispose();
+      scrollDisposable.dispose();
       document.removeEventListener("keydown", onDocumentKeyDown, true);
       helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
       helperTextarea?.removeEventListener("compositionupdate", onCompositionUpdate);
@@ -2691,14 +4108,20 @@ function TerminalPane({
       fit.current = null;
       socket.current = null;
     };
-  }, [pane.sessionId, token, setStatus]);
+  }, [pane.sessionId, paneTargetKey, token, setStatus]);
 
   return (
     <div
       className={cn("relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
+      onPointerDown={(event) => {
+        if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        onFocus();
+        terminal.current?.focus();
+      }}
       onMouseDown={(event) => {
         if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
         onFocus();
+        terminal.current?.focus();
       }}
       onDragOver={(event) => {
         if (simple) return;
@@ -2719,98 +4142,500 @@ function TerminalPane({
         onDropPayload(dropZoneFromEvent(event), payload);
       }}
     >
-      <div className="flex h-7 items-center justify-between border-b border-border bg-card px-1.5">
-        <div
-          className={cn("flex min-w-0 flex-1 items-center gap-1.5 truncate text-xs font-medium text-muted-foreground", !simple && "cursor-grab active:cursor-grabbing")}
-          draggable={!simple}
-          onDragStart={(event) => setDragPayload(event, { kind: "pane", paneId: pane.id })}
-          onDragEnd={() => onDropTarget(null)}
-          title={simple ? pane.sessionId || "Session" : "Drag pane"}
-        >
-          <span className="truncate">{pane.sessionId || "Empty pane"}</span>
-          {pane.sessionId ? <BackendBadge value={backend} /> : null}
-        </div>
-        <div
-          data-terminal-chrome
-          className="flex items-center gap-1"
-          onPointerDown={stopTerminalChromeEvent}
-          onPointerUp={stopTerminalChromeEvent}
-          onMouseDown={stopTerminalChromeEvent}
-          onMouseUp={stopTerminalChromeEvent}
-          onClick={(event) => event.stopPropagation()}
-        >
-          {isTmux ? (
-            <>
-              <Button
-                variant="ghost"
-                size="xs"
-                className="h-7 px-1.5"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  sendTmuxPrefix();
-                }}
-                title={`Send tmux prefix for ${worker ? workerDisplayLabel(worker) : "worker"} (${tmuxPrefixLabel})`}
-              >
-                <Keyboard className="h-3.5 w-3.5" />
-                {tmuxPrefixLabel}
-              </Button>
-              {!simple ? (
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    configureTmuxPrefix();
-                  }}
-                  title="Configure tmux prefix"
-                >
-                  <Settings className="h-4 w-4" />
-                </Button>
-              ) : null}
-            </>
-          ) : null}
-          {!simple ? (
-            <>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onSplit("horizontal");
-                }}
-                title="Split right"
-              >
-                <SplitSquareHorizontal className="h-4 w-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onSplit("vertical");
-                }}
-                title="Split down"
-              >
-                <SplitSquareVertical className="h-4 w-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onClose();
-                }}
-                title="Close pane"
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </>
-          ) : null}
-        </div>
-      </div>
+	      <div className="flex h-7 items-center justify-between border-b border-border bg-card px-1.5">
+	        <div
+	          className={cn("flex min-w-0 flex-1 items-center gap-1.5 truncate text-xs font-medium text-muted-foreground", !simple && "cursor-grab active:cursor-grabbing")}
+	          draggable={!simple}
+	          onDragStart={(event) => setDragPayload(event, { kind: "pane", paneId: pane.id })}
+	          onDragEnd={() => onDropTarget(null)}
+	          title={simple ? attachedLabel || "Session" : "Drag pane"}
+	        >
+	          <span className="truncate">{attachedLabel || "Empty pane"}</span>
+	          {pane.sessionId ? <BackendBadge value={backend} /> : null}
+	          {pane.sessionId && terminalMode.mode ? <StatusBadge tone={workerStateMode ? "ok" : undefined}>{terminalMode.render_mode || terminalMode.mode}</StatusBadge> : null}
+	          {workerStateMode ? (
+	            <span className="hidden min-w-0 truncate text-[11px] font-normal text-muted-foreground/80 xl:inline">
+	              remote {formatTerminalSize(terminalMode.remote_size)} · viewport {formatTerminalSize(viewportSize)}
+	            </span>
+	          ) : null}
+	          {workerStateMode && viewportHint ? <StatusBadge tone={viewportHint === "cropped" ? "warn" : undefined}>{viewportHint}</StatusBadge> : null}
+	        </div>
+	        <div
+	          data-terminal-chrome
+	          ref={mobileActionsRef}
+	          className="relative flex shrink-0 items-center gap-1"
+	          onPointerDown={stopTerminalChromeEvent}
+	          onPointerUp={stopTerminalChromeEvent}
+	          onMouseDown={stopTerminalChromeEvent}
+	          onMouseUp={stopTerminalChromeEvent}
+	          onClick={(event) => event.stopPropagation()}
+	        >
+	          {isTmux ? (
+	            <>
+	              <Button
+	                variant="ghost"
+	                size="xs"
+	                className="h-7 px-1.5"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  sendTmuxPrefix();
+	                }}
+	                title={`Send tmux prefix for ${worker ? workerDisplayLabel(worker) : "worker"} (${tmuxPrefixLabel})`}
+	              >
+	                <Keyboard className="h-3.5 w-3.5" />
+	                {tmuxPrefixLabel}
+	              </Button>
+	              {!simple ? (
+	                <Button
+	                  variant="ghost"
+	                  size="icon-sm"
+	                  className="hidden md:inline-flex"
+	                  onClick={(event) => {
+	                    event.stopPropagation();
+	                    configureTmuxPrefix();
+	                  }}
+	                  title="Configure tmux prefix"
+	                >
+	                  <Settings className="h-4 w-4" />
+	                </Button>
+	              ) : null}
+	            </>
+	          ) : null}
+	          {workerStateMode ? (
+	            <div className="hidden items-center gap-1 md:flex">
+	              <Button
+	                variant="ghost"
+	                size="xs"
+	                className="h-7 px-1.5"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  setStateOpen(true);
+	                }}
+	                disabled={!cellSnapshot}
+	                title={cellSnapshot ? "Open worker-side cell state" : "Worker-side cell state has not arrived yet"}
+	              >
+	                <Monitor className="h-3.5 w-3.5" />
+	                State
+	              </Button>
+	              <Button
+	                variant={stateRenderer ? "secondary" : "ghost"}
+	                size="xs"
+	                className="h-7 px-1.5"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  setStateRenderer((value) => !value);
+	                  requestAnimationFrame(() => terminal.current?.focus());
+	                }}
+		                disabled={!cellSnapshot}
+		                title={cellSnapshot ? "Show worker-side cell state for diagnostics" : "Waiting for worker-side cells snapshot"}
+		              >
+		                <Bug className="h-3.5 w-3.5" />
+		                Debug
+		              </Button>
+	              <Button
+	                variant="ghost"
+	                size="xs"
+	                className="h-7 px-1.5"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  openHistoryPanel();
+	                }}
+	                loading={historyLoading}
+	                title="Open worker-side history page"
+	              >
+	                <History className="h-3.5 w-3.5" />
+	                History
+	              </Button>
+	              <Button
+	                variant="ghost"
+	                size="xs"
+	                className="h-7 px-1.5"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  sendSizeSync();
+	                }}
+	                title={`Sync remote terminal size to this viewport (${formatTerminalSize(currentTerminalSize())})`}
+	              >
+	                <UnfoldHorizontal className="h-3.5 w-3.5" />
+	                Sync
+	              </Button>
+	              <Button
+	                variant="ghost"
+	                size="xs"
+	                className="h-7 px-1.5"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  sendSizeReset();
+		                }}
+		                title={`Reset remote terminal size to worker default (${formatTerminalSize(terminalMode.default_size)})`}
+		              >
+		                <RefreshCw className="h-3.5 w-3.5" />
+		                Reset
+		              </Button>
+	            </div>
+	          ) : null}
+	          {!simple ? (
+	            <div className="hidden items-center gap-1 md:flex">
+	              <Button
+	                variant="ghost"
+	                size="icon-sm"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  onSplit("horizontal");
+	                }}
+	                title="Split right"
+	              >
+	                <SplitSquareHorizontal className="h-4 w-4" />
+	              </Button>
+	              <Button
+	                variant="ghost"
+	                size="icon-sm"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  onSplit("vertical");
+	                }}
+	                title="Split down"
+	              >
+	                <SplitSquareVertical className="h-4 w-4" />
+	              </Button>
+	              <Button
+	                variant="ghost"
+	                size="icon-sm"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  onClose();
+	                }}
+	                title="Close pane"
+	              >
+	                <X className="h-4 w-4" />
+	              </Button>
+	            </div>
+	          ) : null}
+	          {hasMobileActions ? (
+	            <>
+	              <Button
+	                variant={mobileActionsOpen ? "secondary" : "ghost"}
+	                size="icon-sm"
+	                className="md:hidden"
+	                onClick={(event) => {
+	                  event.stopPropagation();
+	                  setMobileActionsOpen((value) => !value);
+	                }}
+	                title="More session actions"
+	                aria-expanded={mobileActionsOpen}
+	              >
+	                <Ellipsis className="h-4 w-4" />
+	              </Button>
+	              {mobileActionsOpen ? (
+	                <div className="absolute right-0 top-full z-50 mt-1 flex w-44 flex-col gap-1 rounded-md border border-border bg-card p-1 shadow-lg md:hidden">
+	                  {isTmux && !simple ? (
+	                    <Button
+	                      variant="ghost"
+	                      size="sm"
+	                      className="w-full justify-start"
+	                      onClick={(event) => {
+	                        event.stopPropagation();
+	                        setMobileActionsOpen(false);
+	                        configureTmuxPrefix();
+	                      }}
+	                      title="Configure tmux prefix"
+	                    >
+	                      <Settings className="h-3.5 w-3.5" />
+	                      Prefix settings
+	                    </Button>
+	                  ) : null}
+	                  {workerStateMode ? (
+	                    <>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          setStateOpen(true);
+	                        }}
+	                        disabled={!cellSnapshot}
+	                        title={cellSnapshot ? "Open worker-side cell state" : "Worker-side cell state has not arrived yet"}
+	                      >
+	                        <Monitor className="h-3.5 w-3.5" />
+	                        State
+	                      </Button>
+	                      <Button
+	                        variant={stateRenderer ? "secondary" : "ghost"}
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          setStateRenderer((value) => !value);
+	                          requestAnimationFrame(() => terminal.current?.focus());
+	                        }}
+		                        disabled={!cellSnapshot}
+		                        title={cellSnapshot ? "Show worker-side cell state for diagnostics" : "Waiting for worker-side cells snapshot"}
+		                      >
+		                        <Bug className="h-3.5 w-3.5" />
+		                        Debug
+		                      </Button>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          openHistoryPanel();
+	                        }}
+	                        loading={historyLoading}
+	                        title="Open worker-side history page"
+	                      >
+	                        <History className="h-3.5 w-3.5" />
+	                        History
+	                      </Button>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          sendSizeSync();
+	                        }}
+	                        title={`Sync remote terminal size to this viewport (${formatTerminalSize(currentTerminalSize())})`}
+	                      >
+	                        <UnfoldHorizontal className="h-3.5 w-3.5" />
+	                        Sync
+	                      </Button>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          sendSizeReset();
+		                        }}
+		                        title={`Reset remote terminal size to worker default (${formatTerminalSize(terminalMode.default_size)})`}
+		                      >
+		                        <RefreshCw className="h-3.5 w-3.5" />
+		                        Reset
+		                      </Button>
+	                    </>
+	                  ) : null}
+	                  {!simple ? (
+	                    <>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          onSplit("horizontal");
+	                        }}
+	                        title="Split right"
+	                      >
+	                        <SplitSquareHorizontal className="h-3.5 w-3.5" />
+	                        Split right
+	                      </Button>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          onSplit("vertical");
+	                        }}
+	                        title="Split down"
+	                      >
+	                        <SplitSquareVertical className="h-3.5 w-3.5" />
+	                        Split down
+	                      </Button>
+	                      <Button
+	                        variant="ghost"
+	                        size="sm"
+	                        className="w-full justify-start"
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          setMobileActionsOpen(false);
+	                          onClose();
+	                        }}
+	                        title="Close pane"
+	                      >
+	                        <X className="h-3.5 w-3.5" />
+	                        Close pane
+	                      </Button>
+	                    </>
+	                  ) : null}
+	                </div>
+	              ) : null}
+	            </>
+	          ) : null}
+	        </div>
+	      </div>
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden p-1">
         {pane.sessionId ? (
-          <div ref={terminalRef} className="h-full w-full min-w-0 overflow-hidden" />
+          <div className="relative h-full min-h-0 min-w-0">
+            <div ref={terminalRef} className={cn("h-full w-full min-w-0 overflow-hidden", stateViewActive && "pointer-events-none opacity-0")} />
+            {stateViewActive ? (
+              <div
+                ref={inlineStateScreenRef}
+                className="agentmux-cell-screen absolute inset-0 overflow-hidden bg-[#050607] p-1 font-mono text-[11px] leading-5 text-[#eef2f3]"
+                onPointerDown={handleStatePointerDown}
+                onPointerMove={handleStatePointerMove}
+                onPointerUp={handleStatePointerUp}
+                onPointerCancel={() => {
+                  mouseDownButton.current = "";
+                }}
+              >
+                {renderCellViewport(cellSnapshot!, viewportSize, statePanX, statePanY)}
+                {statePanMaxX > 0 || statePanMaxY > 0 ? (
+                  <div
+                    data-terminal-chrome
+                    className="absolute bottom-2 right-2 grid grid-cols-[28px_40px_28px] items-center gap-1 rounded border border-border bg-card/90 p-1 shadow-lg"
+                    onPointerDown={stopTerminalChromeEvent}
+                    onMouseDown={stopTerminalChromeEvent}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <span />
+                    <Button variant="ghost" size="icon-sm" disabled={statePanY >= statePanMaxY} onClick={() => nudgeStatePanY(4)} title="Pan up">
+                      <ChevronUp className="h-4 w-4" />
+                    </Button>
+                    <span />
+                    <Button variant="ghost" size="icon-sm" disabled={statePanX <= 0} onClick={() => nudgeStatePan(-8)} title="Pan left">
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <span className="text-center text-[10px] leading-3 text-muted-foreground">
+                      x{statePanX}/{statePanMaxX}
+                      <br />
+                      y{statePanY}/{statePanMaxY}
+                    </span>
+                    <Button variant="ghost" size="icon-sm" disabled={statePanX >= statePanMaxX} onClick={() => nudgeStatePan(8)} title="Pan right">
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                    <span />
+                    <Button variant="ghost" size="icon-sm" disabled={statePanY <= 0} onClick={() => nudgeStatePanY(-4)} title="Pan down">
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                    <span />
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {historyOpen ? (
+              <div
+                data-terminal-chrome
+                className="absolute inset-x-2 top-2 bottom-2 z-20 flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-card/95 shadow-2xl backdrop-blur"
+                onPointerDown={stopTerminalChromeEvent}
+                onMouseDown={stopTerminalChromeEvent}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-semibold">Worker history</div>
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {historyLines.length} lines · {historyHasMore ? "more available" : "latest cached page"}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      loading={historyLoading}
+                      disabled={!historyHasMore && historyLines.length > 0}
+                      onClick={() => requestHistoryPage(true)}
+                      title="Load older worker-side history"
+                    >
+                      More
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => {
+                        setHistoryOpen(false);
+                        requestAnimationFrame(() => terminal.current?.focus());
+                      }}
+                      title="Close history"
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]">
+                  {historyError ? <div className="mb-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-red-200">{historyError}</div> : null}
+                  {historyLines.length === 0 && !historyLoading ? <div className="text-muted-foreground">No worker-side history page returned yet.</div> : null}
+                  {historyLines.map((line, index) => (
+                    <div
+                      key={`${line.seq_start || index}:${index}`}
+                      className={cn("whitespace-pre", line.flags?.includes("resize_boundary") && "my-1 text-amber-300")}
+                      title={line.generation ? `generation ${line.generation}` : undefined}
+                    >
+                      {stripAnsi(line.text)}
+                    </div>
+                  ))}
+                  {historyLoading ? <div className="text-muted-foreground">Loading history...</div> : null}
+                </div>
+              </div>
+            ) : null}
+            {stateOpen ? (
+              <div
+                data-terminal-chrome
+                className="absolute inset-x-2 top-2 bottom-2 z-20 flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-card/95 shadow-2xl backdrop-blur"
+                onPointerDown={stopTerminalChromeEvent}
+                onMouseDown={stopTerminalChromeEvent}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-semibold">Worker state screen</div>
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {cellSnapshot
+                        ? `${cellSnapshot.version || "cells-v1"} · remote ${cellSnapshot.cols || "?"}x${cellSnapshot.rows || "?"} · viewport ${formatTerminalSize(viewportSize)} · x ${statePanX}/${statePanMaxX} · y ${statePanY}/${statePanMaxY}`
+                        : "No cell snapshot yet"}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button variant="ghost" size="icon-sm" disabled={statePanY >= statePanMaxY} onClick={() => nudgeStatePanY(4)} title="Pan up">
+                      <ChevronUp className="h-4 w-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon-sm" disabled={statePanX <= 0} onClick={() => nudgeStatePan(-8)} title="Pan left">
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon-sm" disabled={statePanX >= statePanMaxX} onClick={() => nudgeStatePan(8)} title="Pan right">
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon-sm" disabled={statePanY <= 0} onClick={() => nudgeStatePanY(-4)} title="Pan down">
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => {
+                        setStateOpen(false);
+                        requestAnimationFrame(() => terminal.current?.focus());
+                      }}
+                      title="Close state screen"
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                <div
+                  ref={modalStateScreenRef}
+                  className="agentmux-cell-screen min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]"
+                  onPointerDown={handleStatePointerDown}
+                  onPointerMove={handleStatePointerMove}
+                  onPointerUp={handleStatePointerUp}
+                  onPointerCancel={() => {
+                    mouseDownButton.current = "";
+                  }}
+                >
+                  {cellSnapshot ? renderCellViewport(cellSnapshot, viewportSize, statePanX, statePanY) : <div className="text-muted-foreground">Waiting for worker-side cells snapshot...</div>}
+                </div>
+              </div>
+            ) : null}
+          </div>
         ) : (
           <Card className="grid h-full place-items-center border-dashed bg-background">
             <div className="text-center text-sm text-muted-foreground">Select a session from the sidebar.</div>
@@ -2937,15 +4762,15 @@ function DropIndicator({ zone }: { zone?: DropZone }) {
   );
 }
 
-function newPane(sessionId?: string): PaneNode {
-  return { type: "pane", id: crypto.randomUUID(), sessionId };
+function newPane(sessionId?: string, target?: TerminalTargetView): PaneNode {
+  return { type: "pane", id: crypto.randomUUID(), sessionId, target: normalizeTerminalTarget(target) };
 }
 
-function newWorkspaceTab(sessionId?: string, title?: string): WorkspaceTab {
-  const pane = newPane(sessionId);
+function newWorkspaceTab(sessionId?: string, title?: string, target?: TerminalTargetView): WorkspaceTab {
+  const pane = newPane(sessionId, target);
   return {
     id: crypto.randomUUID(),
-    title: title || workspaceTitleForSession(sessionId),
+    title: title || workspaceTitleForSession(sessionId, target),
     renamed: false,
     layout: pane,
     activePane: pane.id,
@@ -2954,14 +4779,15 @@ function newWorkspaceTab(sessionId?: string, title?: string): WorkspaceTab {
 
 function titleForTab(tab: WorkspaceTab, layout: LayoutNode) {
   if (tab.renamed) return tab.title;
-  const sessionIDs = collectPanes(layout).map((pane) => pane.sessionId).filter((id): id is string => Boolean(id));
-  if (sessionIDs.length === 1) return workspaceTitleForSession(sessionIDs[0]);
-  if (sessionIDs.length > 1) return `${sessionIDs.length} sessions`;
+  const attached = collectPanes(layout).filter((pane) => pane.sessionId);
+  if (attached.length === 1) return workspaceTitleForSession(attached[0].sessionId, attached[0].target);
+  if (attached.length > 1) return `${attached.length} sessions`;
   return tab.title || "Workspace";
 }
 
-function workspaceTitleForSession(sessionId?: string) {
+function workspaceTitleForSession(sessionId?: string, target?: TerminalTargetView) {
   if (!sessionId) return "Workspace";
+  if (target?.pane_id) return `${sessionId} ${terminalTargetShortLabel(target)}`;
   return sessionId;
 }
 
@@ -3048,9 +4874,9 @@ function swapPaneSessions(node: LayoutNode, sourcePaneId: string, targetPaneId: 
   const target = findPane(node, targetPaneId);
   if (!source || !target) return node;
   return updatePane(
-    updatePane(node, sourcePaneId, (pane) => ({ ...pane, sessionId: target.sessionId })),
+    updatePane(node, sourcePaneId, (pane) => ({ ...pane, sessionId: target.sessionId, target: target.target })),
     targetPaneId,
-    (pane) => ({ ...pane, sessionId: source.sessionId }),
+    (pane) => ({ ...pane, sessionId: source.sessionId, target: source.target }),
   );
 }
 
@@ -3074,7 +4900,7 @@ function firstPaneId(node: LayoutNode): string {
 
 function clearSessionFromLayout(node: LayoutNode, sessionId: string): LayoutNode {
   if (node.type === "pane") {
-    return node.sessionId === sessionId ? { ...node, sessionId: undefined } : node;
+    return node.sessionId === sessionId ? { ...node, sessionId: undefined, target: undefined } : node;
   }
   return { ...node, children: node.children.map((child) => clearSessionFromLayout(child, sessionId)) };
 }
@@ -3124,6 +4950,10 @@ function base64ToBytes(value: string) {
   const bytes = new Uint8Array(text.length);
   for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
   return bytes;
+}
+
+function snapshotLinesToTerminal(value: string) {
+  return value.replace(/\r?\n/g, "\r\n");
 }
 
 function suppressTerminalInput(durationMs = 600) {
@@ -3299,6 +5129,7 @@ function workerUpdateJobActive(status: string) {
     case "queued":
     case "sent":
     case "started":
+    case "running":
     case "restarting":
       return true;
     default:
@@ -3457,6 +5288,34 @@ function readRecentCWDs(): RecentCWDState {
   }
 }
 
+function readFavorites(): FavoritesState {
+  const value = localStorage.getItem("agentmux.favorites");
+  if (!value) return { sessions: [], panes: [] };
+  try {
+    const parsed = JSON.parse(value);
+    if (!isRecord(parsed)) return { sessions: [], panes: [] };
+    const sessions = Array.isArray(parsed.sessions) ? uniqueStrings(parsed.sessions.filter((item): item is string => typeof item === "string"), 100) : [];
+    const panes = Array.isArray(parsed.panes)
+      ? parsed.panes
+          .map((item): FavoritePane | null => {
+            if (!isRecord(item) || typeof item.sessionId !== "string") return null;
+            const target = normalizeTerminalTarget(item.target);
+            if (!target) return null;
+            return {
+              sessionId: item.sessionId,
+              target,
+              label: typeof item.label === "string" ? item.label : item.sessionId,
+              detail: typeof item.detail === "string" ? item.detail : terminalTargetDetail(target),
+            };
+          })
+          .filter((item): item is FavoritePane => Boolean(item))
+      : [];
+    return { sessions, panes };
+  } catch {
+    return { sessions: [], panes: [] };
+  }
+}
+
 function defaultWorkspaceState(): WorkspaceState {
   const tab = newWorkspaceTab(undefined, "Workspace 1");
   return { tabs: [tab], activeTabId: tab.id };
@@ -3486,6 +5345,7 @@ function normalizeLayoutNode(value: unknown): LayoutNode | null {
       type: "pane",
       id: typeof value.id === "string" && value.id ? value.id : crypto.randomUUID(),
       sessionId: typeof value.sessionId === "string" && value.sessionId ? value.sessionId : undefined,
+      target: normalizeTerminalTarget(value.target),
     };
   }
   if (value.type !== "split") return null;
@@ -3502,12 +5362,160 @@ function normalizeLayoutNode(value: unknown): LayoutNode | null {
   };
 }
 
+function normalizeTerminalTarget(value: unknown): TerminalTargetView | undefined {
+  if (!isRecord(value)) return undefined;
+  const target: TerminalTargetView = {
+    session_name: optionalString(value.session_name),
+    window_id: optionalString(value.window_id),
+    window_index: optionalNumber(value.window_index),
+    window_name: optionalString(value.window_name),
+    window_active: optionalBoolean(value.window_active),
+    pane_id: optionalString(value.pane_id),
+    pane_index: optionalNumber(value.pane_index),
+    pane_active: optionalBoolean(value.pane_active),
+    cwd: optionalString(value.cwd),
+    command: optionalString(value.command),
+    left: optionalNumber(value.left),
+    top: optionalNumber(value.top),
+    width: optionalNumber(value.width),
+    height: optionalNumber(value.height),
+  };
+  if (!target.session_name && !target.window_id && target.window_index === undefined && !target.pane_id) return undefined;
+  return target;
+}
+
+function optionalString(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function optionalNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function optionalBoolean(value: unknown) {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function terminalTargetKey(target?: TerminalTargetView | null) {
+  if (!target) return "";
+  if (target.pane_id) return `pane:${target.pane_id}`;
+  const windowKey = terminalTargetWindowKey(target);
+  if (!windowKey) return "";
+  return `window:${windowKey}:pane:${target.pane_index ?? ""}`;
+}
+
+function targetPreviewKey(sessionId: string, target: TerminalTargetView) {
+  return `${sessionId}|${terminalTargetKey(target) || terminalTargetDetail(target)}`;
+}
+
+function favoritePaneKey(sessionId: string, target: TerminalTargetView) {
+  return `${sessionId}|${terminalTargetKey(target) || terminalTargetDetail(target)}`;
+}
+
+function sessionTargetSummary(targets: TerminalTargetView[]): SessionTargetSummary {
+  return {
+    windows: groupTerminalTargetsByWindow(targets).length,
+    panes: targets.filter((target) => target.pane_id).length || targets.length,
+  };
+}
+
+function terminalTargetPreviewParams(target: TerminalTargetView, lines: number) {
+  const params = new URLSearchParams();
+  params.set("lines", String(lines));
+  setOptionalParam(params, "session_name", target.session_name);
+  setOptionalParam(params, "window_id", target.window_id);
+  setOptionalParam(params, "window_index", target.window_index);
+  setOptionalParam(params, "window_name", target.window_name);
+  setOptionalParam(params, "window_active", target.window_active);
+  setOptionalParam(params, "pane_id", target.pane_id);
+  setOptionalParam(params, "pane_index", target.pane_index);
+  setOptionalParam(params, "pane_active", target.pane_active);
+  setOptionalParam(params, "cwd", target.cwd);
+  setOptionalParam(params, "command", target.command);
+  setOptionalParam(params, "left", target.left);
+  setOptionalParam(params, "top", target.top);
+  setOptionalParam(params, "width", target.width);
+  setOptionalParam(params, "height", target.height);
+  return params.toString();
+}
+
+function setOptionalParam(params: URLSearchParams, key: string, value: string | number | boolean | undefined) {
+  if (value === undefined || value === "") return;
+  params.set(key, String(value));
+}
+
+function terminalTargetWindowKey(target: TerminalTargetView) {
+  if (target.window_id) return target.window_id;
+  return [target.session_name || "", target.window_index ?? "", target.window_name || ""].join("|");
+}
+
+function groupTerminalTargetsByWindow(targets: TerminalTargetView[]) {
+  const groups = new Map<string, TargetWindowGroup>();
+  for (const target of targets) {
+    const key = terminalTargetWindowKey(target);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        index: target.window_index ?? groups.size,
+        name: target.window_name || "",
+        active: Boolean(target.window_active),
+        targets: [],
+      });
+    }
+    const group = groups.get(key)!;
+    group.active = group.active || Boolean(target.window_active);
+    group.targets.push(target);
+  }
+  return Array.from(groups.values());
+}
+
+function targetWindowLabel(group: TargetWindowGroup) {
+  const name = group.name ? ` · ${group.name}` : "";
+  return `Window ${group.index}${name}`;
+}
+
+function terminalTargetShortLabel(target?: TerminalTargetView) {
+  if (!target) return "";
+  const windowLabel = target.window_index === undefined ? "w?" : `w${target.window_index}`;
+  const paneLabel = target.pane_index === undefined ? target.pane_id || "p?" : `p${target.pane_index}`;
+  return `${windowLabel}/${paneLabel}`;
+}
+
+function terminalTargetLabel(target: TerminalTargetView, index: number) {
+  const pane = target.pane_index === undefined ? index : target.pane_index;
+  const id = target.pane_id ? ` · ${target.pane_id}` : "";
+  return `Pane ${pane}${id}`;
+}
+
+function terminalTargetDetail(target: TerminalTargetView) {
+  const size = target.width && target.height ? `${target.width}x${target.height}` : "";
+  return [target.command || "shell", target.cwd, size].filter(Boolean).join(" · ");
+}
+
+function terminalPaneAttachedLabel(pane: PaneNode, session: SessionView | null) {
+  if (!pane.sessionId) return "";
+  const base = session?.name || pane.sessionId;
+  if (!pane.target?.pane_id) return base;
+  return `${base} ${terminalTargetShortLabel(pane.target)}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
 function workerDisplayLabel(worker: WorkerView) {
   return worker.name && worker.name !== worker.id ? `${worker.name} (${worker.id})` : worker.id;
+}
+
+function shortID(value: string) {
+  const trimmed = value.trim();
+  if (trimmed.length <= 14) return trimmed;
+  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
 }
 
 function workerIsOnline(worker: WorkerView) {
@@ -3533,6 +5541,7 @@ function filterWorkers(workers: WorkerView[], query: string) {
     const software = worker.software || {};
     const haystacks = [
       worker.id,
+      worker.worker_instance_id,
       worker.name,
       worker.addr,
       worker.backend,
@@ -3613,6 +5622,226 @@ function filterSessions(sessions: SessionView[], workers: WorkerView[], workerFi
 
 function sessionBackendLabel(session?: SessionView | null, worker?: WorkerView | null) {
   return session?.backend || worker?.backend || "unknown";
+}
+
+function formatTerminalSize(size?: TerminalSize | null) {
+  if (!size?.cols || !size?.rows) return "unknown";
+  return `${size.cols}x${size.rows}`;
+}
+
+function terminalViewportHint(remote?: TerminalSize | null, viewport?: TerminalSize | null) {
+  if (!remote?.cols || !remote?.rows || !viewport?.cols || !viewport?.rows) return "";
+  if (viewport.cols < remote.cols || viewport.rows < remote.rows) return "cropped";
+  if (viewport.cols > remote.cols || viewport.rows > remote.rows) return "padded";
+  return "";
+}
+
+function terminalModeDetail(mode: TerminalModePayload) {
+  const parts = [`terminal mode ${mode.mode}`];
+  if (mode.render_mode) parts.push(mode.render_mode);
+  if (mode.remote_size?.cols && mode.remote_size?.rows) parts.push(`remote ${formatTerminalSize(mode.remote_size)}`);
+  if (mode.default_size?.cols && mode.default_size?.rows) parts.push(`default ${formatTerminalSize(mode.default_size)}`);
+  if (mode.resize_policy) parts.push(mode.resize_policy);
+  if (mode.fallback) parts.push(`fallback ${mode.fallback}`);
+  return parts.join(" · ");
+}
+
+function applyTerminalDiff(current: TerminalCellSnapshot | null, diff: TerminalDiffPayload) {
+  if (!current || !diff.ops?.length) return current;
+  if (current.generation && diff.generation && current.generation !== diff.generation) return current;
+  const lines = (current.lines || []).map((line) => line.slice());
+  let cursor = current.cursor ? { ...current.cursor } : undefined;
+  for (const op of diff.ops) {
+    if (op.op === "replace_row" && typeof op.row === "number" && op.row >= 0 && op.row < lines.length && Array.isArray(op.cells)) {
+      lines[op.row] = op.cells.slice();
+    }
+    if (op.op === "cursor" && op.cursor) {
+      cursor = { ...op.cursor };
+    }
+  }
+  return { ...current, generation: diff.generation || current.generation, cursor, lines };
+}
+
+function terminalStatePanMaxX(snapshot?: TerminalCellSnapshot | null, viewport?: TerminalSize | null) {
+  const remoteCols = snapshot?.cols || snapshot?.lines?.[0]?.length || 0;
+  const viewportCols = viewport?.cols || remoteCols;
+  return Math.max(0, remoteCols - viewportCols);
+}
+
+function terminalStatePanMaxY(snapshot?: TerminalCellSnapshot | null, viewport?: TerminalSize | null) {
+  const remoteRows = snapshot?.rows || snapshot?.lines?.length || 0;
+  const viewportRows = viewport?.rows || remoteRows;
+  return Math.max(0, remoteRows - viewportRows);
+}
+
+function cellViewportStartRow(snapshot: TerminalCellSnapshot, viewport?: TerminalSize | null, panY = 0) {
+  const remoteRows = snapshot.lines?.length || snapshot.rows || 0;
+  const viewportRows = Math.max(1, Math.min(viewport?.rows || snapshot.rows || 24, snapshot.rows || viewport?.rows || 24));
+  const verticalPan = clampNumber(panY, 0, terminalStatePanMaxY(snapshot, viewport));
+  return Math.max(0, remoteRows - viewportRows - verticalPan);
+}
+
+function renderCellViewport(snapshot: TerminalCellSnapshot, viewport?: TerminalSize | null, panX = 0, panY = 0) {
+  const remoteLines = snapshot.lines || [];
+  const viewportCols = Math.max(1, Math.min(viewport?.cols || snapshot.cols || 80, snapshot.cols || viewport?.cols || 80));
+  const viewportRows = Math.max(1, Math.min(viewport?.rows || snapshot.rows || 24, snapshot.rows || viewport?.rows || 24));
+  const startCol = clampNumber(panX, 0, terminalStatePanMaxX(snapshot, viewport));
+  const remoteRows = remoteLines.length;
+  const startRow = cellViewportStartRow(snapshot, viewport, panY);
+  const padTop = Math.max(0, viewportRows - remoteRows);
+  const visibleLines = remoteLines.slice(startRow, startRow + viewportRows);
+  const rendered: React.ReactNode[] = [];
+  for (let i = 0; i < padTop; i++) {
+    rendered.push(<div key={`pad:${i}`} className="whitespace-pre">{nbspLine(viewportCols)}</div>);
+  }
+  for (let index = 0; index < visibleLines.length; index++) {
+    const remoteRow = startRow + index;
+    rendered.push(
+      <div key={remoteRow} className="whitespace-pre">
+        {renderCellLine(visibleLines[index], remoteRow, viewportCols, startCol, snapshot.cursor)}
+      </div>,
+    );
+  }
+  return rendered;
+}
+
+function renderCellLine(line: TerminalCell[], row: number, cols: number, startCol: number, cursor?: TerminalCursor) {
+  const cells = line.slice(startCol, startCol + cols);
+  const rendered = cells.map((cell, col) => {
+    const remoteCol = startCol + col;
+    const text = cell.conceal ? " " : cell.t || " ";
+    const isCursor = cursor?.visible && cursor.x === remoteCol && cursor.y === row;
+    const style = terminalCellStyle(cell);
+    return (
+      <span
+        key={remoteCol}
+        className={cn(
+          "agentmux-cell",
+          cell.bold && "font-bold",
+          cell.italic && "italic",
+          cell.underline && "agentmux-cell-underline",
+          cell.underline === "double" && "agentmux-cell-underline-double",
+          cell.underline === "curly" && "agentmux-cell-underline-curly",
+          cell.underline === "dotted" && "agentmux-cell-underline-dotted",
+          cell.underline === "dashed" && "agentmux-cell-underline-dashed",
+          cell.strike && "line-through",
+          cell.faint && "opacity-70",
+          cell.blink && "animate-pulse",
+          cell.link && "agentmux-cell-link",
+          isCursor && "agentmux-cell-cursor",
+        )}
+        style={style}
+        title={cell.link || undefined}
+      >
+        {text}
+      </span>
+    );
+  });
+  for (let col = cells.length; col < cols; col++) {
+    const remoteCol = startCol + col;
+    const isCursor = cursor?.visible && cursor.x === remoteCol && cursor.y === row;
+    rendered.push(
+      <span key={`pad:${remoteCol}`} className={cn("agentmux-cell", isCursor && "agentmux-cell-cursor")}>
+        {" "}
+      </span>,
+    );
+  }
+  return rendered;
+}
+
+const xtermAnsiPalette = buildXtermAnsiPalette();
+
+function terminalCellStyle(cell: TerminalCell): React.CSSProperties | undefined {
+  const fg = resolveTerminalColor(cell.fg);
+  const bg = resolveTerminalColor(cell.bg);
+  const underline = resolveTerminalColor(cell.ul);
+  const style: React.CSSProperties = {};
+  if (cell.reverse) {
+    style.color = bg || xtermTheme.background;
+    style.backgroundColor = fg || xtermTheme.foreground;
+  } else {
+    if (fg) style.color = fg;
+    if (bg) style.backgroundColor = bg;
+  }
+  if (underline) style.textDecorationColor = underline;
+  return Object.keys(style).length ? style : undefined;
+}
+
+function resolveTerminalColor(value?: string) {
+  if (!value) return "";
+  if (value.startsWith("ansi:")) {
+    const index = Number.parseInt(value.slice("ansi:".length), 10);
+    return Number.isInteger(index) ? xtermAnsiPalette[index] || "" : "";
+  }
+  return /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : "";
+}
+
+function buildXtermAnsiPalette() {
+  const colors = [
+    "#2e3436",
+    "#cc0000",
+    "#4e9a06",
+    "#c4a000",
+    "#3465a4",
+    "#75507b",
+    "#06989a",
+    "#d3d7cf",
+    "#555753",
+    "#ef2929",
+    "#8ae234",
+    "#fce94f",
+    "#729fcf",
+    "#ad7fa8",
+    "#34e2e2",
+    "#eeeeec",
+  ];
+  const cube = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+  for (let red = 0; red < 6; red++) {
+    for (let green = 0; green < 6; green++) {
+      for (let blue = 0; blue < 6; blue++) {
+        colors.push(rgbHex(cube[red], cube[green], cube[blue]));
+      }
+    }
+  }
+  for (let index = 0; index < 24; index++) {
+    const value = 8 + index * 10;
+    colors.push(rgbHex(value, value, value));
+  }
+  return colors;
+}
+
+function rgbHex(red: number, green: number, blue: number) {
+  return `#${hexByte(red)}${hexByte(green)}${hexByte(blue)}`;
+}
+
+function hexByte(value: number) {
+  return Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0");
+}
+
+function nbspLine(width: number) {
+  return "\u00a0".repeat(Math.max(1, width));
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function pointerButtonName(button: number) {
+  switch (button) {
+    case 0:
+      return "left";
+    case 1:
+      return "middle";
+    case 2:
+      return "right";
+    case 3:
+      return "backward";
+    case 4:
+      return "forward";
+    default:
+      return "";
+  }
 }
 
 function displayControlSequence(value: string) {

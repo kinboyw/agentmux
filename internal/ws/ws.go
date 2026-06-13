@@ -28,6 +28,15 @@ const (
 
 var ErrClosed = errors.New("websocket closed")
 
+type HandshakeError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e HandshakeError) Error() string {
+	return "websocket upgrade failed: " + e.Status
+}
+
 type Conn struct {
 	conn        net.Conn
 	br          *bufio.Reader
@@ -125,7 +134,7 @@ func Dial(ctx context.Context, rawURL string, token string) (*Conn, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		conn.Close()
-		return nil, fmt.Errorf("websocket upgrade failed: %s", resp.Status)
+		return nil, HandshakeError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	return &Conn{conn: conn, br: br, writeMask: true}, nil
 }

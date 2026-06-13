@@ -30,6 +30,58 @@ func TestAuthStoreSignalExchange(t *testing.T) {
 	}
 }
 
+func TestAuthStoreWorkerRefreshRotatesToken(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		testAuthStoreWorkerRefreshRotatesToken(t, newAuthStore())
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		store, err := OpenSQLiteAuthStore(t.TempDir() + "/agentmux.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		testAuthStoreWorkerRefreshRotatesToken(t, store)
+	})
+}
+
+func testAuthStoreWorkerRefreshRotatesToken(t *testing.T, store AuthStore) {
+	t.Helper()
+	minted, err := store.MintSignal(time.Minute, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined, err := store.Exchange(exchangeRequest{Signal: minted.Signal, Role: "worker", DeviceID: "worker-1", DeviceName: "Worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined.RefreshToken == "" || joined.RefreshExpiresAt.IsZero() {
+		t.Fatalf("expected worker refresh token: %+v", joined)
+	}
+	refreshed, err := store.Refresh(refreshRequest{RefreshToken: joined.RefreshToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Role != "worker" || refreshed.Credential == "" || refreshed.Credential == joined.Credential {
+		t.Fatalf("expected rotated worker access token: %+v", refreshed)
+	}
+	if refreshed.RefreshToken == "" || refreshed.RefreshToken == joined.RefreshToken {
+		t.Fatalf("expected rotated worker refresh token: %+v", refreshed)
+	}
+	if refreshed.DeviceID != joined.DeviceID || refreshed.TenantID != joined.TenantID {
+		t.Fatalf("worker identity changed on refresh: joined=%+v refreshed=%+v", joined, refreshed)
+	}
+	if _, ok := store.Credential(refreshed.Credential); !ok {
+		t.Fatal("expected refreshed worker credential to authorize")
+	}
+	if _, err := store.Refresh(refreshRequest{RefreshToken: joined.RefreshToken}); err == nil {
+		t.Fatal("old worker refresh token should be single-use")
+	}
+}
+
 func TestAuthStoreRejectsRepeatedSignalUseByInstance(t *testing.T) {
 	t.Run("memory", func(t *testing.T) {
 		testAuthStoreRejectsRepeatedSignalUseByInstance(t, newAuthStore())

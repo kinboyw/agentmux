@@ -52,11 +52,12 @@ Control mode:
 curl -fsSL https://hub.example.com/install.sh | sh -s -- control
 ```
 
-The script uses an existing `agentmux` in `PATH`, builds from source when run
+The script uses an existing role binary in `PATH`, builds from source when run
 inside a checkout, or downloads a matching role-specific Linux/macOS release
-archive from GitHub. Worker and Control install commands prefer
-`agentmux-worker-*` and `agentmux-control-*` assets, with fallback to legacy
-`agentmux-*` assets. Hub-only Windows artifacts are published separately as
+archive from GitHub. Worker install commands prefer `agentmux-worker-*`.
+Control installs a real `agentmux-tui` binary and prefers `agentmux-tui-*`,
+with fallback to older `agentmux-control-*` and legacy `agentmux-*` assets.
+Hub-only Windows artifacts are published separately as
 `agentmux-hub-windows-amd64.tar.gz`.
 
 ### `GET /run.sh`
@@ -70,8 +71,8 @@ curl -fsSL https://hub.example.com/run.sh | sh -s -- control@latest
 curl -fsSL https://hub.example.com/run.sh | sh -s -- hub@v0.1.0 --addr 127.0.0.1:8081
 ```
 
-Control defaults to `control app --hub <current-hub>`. Worker defaults to
-`worker --hub <current-hub-ws>`.
+Control executes the cached `agentmux-tui` binary with `--hub <current-hub>`.
+Worker defaults to `worker --hub <current-hub-ws>`.
 
 ### `GET /health`
 
@@ -186,14 +187,17 @@ Response:
 
 ### `GET /api/workers`
 
-Returns connected workers.
-Direct Token credentials receive `403`.
+Returns registered workers visible to the credential tenant. Online workers are
+backed by a live WebSocket connection; offline workers remain visible from Hub
+persistence after disconnects and Hub restarts. Direct Token credentials may
+read worker status and backend metadata, but cannot manage workers.
 
 ```json
 {
   "workers": [
     {
       "id":"local",
+      "worker_instance_id":"wins_...",
       "name":"local",
       "addr":"127.0.0.1",
       "backend":"tmux",
@@ -208,11 +212,20 @@ Direct Token credentials receive `403`.
         "update_policy":"manual"
       },
       "last_seen":"2026-06-08T12:00:00Z",
+      "status":"online",
       "online":true
     }
   ]
 }
 ```
+
+Identity model:
+
+- `id` / `worker_id` is the routable Worker ID used in session IDs such as
+  `local/demo`. It is user-facing and may later support rename/migration flows.
+- `worker_instance_id` is generated once on the Worker installation and is
+  stable across Worker renames. Hub stores it for auditing, update tracking, and
+  future rename-safe identity. Older Workers may omit it.
 
 ### `PATCH /api/workers/{worker}`
 
@@ -247,7 +260,9 @@ Response:
 
 ### `GET /api/workers/{worker}/updates`
 
-Returns in-memory update jobs for a worker.
+Returns durable update jobs for a worker. SQLite-backed Hubs persist jobs and
+events across restarts; in-memory development Hubs keep the same API surface but
+do not survive process restarts.
 
 Response:
 
@@ -257,12 +272,24 @@ Response:
     {
       "id": "upd_...",
       "worker_id": "mywsl",
+      "worker_instance_id": "wins_...",
       "target_version": "latest",
       "repo": "kinboyw/agentmux",
       "status": "sent",
       "message": "waiting for worker",
       "created_at": "2026-06-10T12:00:00Z",
-      "updated_at": "2026-06-10T12:00:01Z"
+      "updated_at": "2026-06-10T12:00:01Z",
+      "events": [
+        {
+          "id": "evt_...",
+          "job_id": "upd_...",
+          "worker_id": "mywsl",
+          "worker_instance_id": "wins_...",
+          "status": "queued",
+          "message": "update queued",
+          "created_at": "2026-06-10T12:00:00Z"
+        }
+      ]
     }
   ]
 }
@@ -300,7 +327,8 @@ Response:
 Possible errors:
 
 - `404`: worker is unknown.
-- `403`: worker belongs to another tenant or the token is a direct shared token.
+- `403`: worker belongs to another tenant, the worker is disabled, or the token
+  is not allowed to create sessions in that tenant.
 - `409`: worker is offline, disabled, missing `worker.update.apply`, or uses
   `pty` without disruptive restart confirmation.
 

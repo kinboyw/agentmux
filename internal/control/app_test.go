@@ -2,7 +2,11 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -455,16 +459,123 @@ func TestRenderMobileTargetsShowsPaneHierarchy(t *testing.T) {
 	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
 	app.mobileView = appMobileTargets
 	app.targetFor = "local/demo"
-	app.targetSel = 1
 	app.targets["local/demo"] = []protocol.TerminalTarget{
 		{SessionName: "demo", WindowIndex: 0, WindowName: "main", PaneID: "%1", PaneIndex: 0, PaneActive: true, Command: "codex", Width: 40, Height: 20},
 		{SessionName: "demo", WindowIndex: 1, WindowName: "logs", PaneID: "%3", PaneIndex: 0, Command: "tail", Width: 80, Height: 10},
 	}
+	app.targetOpen[mobileTargetSessionKey("local/demo")] = true
+	app.targetOpen[mobileTargetWindowNodeKey("local/demo", mobileTargetWindowKey(app.targets["local/demo"][0]))] = true
+	app.targetOpen[mobileTargetWindowNodeKey("local/demo", mobileTargetWindowKey(app.targets["local/demo"][1]))] = true
+	app.targetCaps[mobileTargetPreviewKey("local/demo", app.targets["local/demo"][0])] = "codex preview"
+	app.targetCaps[mobileTargetPreviewKey("local/demo", app.targets["local/demo"][1])] = "tail preview\nnext"
+	app.targetSel = 2
 	app.renderWithSize(44, 10)
 	output := stripControl(app.Out.(*bytes.Buffer).String())
-	if !strings.Contains(output, "AgentMux / panes") || !strings.Contains(output, "main") || !strings.Contains(output, "%1") || !strings.Contains(output, "logs") || !strings.Contains(output, "%3") {
+	if !strings.Contains(output, "AgentMux / targets") || !strings.Contains(output, "main") || !strings.Contains(output, "%1") || !strings.Contains(output, "codex preview") || !strings.Contains(output, "logs") || !strings.Contains(output, "%3") || !strings.Contains(output, "tail preview") {
 		t.Fatalf("mobile target render missing pane hierarchy:\n%s", output)
 	}
+}
+
+func TestMobileTargetsTreeNavigationOpensWindowAndSelectsPane(t *testing.T) {
+	app := NewApp(Client{HubURL: "http://hub", Token: "token"}, AppAuthResult{}, nil, &bytes.Buffer{})
+	app.mobileView = appMobileTargets
+	app.targetFor = "local/demo"
+	app.targets["local/demo"] = []protocol.TerminalTarget{
+		{SessionName: "demo", WindowIndex: 0, WindowName: "main", PaneID: "%1", PaneIndex: 0, PaneActive: true, Command: "codex"},
+		{SessionName: "demo", WindowIndex: 0, WindowName: "main", PaneID: "%2", PaneIndex: 1, Command: "bash"},
+		{SessionName: "demo", WindowIndex: 1, WindowName: "logs", PaneID: "%3", PaneIndex: 0, Command: "tail"},
+	}
+	for _, target := range app.targets["local/demo"] {
+		app.targetCaps[mobileTargetPreviewKey("local/demo", target)] = "cached"
+	}
+	app.targetOpen[mobileTargetSessionKey("local/demo")] = true
+	nodes := app.mobileTargetNodes()
+	if len(nodes) != 3 {
+		t.Fatalf("expected session plus two collapsed windows, got %d: %+v", len(nodes), nodes)
+	}
+	app.targetSel = 1
+	app.openSelectedMobileTargetNode(context.Background())
+	nodes = app.mobileTargetNodes()
+	if len(nodes) != 5 || nodes[2].kind != appMobileTargetPane || nodes[2].target.PaneID != "%1" {
+		t.Fatalf("expected first window panes after open, got %+v", nodes)
+	}
+	app.targetSel = 3
+	app.streams["local/demo#%2"] = &appSessionStream{sessionID: "local/demo#%2", baseSessionID: "local/demo", view: terminalview.New(40, 10), size: protocol.TerminalSize{Cols: 40, Rows: 10}}
+	if err := app.activateMobileTargetNode(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if app.active != "local/demo#%2" {
+		t.Fatalf("expected selected pane to attach, got %q", app.active)
+	}
+}
+
+func TestOpenMobileTargetsUsesCanonicalSessionID(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"targets":[{"session_name":"0","window_index":0,"window_name":"main","pane_id":"%1","pane_index":0}]}`)
+	}))
+	defer server.Close()
+	app := NewApp(New(server.URL, "token"), AppAuthResult{}, nil, &bytes.Buffer{})
+	app.sessions = []protocol.SessionView{{ID: "mywsl-f50d", WorkerID: "mywsl", Name: "0", Status: "active"}}
+	if err := app.openMobileTargets(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/api/sessions/mywsl/0/targets" {
+		t.Fatalf("unexpected targets path %q", gotPath)
+	}
+	if app.targetFor != "mywsl/0" {
+		t.Fatalf("expected canonical targetFor, got %q", app.targetFor)
+	}
+}
+
+func TestSessionTargetPreviewSendsPaneQuery(t *testing.T) {
+	var gotPath, gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":"pane preview","scope":"pane"}`)
+	}))
+	defer server.Close()
+	client := New(server.URL, "token")
+	target := protocol.TerminalTarget{
+		SessionName:  "demo",
+		WindowID:     "@1",
+		WindowIndex:  2,
+		WindowName:   "main",
+		WindowActive: true,
+		PaneID:       "%3",
+		PaneIndex:    4,
+		PaneActive:   true,
+		Command:      "bash",
+		Width:        80,
+		Height:       24,
+	}
+	data, err := client.SessionTargetPreview(context.Background(), "local/demo", 8, &target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data != "pane preview" {
+		t.Fatalf("unexpected preview data %q", data)
+	}
+	if gotPath != "/api/sessions/local/demo/preview" {
+		t.Fatalf("unexpected preview path %q", gotPath)
+	}
+	values := mustParseQuery(t, gotQuery)
+	if values.Get("lines") != "8" || values.Get("pane_id") != "%3" || values.Get("window_id") != "@1" || values.Get("window_active") != "true" || values.Get("pane_active") != "true" {
+		t.Fatalf("target query not encoded correctly: %s", gotQuery)
+	}
+}
+
+func mustParseQuery(t *testing.T, raw string) url.Values {
+	t.Helper()
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return values
 }
 
 func TestRenderAttachedUsesSplitPaneByDefault(t *testing.T) {

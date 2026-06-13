@@ -85,4 +85,31 @@ Expected benefits:
 This is more complex than byte streaming because terminal output is a stateful
 protocol, not plain text.
 
+## Phase 6: Direct-First Transport
+
+Make Control-Worker P2P the preferred terminal data path, with Hub relay as the
+automatic fallback.
+
+- Worker advertises direct-mode capabilities over the existing Hub control
+  channel.
+- Control requests an attach grant from Hub before opening a terminal stream.
+- Hub issues short-lived grants and exchanges direct-mode signaling messages.
+- Control attempts direct transport first and falls back to relay on timeout,
+  unsupported capability, policy denial, or negotiation failure.
+- Web Control shows per-pane transport state outside the terminal buffer:
+  negotiating, direct, fallback, relay, interrupted, and closed.
+- Control exposes direct negotiation diagnostics: stream ID, grant ID, ICE
+  state, selected candidate pair, fallback reason, and last interrupt reason.
+- Hub, Worker, and Control emit structured logs keyed by `stream_id` and
+  `grant_id` for every attach attempt.
+
+Candidate implementation order:
+
+1. Add direct-mode capability flags and attach-grant protocol types.
+2. Add Hub signaling messages for offer, answer, candidates, and interrupts.
+3. Add Control state machine and UI badges while still using relay.
+4. Add WebRTC DataChannel direct transport for Web Control and Go Worker.
+5. Add automatic relay fallback and direct negotiation timeout.
+6. Add detailed correlation logs and tests for fallback and revocation.
+
 ![AgentMux relay versus direct mode](assets/visuals/agentmux-7-relay-vs-direct-mode-v1.png)

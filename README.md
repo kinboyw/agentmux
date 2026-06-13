@@ -22,6 +22,16 @@ controls that terminal layer.
 
 ## Quick Start
 
+AgentMux clients default to the public Hub at `https://agentmux.kinboy.wang`
+when no Hub is configured locally:
+
+```bash
+agentmux-tui
+agentmux worker join --join 'amx_sig_...' --name "$(hostname)"
+```
+
+Use `--hub` or `AGENTMUX_HUB`/`AGENTMUX_CONTROL_HUB` to target a private Hub.
+
 If you are already viewing an AgentMux Hub landing page, use that Hub directly:
 
 1. Click `Generate join signal`.
@@ -65,7 +75,7 @@ Installed binaries expose build metadata and a conservative updater:
 agentmux version
 agentmux update check --role control
 agentmux update apply --role control
-agentmux run control@latest --hub https://hub.example.com
+agentmux run control@latest
 ```
 
 `update apply` verifies the release checksum, stages the new binary, and keeps a

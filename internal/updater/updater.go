@@ -161,23 +161,31 @@ func ResolveRelease(ctx context.Context, options Options) (Release, error) {
 	if tag == "" {
 		tag = options.Version
 	}
-	assetBase := fmt.Sprintf("agentmux-%s-%s-%s", options.Role, options.OS, options.Arch)
-	assetName := assetBase + ".tar.gz"
-	entryName := assetBase
+	assetBases := []string{fmt.Sprintf("agentmux-%s-%s-%s", options.Role, options.OS, options.Arch)}
+	if options.Role == "control" {
+		assetBases = []string{
+			fmt.Sprintf("agentmux-tui-%s-%s", options.OS, options.Arch),
+			fmt.Sprintf("agentmux-control-%s-%s", options.OS, options.Arch),
+		}
+	}
 	if options.Role != "hub" {
-		legacyBase := fmt.Sprintf("agentmux-%s-%s", options.OS, options.Arch)
-		if findAsset(release.Assets, assetName) == "" && findAsset(release.Assets, legacyBase+".tar.gz") != "" {
-			assetBase = legacyBase
-			assetName = legacyBase + ".tar.gz"
-			entryName = legacyBase
+		assetBases = append(assetBases, fmt.Sprintf("agentmux-%s-%s", options.OS, options.Arch))
+	}
+	var assetName, entryName, assetURL string
+	for _, candidate := range assetBases {
+		candidateName := candidate + ".tar.gz"
+		if url := findAsset(release.Assets, candidateName); url != "" {
+			assetName = candidateName
+			entryName = candidate
+			assetURL = url
+			break
 		}
 	}
 	if options.OS == "windows" && options.Role == "hub" {
 		entryName += ".exe"
 	}
-	assetURL := findAsset(release.Assets, assetName)
 	if assetURL == "" {
-		return Release{}, fmt.Errorf("release %s has no asset %s", tag, assetName)
+		return Release{}, fmt.Errorf("release %s has no asset %s", tag, assetBases[0]+".tar.gz")
 	}
 	checksumName := assetName + ".sha256"
 	return Release{
@@ -537,6 +545,12 @@ func runtimeBinaryName(role string) string {
 			return "agentmux-hub.exe"
 		}
 		return "agentmux-hub"
+	}
+	if role == "control" {
+		if runtime.GOOS == "windows" {
+			return "agentmux-tui.exe"
+		}
+		return "agentmux-tui"
 	}
 	if runtime.GOOS == "windows" {
 		return "agentmux.exe"

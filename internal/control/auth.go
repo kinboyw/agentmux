@@ -126,7 +126,7 @@ func ResolveAppAuth(ctx context.Context, opts AppAuthOptions) (AppAuthResult, er
 		return DeviceLogin(ctx, hubURL, opts.DeviceID, deviceName, nil)
 	}
 	if !ok {
-		return AppAuthResult{}, errors.New("no cached control credential; run agentmux control login --hub <url> or pass --hub")
+		return AppAuthResult{}, errors.New("no cached control credential; run agentmux-tui and use /login, or pass --hub for a private Hub")
 	}
 	client := New(entry.HubURL, entry.Credential).WithCacheEntry(entry)
 	return AppAuthResult{

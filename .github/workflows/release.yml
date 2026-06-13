@@ -56,6 +56,26 @@ jobs:
             asset: agentmux-control
             goos: darwin
             goarch: arm64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-tui
+            goos: linux
+            goarch: amd64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-tui
+            goos: linux
+            goarch: arm64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-tui
+            goos: darwin
+            goarch: amd64
+          - role: control
+            cmd: ./cmd/agentmux
+            asset: agentmux-tui
+            goos: darwin
+            goarch: arm64
           - role: hub
             cmd: ./cmd/agentmux-hub
             asset: agentmux-hub

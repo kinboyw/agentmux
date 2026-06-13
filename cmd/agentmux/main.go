@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -71,7 +72,11 @@ func main() {
 }
 
 func isTUIInvocation() bool {
-	return filepathBase(os.Args[0]) == "agentmux-tui"
+	base := filepathBase(os.Args[0])
+	return base == "agentmux-tui" ||
+		strings.HasPrefix(base, "agentmux-tui-") ||
+		base == "agentmux-control" ||
+		strings.HasPrefix(base, "agentmux-control-")
 }
 
 func runDefault(ctx context.Context) {
@@ -82,7 +87,12 @@ func runDefault(ctx context.Context) {
 	}
 	switch entry.Role {
 	case "worker":
-		runWorkerWithAuth(ctx, entry.HubURL, entry.Credential, entry.DeviceID, entry.DeviceName, time.Second, "cache", "")
+		runWorkerWithAuth(ctx, worker.AuthResult{
+			HubURL: entry.HubURL, Token: entry.Credential, CredentialID: entry.CredentialID,
+			TenantID: entry.TenantID, DeviceID: entry.DeviceID, DeviceName: entry.DeviceName,
+			Role: entry.Role, ExpiresAt: entry.ExpiresAt, RefreshToken: entry.RefreshToken,
+			RefreshExpiresAt: entry.RefreshExpiresAt, Source: "cache",
+		}, entry.DeviceID, entry.DeviceName, time.Second, "")
 	case "control":
 		defer term.ResetModes(os.Stdout)
 		client := control.New(entry.HubURL, entry.Credential).WithCacheEntry(entry)
@@ -111,9 +121,11 @@ func runTUI(ctx context.Context, args []string) {
 		deviceID := fs.String("device-id", "", "stable control device id")
 		deviceName := fs.String("device-name", hostname(), "control device display name")
 		_ = fs.Parse(args[1:])
+		common.hubProvided = flagProvided(args[1:], "--hub")
 		if common.hub == "" {
 			common.hub = defaultControlHubURL()
 		}
+		rememberControlHub(*common)
 		if common.join == "" {
 			fatal(fmt.Errorf("--join is required"))
 		}
@@ -130,9 +142,11 @@ func runTUI(ctx context.Context, args []string) {
 	var app *control.App
 	if err != nil {
 		app = control.NewUnauthApp(os.Stdin, os.Stdout, err)
-		if hubURL := controlHubArg(args); hubURL != "" {
-			app.Client = control.New(hubURL, "")
+		hubURL := controlHubArg(args)
+		if hubURL == "" {
+			hubURL = defaultControlHubURL()
 		}
+		app.Client = control.New(hubURL, "")
 	} else {
 		app = control.NewApp(auth.Client, auth, os.Stdin, os.Stdout)
 	}
@@ -395,11 +409,7 @@ func runWorkerForeground(ctx context.Context, args []string) {
 		}
 	}
 	if *hubURL == "" && (*token != "" || *join != "") {
-		*hubURL = "ws://127.0.0.1:8080"
-	}
-	workerID := *id
-	if workerID == "" && (*token != "" || *join != "") {
-		workerID = *name
+		*hubURL = defaultControlHubURL()
 	}
 	instanceID := ""
 	if *join != "" {
@@ -409,6 +419,12 @@ func runWorkerForeground(ctx context.Context, args []string) {
 			fatal(err)
 		}
 	}
+	workerID := strings.TrimSpace(*id)
+	if workerID == "" && *join != "" {
+		workerID = defaultWorkerID(*name, instanceID)
+	} else if workerID == "" && *token != "" {
+		workerID = *name
+	}
 	auth, err := resolveWorkerAuthBestEffort(ctx, worker.AuthOptions{
 		HubURL: *hubURL, Token: *token, Join: *join,
 		DeviceID: workerID, DeviceName: *name, InstanceID: instanceID,
@@ -416,7 +432,7 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	runWorkerWithAuth(ctx, auth.HubURL, auth.Token, workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name), *interval, auth.Source, *backend)
+	runWorkerWithAuth(ctx, auth, workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name), *interval, *backend)
 }
 
 func runWorkerJoin(ctx context.Context, args []string) {
@@ -429,18 +445,18 @@ func runWorkerJoin(ctx context.Context, args []string) {
 	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
 	_ = fs.Parse(args)
 	if *hubURL == "" {
-		*hubURL = "ws://127.0.0.1:8080"
+		*hubURL = defaultControlHubURL()
 	}
 	if *join == "" {
 		fatal(fmt.Errorf("--join is required"))
 	}
-	workerID := *id
-	if workerID == "" {
-		workerID = *name
-	}
 	instanceID, err := appconfig.EnsureWorkerInstanceID()
 	if err != nil {
 		fatal(err)
+	}
+	workerID := strings.TrimSpace(*id)
+	if workerID == "" {
+		workerID = defaultWorkerID(*name, instanceID)
 	}
 	auth, err := resolveWorkerAuthBestEffort(ctx, worker.AuthOptions{
 		HubURL: *hubURL, Join: *join, DeviceID: workerID, DeviceName: *name, InstanceID: instanceID,
@@ -602,9 +618,18 @@ func runWorkerLogs(ctx context.Context, args []string) {
 func runWorkerConfig(args []string) {
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
 	backend := fs.String("backend", "", "session backend: auto, tmux, or pty")
+	terminalMode := fs.String("terminal-mode", "", "terminal transport mode: auto, state, or attach")
+	stateSize := fs.String("state-size", "", "worker terminal state size, for example 120x36")
 	_ = fs.Parse(args)
 	if flagProvided(args, "--backend") {
 		saveWorkerBackendConfig(*backend)
+	}
+	if flagProvided(args, "--terminal-mode") || flagProvided(args, "--state-size") {
+		cols, rows, err := parseStateSize(*stateSize)
+		if err != nil {
+			fatal(err)
+		}
+		saveWorkerTerminalStateConfig(*terminalMode, cols, rows)
 	}
 	cfg, err := appconfig.Load()
 	if err != nil {
@@ -613,10 +638,12 @@ func runWorkerConfig(args []string) {
 	path, _ := appconfig.Path()
 	credentialsPath, _ := credentialcache.Path()
 	resolved, source := resolveWorkerBackendPreference("")
-	fmt.Fprintf(os.Stdout, "config=%s\ncredentials=%s\nworker_backend=%s\nworker_hub_url=%s\nworker_id=%s\nworker_name=%s\nresolved_backend=%s\nsource=%s\n", path, credentialsPath, cfg.WorkerBackend, cfg.WorkerHubURL, cfg.WorkerID, cfg.WorkerName, resolved, source)
+	mode := resolveWorkerTerminalMode(cfg.WorkerTerminalMode)
+	size := resolveWorkerStateSize(cfg.WorkerStateCols, cfg.WorkerStateRows)
+	fmt.Fprintf(os.Stdout, "config=%s\ncredentials=%s\nworker_backend=%s\nworker_terminal_mode=%s\nworker_state_size=%dx%d\nworker_hub_url=%s\nworker_instance_id=%s\nworker_id=%s\nworker_name=%s\nresolved_backend=%s\nsource=%s\n", path, credentialsPath, cfg.WorkerBackend, mode, size.Cols, size.Rows, cfg.WorkerHubURL, cfg.WorkerInstanceID, cfg.WorkerID, cfg.WorkerName, resolved, source)
 }
 
-func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string, interval time.Duration, source string, backendPreference string) {
+func runWorkerWithAuth(ctx context.Context, auth worker.AuthResult, workerID, name string, interval time.Duration, backendPreference string) {
 	lockFile, unlock, err := acquireWorkerLock(workerID)
 	if err != nil {
 		fatal(err)
@@ -626,18 +653,32 @@ func runWorkerWithAuth(ctx context.Context, hubURL, token, workerID, name string
 	if err != nil {
 		fatal(err)
 	}
-	switch source {
+	switch auth.Source {
 	case "join":
 		slog.Default().Info("worker signal exchanged", "device_id", workerID)
 	case "cache":
 		slog.Default().Info("worker credential loaded", "device_id", workerID)
 	}
 	slog.Default().Info("worker runtime lock acquired", "lock", lockFile)
-	w := worker.New(hubURL, token, workerID, name, backend, slog.Default())
+	w := worker.New(auth.HubURL, auth.Token, workerID, name, backend, slog.Default())
+	w.WithCredentialEntry(credentialcache.Entry{
+		HubURL: auth.HubURL, Credential: auth.Token, CredentialID: auth.CredentialID,
+		TenantID: auth.TenantID, Role: auth.Role, DeviceID: auth.DeviceID, DeviceName: auth.DeviceName,
+		ExpiresAt: auth.ExpiresAt, RefreshToken: auth.RefreshToken, RefreshExpiresAt: auth.RefreshExpiresAt,
+		UpdatedAt: time.Now().UTC(),
+	})
+	instanceID, err := appconfig.EnsureWorkerInstanceID()
+	if err != nil {
+		fatal(err)
+	}
+	w.InstanceID = instanceID
 	w.Version = buildversion.Version
 	w.Software.Version = buildversion.Version
 	w.Software.Commit = buildversion.Commit
 	w.Software.BuildTime = buildversion.BuildTime
+	cfg, _ := appconfig.Load()
+	w.TerminalMode = resolveWorkerTerminalMode(cfg.WorkerTerminalMode)
+	w.StateSize = resolveWorkerStateSize(cfg.WorkerStateCols, cfg.WorkerStateRows)
 	w.Interval = interval
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
@@ -706,6 +747,10 @@ func printWorkerStatusSummary(out *os.File) {
 	fmt.Fprintf(out, "  name=%s\n", cfg.WorkerName)
 	fmt.Fprintf(out, "  backend=%s\n", resolvedBackend)
 	fmt.Fprintf(out, "  backend_source=%s\n", backendSource)
+	terminalMode := resolveWorkerTerminalMode(cfg.WorkerTerminalMode)
+	stateSize := resolveWorkerStateSize(cfg.WorkerStateCols, cfg.WorkerStateRows)
+	fmt.Fprintf(out, "  terminal_mode=%s\n", terminalMode)
+	fmt.Fprintf(out, "  state_size=%dx%d\n", stateSize.Cols, stateSize.Rows)
 	fmt.Fprintf(out, "  credential=%s\n", credentialStatus)
 	fmt.Fprintf(out, "  log=%s\n", logPath)
 	fmt.Fprintf(out, "  pid_file=%s\n", pidPath)
@@ -780,6 +825,70 @@ func saveWorkerBackendConfig(value string) {
 	fmt.Fprintf(os.Stderr, "worker backend saved: %s (%s)\n", value, path)
 }
 
+func resolveWorkerTerminalMode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "state", "attach":
+		return value
+	default:
+		return "auto"
+	}
+}
+
+func resolveWorkerStateSize(cols, rows int) protocol.TerminalSize {
+	if cols <= 0 {
+		cols = 120
+	}
+	if rows <= 0 {
+		rows = 36
+	}
+	return protocol.TerminalSize{Cols: cols, Rows: rows}
+}
+
+func saveWorkerTerminalStateConfig(mode string, cols int, rows int) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "" {
+		switch mode {
+		case "auto", "state", "attach":
+		default:
+			fatal(fmt.Errorf("invalid worker terminal mode %q; expected auto, state, or attach", mode))
+		}
+	}
+	if cols < 0 || rows < 0 {
+		fatal(fmt.Errorf("state size must be positive"))
+	}
+	if err := appconfig.SaveWorkerTerminalState(mode, cols, rows); err != nil {
+		fatal(err)
+	}
+	path, _ := appconfig.Path()
+	size := resolveWorkerStateSize(cols, rows)
+	savedMode := mode
+	if savedMode == "" {
+		savedMode = "unchanged"
+	}
+	fmt.Fprintf(os.Stderr, "worker terminal state saved: mode=%s size=%dx%d (%s)\n", savedMode, size.Cols, size.Rows, path)
+}
+
+func parseStateSize(value string) (int, int, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return 0, 0, nil
+	}
+	left, right, ok := strings.Cut(value, "x")
+	if !ok {
+		return 0, 0, fmt.Errorf("invalid state size %q; expected COLSxROWS, for example 120x36", value)
+	}
+	cols, err := strconv.Atoi(strings.TrimSpace(left))
+	if err != nil || cols <= 0 {
+		return 0, 0, fmt.Errorf("invalid state size cols %q", left)
+	}
+	rows, err := strconv.Atoi(strings.TrimSpace(right))
+	if err != nil || rows <= 0 {
+		return 0, 0, fmt.Errorf("invalid state size rows %q", right)
+	}
+	return cols, rows, nil
+}
+
 func warnPtyFallback(tmuxErr error, source string) {
 	path, _ := appconfig.Path()
 	fmt.Fprintf(os.Stderr, "warning: tmux is unavailable, falling back to built-in PTY backend (%s preference).\n", source)
@@ -798,6 +907,54 @@ func workerIDFromAuth(auth worker.AuthResult, fallback string) string {
 		return auth.DeviceID
 	}
 	return fallback
+}
+
+func defaultWorkerID(name, instanceID string) string {
+	base := sanitizeWorkerIDComponent(name)
+	if base == "" {
+		base = "worker"
+	}
+	suffix := workerInstanceIDSuffix(instanceID)
+	if suffix == "" || strings.HasSuffix(base, "-"+suffix) {
+		return base
+	}
+	return base + "-" + suffix
+}
+
+func workerInstanceIDSuffix(instanceID string) string {
+	suffix := strings.TrimPrefix(strings.TrimSpace(instanceID), "wins_")
+	suffix = sanitizeWorkerIDComponent(suffix)
+	if len(suffix) > 8 {
+		return suffix[len(suffix)-8:]
+	}
+	return suffix
+}
+
+func sanitizeWorkerIDComponent(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	var out strings.Builder
+	separator := false
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+			out.WriteRune(r)
+			separator = false
+		case r == '-' || r == '_' || r == '.':
+			if out.Len() > 0 && !separator {
+				out.WriteRune(r)
+				separator = true
+			}
+		default:
+			if out.Len() > 0 && !separator {
+				out.WriteByte('-')
+				separator = true
+			}
+		}
+	}
+	return strings.Trim(out.String(), "-_.")
 }
 
 func workerNameFromAuth(auth worker.AuthResult, fallback string) string {
@@ -904,6 +1061,7 @@ func resolveControlAppAuth(ctx context.Context, args []string) (control.AppAuthR
 
 func resolveControlAppAuthWithLogin(ctx context.Context, args []string, login bool) (control.AppAuthResult, error) {
 	flags := parseControlAppFlags(args)
+	rememberControlHub(flags.common)
 	return control.ResolveAppAuth(ctx, control.AppAuthOptions{
 		HubURL: flags.common.hub, Token: flags.common.token, Join: flags.common.join,
 		DeviceID: flags.deviceID, DeviceName: flags.deviceName, Login: login,
@@ -924,6 +1082,8 @@ func parseControlAppFlags(args []string) parsedControlAppFlags {
 	deviceID := fs.String("device-id", "", "stable control device id")
 	deviceName := fs.String("device-name", hostname(), "control device display name")
 	_ = fs.Parse(args)
+	common.hubProvided = flagProvided(args, "--hub")
+	rememberControlHub(*common)
 	if common.hub == "" && (common.token != "" || common.join != "") {
 		common.hub = defaultControlHubURL()
 	}
@@ -940,7 +1100,11 @@ func runControlLogin(ctx context.Context, args []string) {
 	deviceID := fs.String("device-id", "", "stable control device id")
 	deviceName := fs.String("device-name", hostname(), "control device display name")
 	_ = fs.Parse(args)
+	if flagProvided(args, "--hub") {
+		rememberControlHub(commonControlFlags{hub: *hubURL, hubProvided: true})
+	}
 	auth, err := control.DeviceLogin(ctx, *hubURL, *deviceID, *deviceName, func(start control.DeviceStartResponse) {
+		control.OpenBrowserBestEffort(start.VerificationURLComplete)
 		fmt.Fprintln(os.Stderr, "Open this URL to sign in:")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, start.VerificationURLComplete)
@@ -955,9 +1119,10 @@ func runControlLogin(ctx context.Context, args []string) {
 }
 
 type commonControlFlags struct {
-	hub   string
-	token string
-	join  string
+	hub         string
+	hubProvided bool
+	token       string
+	join        string
 }
 
 type controlDebugFlags struct {
@@ -974,6 +1139,8 @@ func controlFlags(name string, args []string) commonControlFlags {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	common := addControlCommon(fs)
 	_ = fs.Parse(args)
+	common.hubProvided = flagProvided(args, "--hub")
+	rememberControlHub(*common)
 	return *common
 }
 
@@ -1051,6 +1218,7 @@ func newControlClient(ctx context.Context, flags commonControlFlags) control.Cli
 	if flags.hub == "" && (flags.token != "" || flags.join != "") {
 		flags.hub = defaultControlHubURL()
 	}
+	rememberControlHub(flags)
 	auth, err := control.ResolveAppAuth(ctx, control.AppAuthOptions{
 		HubURL: flags.hub, Token: flags.token, Join: flags.join,
 		DeviceName: hostname(),
@@ -1087,22 +1255,16 @@ func firstNonEmptyEnv(keys ...string) string {
 }
 
 func defaultControlHubURL() string {
-	if value := strings.TrimSpace(os.Getenv("AGENTMUX_CONTROL_HUB")); value != "" {
-		return value
+	return control.DefaultHubURL()
+}
+
+func rememberControlHub(flags commonControlFlags) {
+	if !flags.hubProvided || strings.TrimSpace(flags.hub) == "" {
+		return
 	}
-	if value := strings.TrimSpace(os.Getenv("AGENTMUX_HUB")); value != "" {
-		return value
+	if err := control.RememberHubURL(flags.hub); err != nil {
+		slog.Default().Warn("save control hub failed", "error", err)
 	}
-	if entry, ok := credentialcache.LoadLatest("control", ""); ok && strings.TrimSpace(entry.HubURL) != "" {
-		return entry.HubURL
-	}
-	if cfg, err := appconfig.Load(); err == nil && strings.TrimSpace(cfg.WorkerHubURL) != "" {
-		return cfg.WorkerHubURL
-	}
-	if entry, ok := credentialcache.LoadLatest("worker", ""); ok && strings.TrimSpace(entry.HubURL) != "" {
-		return entry.HubURL
-	}
-	return "http://127.0.0.1:8080"
 }
 
 func envBool(key string) bool {
@@ -1215,7 +1377,7 @@ func inferRuntimeRole() string {
 	switch {
 	case strings.Contains(base, "agentmux-hub"):
 		return "hub"
-	case strings.Contains(base, "agentmux-tui"):
+	case strings.Contains(base, "agentmux-tui"), strings.Contains(base, "agentmux-control"):
 		return "control"
 	default:
 		return "control"
@@ -1248,7 +1410,7 @@ func roleExecArgs(role string, args []string) []string {
 	out := make([]string, 0, len(args)+2)
 	switch role {
 	case "control":
-		out = append(out, "control", "app")
+		return args
 	case "worker":
 		out = append(out, "worker")
 	case "hub":

@@ -133,10 +133,11 @@ https://github.com/kinboyw/agentmux/releases
 ```
 
 The installer is role-aware: Worker uses `agentmux-worker-${os}-${arch}`,
-Control uses `agentmux-control-${os}-${arch}`, and Hub uses
-`agentmux-hub-${os}-${arch}`. Worker and Control keep a fallback to older
-`agentmux-${os}-${arch}` assets. Windows is currently supported for the
-hub-only artifact, for example `agentmux-hub-windows-amd64.tar.gz`.
+Control installs the real TUI binary from `agentmux-tui-${os}-${arch}`, and Hub
+uses `agentmux-hub-${os}-${arch}`. Control keeps a fallback to older
+`agentmux-control-${os}-${arch}` assets, and Worker/Control both keep a fallback
+to legacy `agentmux-${os}-${arch}` assets. Windows is currently supported for
+the hub-only artifact, for example `agentmux-hub-windows-amd64.tar.gz`.
 Downloaded release archives are verified against the matching
 `.tar.gz.sha256` asset before installation.
 
@@ -191,7 +192,7 @@ For temporary Control use without changing the installed binary, run from the
 verified cache:
 
 ```bash
-agentmux run control@latest --hub https://hub.example.com
+agentmux run control@latest
 ```
 
 If AgentMux is not installed locally yet, use the Hub-served cached runner:
@@ -214,10 +215,12 @@ SQLite persists:
 - scoped credentials
 - registered users
 - browser/TUI device auth sessions
+- registered Worker records and software inventory
+- Worker update jobs and update events
 
 Runtime state is rebuilt as workers reconnect:
 
-- connected workers
+- live Worker connections
 - active WebSocket streams
 - live session snapshots
 
