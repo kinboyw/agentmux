@@ -3633,7 +3633,6 @@ function TerminalPane({
   const resizePolicy = React.useRef("pending");
   const historyLoadingRef = React.useRef(false);
   const historyBeforeSeq = React.useRef<number | undefined>(undefined);
-  const historyAutoRequested = React.useRef(false);
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
@@ -3733,9 +3732,9 @@ function TerminalPane({
     if (resizePolicy.current !== "worker_state" && !manual) return;
     if (historyLoadingRef.current) return;
     historyLoadingRef.current = true;
-    setHistoryOpen(true);
     setHistoryLoading(true);
     setHistoryError("");
+    if (manual) setHistoryOpen(true);
     sendEnvelope(socket.current, "terminal.history.request", pane.sessionId, streamId.current, {
       before_seq: historyBeforeSeq.current,
       limit_lines: 300,
@@ -3874,7 +3873,6 @@ function TerminalPane({
     resizePolicy.current = "pending";
     viewportSizeRef.current = {};
     historyBeforeSeq.current = undefined;
-    historyAutoRequested.current = false;
     historyLoadingRef.current = false;
     setTerminalMode({});
     setViewportSize({});
@@ -3996,7 +3994,6 @@ function TerminalPane({
         setHistoryLoading(false);
         historyLoadingRef.current = false;
         setHistoryError("");
-        if (nextLines.length > 0) setHistoryOpen(true);
       }
       if (env.type === "error") {
         if (historyLoadingRef.current) {
@@ -4062,12 +4059,6 @@ function TerminalPane({
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
       return false;
     });
-    const scrollDisposable = term.onScroll((position) => {
-      if (position > 2) return;
-      if (historyAutoRequested.current || historyLoadingRef.current) return;
-      historyAutoRequested.current = true;
-      requestHistoryPage(false);
-    });
     const onDocumentKeyDown = (event: KeyboardEvent) => {
       if (terminalInputSuppressed()) return;
       if (!activeRef.current || event.defaultPrevented) return;
@@ -4091,7 +4082,6 @@ function TerminalPane({
 
     return () => {
       dataDisposable.dispose();
-      scrollDisposable.dispose();
       document.removeEventListener("keydown", onDocumentKeyDown, true);
       helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
       helperTextarea?.removeEventListener("compositionupdate", onCompositionUpdate);

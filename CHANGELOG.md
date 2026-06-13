@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.0.5
+
+Worker-side terminal state, Web Control mobile polish, and release packaging updates.
+
+- Added worker-side terminal snapshots, row-level terminal diffs, history pages,
+  state reset, mouse, and size-control protocol messages.
+- Added Web Control support for worker-state xterm attach, worker-side history,
+  state diagnostics, and remote terminal size sync/reset.
+- Fixed Web Control so Worker history does not open automatically on initial
+  remote session attach.
+- Improved mobile Web Control with compact overview metrics, folded terminal
+  actions, Worker Ops menus, and session/window/pane navigation refinements.
+- Added session and pane favorites backed by browser local storage.
+- Expanded release packaging for Worker, Control, TUI, and Hub assets with
+  checksums.
+- Updated terminal state, API, usage, architecture, roadmap, deployment, and
+  update strategy documentation.
+
+See [docs/releases/v0.0.5.md](docs/releases/v0.0.5.md) for the full release notes.
+
 ## v0.0.2
 
 Worker onboarding and CLI usability release.
