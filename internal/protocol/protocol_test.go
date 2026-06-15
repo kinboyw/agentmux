@@ -44,9 +44,11 @@ func TestTerminalSizeControlPayloadRoundTrip(t *testing.T) {
 
 func TestTerminalRenderModePayloadRoundTrip(t *testing.T) {
 	env, err := NewEnvelope(TypeControlOpen, TerminalOpen{
-		Cols:       120,
-		Rows:       36,
-		RenderMode: RenderModeWorkerStateXterm,
+		Cols:        120,
+		Rows:        36,
+		RenderMode:  RenderModeWorkerStateXterm,
+		ChannelMode: TerminalChannelP2PPreferred,
+		GrantID:     "grant_test",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,9 +60,18 @@ func TestTerminalRenderModePayloadRoundTrip(t *testing.T) {
 	if open.RenderMode != RenderModeWorkerStateXterm {
 		t.Fatalf("unexpected render mode: %+v", open)
 	}
+	if open.ChannelMode != TerminalChannelP2PPreferred {
+		t.Fatalf("unexpected channel mode: %+v", open)
+	}
+	if open.GrantID != "grant_test" {
+		t.Fatalf("unexpected grant id: %+v", open)
+	}
 	mode, err := NewEnvelope(TypeTerminalMode, TerminalMode{
-		Mode:       "state-bridge",
-		RenderMode: RenderModeWorkerStateXterm,
+		Mode:         "state-bridge",
+		RenderMode:   RenderModeWorkerStateXterm,
+		ChannelMode:  TerminalChannelP2PPreferred,
+		ChannelState: TerminalChannelP2PFallback,
+		GrantID:      "grant_test",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -71,6 +82,12 @@ func TestTerminalRenderModePayloadRoundTrip(t *testing.T) {
 	}
 	if negotiated.RenderMode != RenderModeWorkerStateXterm {
 		t.Fatalf("unexpected negotiated render mode: %+v", negotiated)
+	}
+	if negotiated.ChannelMode != TerminalChannelP2PPreferred || negotiated.ChannelState != TerminalChannelP2PFallback {
+		t.Fatalf("unexpected negotiated channel state: %+v", negotiated)
+	}
+	if negotiated.GrantID != "grant_test" {
+		t.Fatalf("unexpected negotiated grant id: %+v", negotiated)
 	}
 }
 

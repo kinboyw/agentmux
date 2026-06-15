@@ -21,6 +21,7 @@ import {
   LogIn,
   LogOut,
   Monitor,
+  PanelTop,
   Plus,
   Power,
   RefreshCw,
@@ -99,6 +100,7 @@ type MainView = "overview" | "workspace";
 type SplitDirection = "horizontal" | "vertical";
 type DropZone = "left" | "right" | "top" | "bottom" | "center";
 type AttachMode = "current" | "new-tab";
+type TerminalChannelPreference = "relay" | "p2p_preferred";
 
 type TerminalTargetView = {
   session_name?: string;
@@ -228,6 +230,7 @@ type HubVersionPayload = {
   commit?: string;
   build_time?: string;
   protocol_version?: string;
+  capabilities?: string[];
 };
 
 type WorkerUpdateJob = {
@@ -266,7 +269,26 @@ type TerminalModePayload = {
   remote_size?: TerminalSize;
   viewport_size?: TerminalSize;
   default_size?: TerminalSize;
+  channel_mode?: string;
+  channel_state?: string;
+  grant_id?: string;
   fallback?: string;
+  fallback_reason?: string;
+};
+
+type P2PGrantPayload = {
+  grant_id?: string;
+  state?: string;
+  allowed_transport?: string;
+  fallback_after_ms?: number;
+};
+
+type P2PSignalPayload = {
+  grant_id?: string;
+  signal?: string;
+  state?: string;
+  reason?: string;
+  message?: string;
 };
 
 type TerminalHistoryLine = {
@@ -346,6 +368,20 @@ type MobileTargetBrowser = {
   windowKey?: string;
 };
 
+type DesktopSessionTargetsState = {
+  loading: boolean;
+  error?: string;
+  targets: TerminalTargetView[];
+  loadedAt?: number;
+};
+
+type DesktopTargetPopoverState = {
+  session: SessionView;
+  group: TargetWindowGroup;
+  anchor: DOMRect;
+  hoveredPaneKey?: string;
+};
+
 type SessionTargetSummary = {
   windows: number;
   panes: number;
@@ -403,7 +439,9 @@ type DropTarget = {
 
 const dragMime = "application/x-agentmux-drag";
 const defaultTmuxPrefix = "\x02";
+const terminalResizeDebounceMs = 450;
 let terminalInputSuppressedUntil = 0;
+let layoutResizeInProgress = false;
 const query = new URLSearchParams(window.location.search);
 const initialSignal = query.get("signal") || "";
 const queryToken = query.get("token") || "";
@@ -413,6 +451,7 @@ const initialRefreshToken = queryToken ? "" : localStorage.getItem("agentmux.ref
 const initialRefreshExpiresAt = queryToken ? "" : localStorage.getItem("agentmux.refresh_expires_at") || "";
 const initialUser = readStoredUser();
 const initialTerminalSettings = readTerminalSettings();
+const initialTerminalChannelPreference = readTerminalChannelPreference();
 const initialWorkspaceState = readWorkspaceState();
 const initialRecentCWDs = readRecentCWDs();
 const initialFavorites = readFavorites();
@@ -432,8 +471,53 @@ function useMediaQuery(mediaQuery: string) {
   return matches;
 }
 
+function installTouchOverscrollGuard(root: HTMLElement) {
+  let startY = 0;
+  const onTouchStart = (event: TouchEvent) => {
+    startY = event.touches[0]?.clientY || 0;
+  };
+  const onTouchMove = (event: TouchEvent) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest("[data-overscroll-guard]")) return;
+    const currentY = event.touches[0]?.clientY || startY;
+    const deltaY = currentY - startY;
+    if (!deltaY) return;
+    const scrollable = nearestScrollable(target, root);
+    if (!scrollable) {
+      event.preventDefault();
+      return;
+    }
+    const atTop = scrollable.scrollTop <= 0;
+    const atBottom = Math.ceil(scrollable.scrollTop + scrollable.clientHeight) >= scrollable.scrollHeight;
+    if ((deltaY > 0 && atTop) || (deltaY < 0 && atBottom)) {
+      event.preventDefault();
+    }
+  };
+  root.addEventListener("touchstart", onTouchStart, { passive: true });
+  root.addEventListener("touchmove", onTouchMove, { passive: false });
+  return () => {
+    root.removeEventListener("touchstart", onTouchStart);
+    root.removeEventListener("touchmove", onTouchMove);
+  };
+}
+
+function nearestScrollable(target: Element, root: HTMLElement) {
+  let node: Element | null = target;
+  while (node) {
+    if (node instanceof HTMLElement) {
+      const style = window.getComputedStyle(node);
+      const canScroll = /(auto|scroll|overlay)/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1;
+      if (canScroll) return node;
+    }
+    if (node === root) break;
+    node = node.parentElement;
+  }
+  return null;
+}
+
 function App() {
   const compactLayout = useMediaQuery("(max-width: 767px)");
+  const appRootRef = React.useRef<HTMLDivElement | null>(null);
   const [token, setToken] = React.useState(initialToken);
   const [tokenExpiresAt, setTokenExpiresAt] = React.useState(initialTokenExpiresAt);
   const [refreshToken, setRefreshToken] = React.useState(initialRefreshToken);
@@ -458,6 +542,7 @@ function App() {
   const [sessionSearch, setSessionSearch] = React.useState("");
   const [mainView, setMainView] = React.useState<MainView>("overview");
   const [terminalSettings, setTerminalSettings] = React.useState<TerminalSettings>(initialTerminalSettings);
+  const [terminalChannelPreference, setTerminalChannelPreference] = React.useState<TerminalChannelPreference>(initialTerminalChannelPreference);
   const [tabs, setTabs] = React.useState<WorkspaceTab[]>(initialWorkspaceState.tabs);
   const [activeTabId, setActiveTabId] = React.useState(initialWorkspaceState.activeTabId);
   const [recentCWDs, setRecentCWDs] = React.useState<RecentCWDState>(initialRecentCWDs);
@@ -469,10 +554,14 @@ function App() {
   const [workerUpdateJobs, setWorkerUpdateJobs] = React.useState<Record<string, WorkerUpdateJob>>({});
   const [actionLoading, setActionLoading] = React.useState<Record<string, boolean>>({});
   const [mobileTargets, setMobileTargets] = React.useState<MobileTargetBrowser | null>(null);
+  const [expandedDesktopSessionId, setExpandedDesktopSessionId] = React.useState<string | null>(null);
+  const [desktopTargetStates, setDesktopTargetStates] = React.useState<Record<string, DesktopSessionTargetsState>>({});
+  const [desktopTargetPopover, setDesktopTargetPopover] = React.useState<DesktopTargetPopoverState | null>(null);
   const [pendingFocusSessionId, setPendingFocusSessionId] = React.useState<string | null>(null);
   const [dropTarget, setDropTarget] = React.useState<DropTarget | null>(null);
   const [toasts, setToasts] = React.useState<Toast[]>([]);
   const sessionButtonRefs = React.useRef<Record<string, HTMLButtonElement | null>>({});
+  const desktopTargetCloseTimer = React.useRef<number | null>(null);
   const authRef = React.useRef({
     token: initialToken,
     tokenExpiresAt: initialTokenExpiresAt,
@@ -483,6 +572,25 @@ function App() {
   const lastActivityAt = React.useRef(Date.now());
   const workersRef = React.useRef<WorkerView[]>([]);
   const workerEventsReady = React.useRef(false);
+
+  React.useEffect(() => {
+    if (!compactLayout || !appRootRef.current) return;
+    return installTouchOverscrollGuard(appRootRef.current);
+  }, [compactLayout]);
+
+  React.useEffect(() => {
+    const clearLayoutResize = () => {
+      layoutResizeInProgress = false;
+    };
+    document.addEventListener("pointerup", clearLayoutResize);
+    document.addEventListener("pointercancel", clearLayoutResize);
+    return () => {
+      document.removeEventListener("pointerup", clearLayoutResize);
+      document.removeEventListener("pointercancel", clearLayoutResize);
+    };
+  }, []);
+
+  React.useEffect(() => () => cancelDesktopTargetPopoverClose(), []);
   const toastTimers = React.useRef<number[]>([]);
   const hubVersionSignature = React.useRef("");
   const webUpdateToastShown = React.useRef(false);
@@ -584,7 +692,19 @@ function App() {
   }, [token]);
 
   React.useEffect(() => {
-    if (initialSignal) {
+    const oauthError = readOAuthCallbackError();
+    const oauth = readOAuthCallbackCredential();
+    if (oauthError) {
+      clearControlRuntimeState();
+      setAuthMode("login");
+      setAuthOpen(true);
+      setStatus({ tone: "err", title: "OAuth login failed", detail: oauthError });
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    } else if (oauth) {
+      void acceptCredential(oauth, "OAuth login ready").then(() => {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      });
+    } else if (initialSignal) {
       void exchangeSignal(initialSignal);
     } else if (initialToken) {
       void refreshAll(initialToken);
@@ -963,6 +1083,7 @@ function App() {
   }
 
   async function acceptCredential(data: AuthCredentialPayload, title: string) {
+    clearControlRuntimeState();
     storeCredential(data);
     setAccessMode(data.user?.email ? "account" : "direct");
     localStorage.setItem("agentmux.control_device_id", data.device_id);
@@ -972,6 +1093,7 @@ function App() {
       detail: `${data.user?.email || data.credential_id} · ${data.tenant_id}`,
     });
     setAuthOpen(false);
+    setMainView("workspace");
     await refreshAll(data.credential);
   }
 
@@ -985,6 +1107,7 @@ function App() {
     }
     setActionBusy(actionKey, true);
     try {
+      clearControlRuntimeState();
       setToken(nextToken);
       setTokenExpiresAt("");
       setRefreshToken("");
@@ -1005,6 +1128,7 @@ function App() {
   }
 
   function signOut() {
+    clearControlRuntimeState();
     setToken("");
     setTokenDraft("");
     setTokenExpiresAt("");
@@ -1026,6 +1150,33 @@ function App() {
     localStorage.removeItem("agentmux.user");
     setAuthOpen(false);
     setStatus({ tone: "idle", title: "Signed out", detail: "Sign in or apply a token to control sessions." });
+  }
+
+  function clearControlRuntimeState() {
+    const workspace = defaultWorkspaceState();
+    setTabs(workspace.tabs);
+    setActiveTabId(workspace.activeTabId);
+    setMainView("overview");
+    setWorkerFilter("all");
+    setWorkerSearch("");
+    setSessionSearch("");
+    setPreviewStates({});
+    setTargetPreviewStates({});
+    setSessionTargetSummaries({});
+    setWorkers([]);
+    setSessions([]);
+    workersRef.current = [];
+    workerEventsReady.current = false;
+    setExpandedDesktopSessionId(null);
+    setDesktopTargetStates({});
+    setDesktopTargetPopover(null);
+    setMobileTargets(null);
+    setCreateOpen(false);
+    setJoinOpen(false);
+    setJoinLoading(false);
+    setPendingFocusSessionId(null);
+    setDropTarget(null);
+    localStorage.setItem("agentmux.workspace_state", JSON.stringify(workspace));
   }
 
   function storeCredential(data: AuthCredentialPayload) {
@@ -1275,6 +1426,90 @@ function App() {
     }
   }
 
+  async function toggleDesktopSessionTargets(session: SessionView) {
+    setDesktopTargetPopover(null);
+    setExpandedDesktopSessionId((current) => (current === session.id ? null : session.id));
+    const current = desktopTargetStates[session.id];
+    if (current?.loading || (current?.loadedAt && Date.now() - current.loadedAt < 45_000)) return;
+    await loadDesktopSessionTargets(session);
+  }
+
+  async function loadDesktopSessionTargets(session: SessionView, force = false) {
+    const current = desktopTargetStates[session.id];
+    if (!force && (current?.loading || (current?.loadedAt && Date.now() - current.loadedAt < 45_000))) return;
+    setDesktopTargetStates((items) => ({
+      ...items,
+      [session.id]: { ...items[session.id], loading: true, error: "" },
+    }));
+    try {
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(session.worker_id)}/${encodeURIComponent(session.name)}/targets`);
+      if (!res.ok) {
+        const detail = errorDetailFromResponseText(res.status, await res.text());
+        setDesktopTargetStates((items) => ({
+          ...items,
+          [session.id]: { loading: false, error: detail, targets: items[session.id]?.targets || [], loadedAt: Date.now() },
+        }));
+        setStatus({ tone: "warn", title: "Pane targets unavailable", detail: `${session.id} · ${detail}` });
+        return;
+      }
+      const payload = (await res.json()) as { targets?: unknown[] };
+      const targets = (payload.targets || []).map(normalizeTerminalTarget).filter((target): target is TerminalTargetView => Boolean(target));
+      setDesktopTargetStates((items) => ({
+        ...items,
+        [session.id]: { loading: false, targets, loadedAt: Date.now() },
+      }));
+      setSessionTargetSummaries((items) => ({ ...items, [session.id]: sessionTargetSummary(targets) }));
+      if (!targets.length) {
+        setStatus({ tone: "warn", title: "No pane targets", detail: session.id });
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setDesktopTargetStates((items) => ({
+        ...items,
+        [session.id]: { loading: false, error: detail, targets: items[session.id]?.targets || [], loadedAt: Date.now() },
+      }));
+      setStatus({ tone: "err", title: "Pane targets failed", detail });
+    }
+  }
+
+  function openDesktopTargetPopover(session: SessionView, group: TargetWindowGroup, anchor: DOMRect) {
+    cancelDesktopTargetPopoverClose();
+    setDesktopTargetPopover({ session, group, anchor });
+    loadTargetPreviews(session, group.targets);
+  }
+
+  function closeDesktopTargetPopover() {
+    cancelDesktopTargetPopoverClose();
+    setDesktopTargetPopover(null);
+  }
+
+  function cancelDesktopTargetPopoverClose() {
+    if (desktopTargetCloseTimer.current === null) return;
+    window.clearTimeout(desktopTargetCloseTimer.current);
+    desktopTargetCloseTimer.current = null;
+  }
+
+  function scheduleDesktopTargetPopoverClose() {
+    cancelDesktopTargetPopoverClose();
+    desktopTargetCloseTimer.current = window.setTimeout(() => {
+      desktopTargetCloseTimer.current = null;
+      setDesktopTargetPopover(null);
+    }, 220);
+  }
+
+  function hoverDesktopTargetPane(paneKey: string) {
+    setDesktopTargetPopover((current) => (current ? { ...current, hoveredPaneKey: paneKey } : current));
+  }
+
+  async function attachDesktopTarget(session: SessionView, target?: TerminalTargetView | null, mode: AttachMode = "current") {
+    setDesktopTargetPopover(null);
+    if (compactLayout && accessMode !== "direct" && !target) {
+      await openMobileTargetBrowser(session, mode);
+      return;
+    }
+    await attach(session.id, mode, target?.pane_id ? target : null);
+  }
+
 	  function selectMobileTargetWindow(windowKey: string) {
 	    const current = mobileTargets;
 	    if (!current) return;
@@ -1474,6 +1709,16 @@ function App() {
     });
   }
 
+  function updateTerminalChannelPreference(next: TerminalChannelPreference) {
+    setTerminalChannelPreference(next);
+    localStorage.setItem("agentmux.terminal_channel_mode", next);
+    setStatus({
+      tone: next === "p2p_preferred" ? "warn" : "idle",
+      title: next === "p2p_preferred" ? "P2P preferred" : "Relay channel",
+      detail: next === "p2p_preferred" ? "Direct transport is experimental and falls back to Hub relay." : "New terminal streams will use Hub relay.",
+    });
+  }
+
   function detachSession(sessionId: string) {
     setTabs((items) =>
       items.map((tab) => {
@@ -1562,7 +1807,9 @@ function App() {
 	  sessions={sessions}
 	  selectedSessionId={directSessionId}
 	  token={token}
+	  terminalChannelPreference={terminalChannelPreference}
 	  onSelectSession={setDirectSessionId}
+	  onTerminalChannelPreferenceChange={updateTerminalChannelPreference}
 	  onRefresh={() => void refreshAllFromButton()}
 	  onCreateSession={() => setCreateOpen(true)}
 	  onSignIn={() => setAuthOpen(true)}
@@ -1606,7 +1853,7 @@ function App() {
   }
 
   return (
-    <div className="relative flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen">
+    <div ref={appRootRef} className="agentmux-app-root relative flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen">
       {sidebarOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/60 md:hidden" onClick={() => setSidebarOpen(false)} aria-label="Close sessions drawer" /> : null}
       <aside className={cn(
         "fixed inset-y-0 left-0 z-40 flex h-full w-[min(88vw,20rem)] shrink-0 flex-col border-r border-border bg-card transition-all duration-200 md:static md:z-auto md:translate-x-0",
@@ -1701,79 +1948,32 @@ function App() {
                   </div>
                 </div>
                 {group.sessions.map((session) => (
-	                  <div
-	                    key={session.id}
-	                    className={cn(
-	                      "rounded-md border border-transparent hover:border-border hover:bg-secondary",
-	                      activeSessionIds.has(session.id) && "border-primary/40 bg-primary/10",
-	                    )}
-	                  >
-	                    <div className="flex items-start gap-1">
-	                      <button
-                        ref={(node) => {
-                          sessionButtonRefs.current[session.id] = node;
-                        }}
-                        type="button"
-                        draggable
-                        className="min-w-0 flex-1 px-2 py-1.5 text-left"
-                        onClick={() => {
-                          void attachSession(session);
-                        }}
-                        onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
-                        onDragEnd={() => setDropTarget(null)}
-	                      >
-	                        {(() => {
-	                          const targetSummary = sessionTargetSummaries[session.id];
-	                          return targetSummary ? (
-	                            <div className="mb-1 flex flex-wrap items-center gap-1">
-	                              <StatusBadge>session</StatusBadge>
-	                              <StatusBadge>{targetSummary.windows} window{targetSummary.windows === 1 ? "" : "s"}</StatusBadge>
-	                              <StatusBadge>{targetSummary.panes} pane{targetSummary.panes === 1 ? "" : "s"}</StatusBadge>
-	                            </div>
-	                          ) : (
-	                            <div className="mb-1 flex flex-wrap items-center gap-1">
-	                              <StatusBadge>session</StatusBadge>
-	                            </div>
-	                          );
-	                        })()}
-	                        <div className="flex min-w-0 items-center gap-1.5">
-                          <div className="truncate text-sm font-medium">{session.name || session.id}</div>
-                          <BackendBadge value={sessionBackendLabel(session, group.worker)} />
-                        </div>
-                        <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
-                        <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
-                      </button>
-	                      <div className="mt-1 mr-1 flex shrink-0 items-center gap-1">
-	                        <Button
-	                          variant={favorites.sessions.includes(session.id) ? "secondary" : "ghost"}
-	                          size="icon-sm"
-	                          onClick={() => toggleSessionFavorite(session.id)}
-	                          title={favorites.sessions.includes(session.id) ? "Remove session favorite" : "Favorite session"}
-	                        >
-	                          <Star className={cn("h-4 w-4", favorites.sessions.includes(session.id) && "fill-primary text-primary")} />
-	                        </Button>
-	                        <Button
-	                          variant="ghost"
-	                          size="icon-sm"
-                          onClick={() => {
-                            void attachSession(session, "new-tab");
-                          }}
-                          title="Open in new tab"
-                        >
-                          <Plus className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          onClick={() => void killSession(session)}
-                          loading={isActionBusy(`session:kill:${session.id}`)}
-                          title="Exit session"
-                        >
-                          <Power className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
+                  <SidebarSessionItem
+                    key={session.id}
+                    session={session}
+                    worker={group.worker}
+                    active={activeSessionIds.has(session.id)}
+                    favorite={favorites.sessions.includes(session.id)}
+                    targetSummary={sessionTargetSummaries[session.id]}
+                    expanded={expandedDesktopSessionId === session.id}
+                    targetState={desktopTargetStates[session.id]}
+                    sessionButtonRef={(node) => {
+                      sessionButtonRefs.current[session.id] = node;
+                    }}
+                    onAttach={() => void attachSession(session)}
+                    onAttachNewTab={() => void attachSession(session, "new-tab")}
+                    onAttachPane={(target, mode) => void attachDesktopTarget(session, target, mode)}
+                    onToggleFavorite={() => toggleSessionFavorite(session.id)}
+                    onToggleTargets={() => void toggleDesktopSessionTargets(session)}
+                    onOpenMobileTargets={() => void openMobileTargetBrowser(session, "current")}
+                    onRefreshTargets={() => void loadDesktopSessionTargets(session, true)}
+                    onHoverWindow={(windowGroup, anchor) => openDesktopTargetPopover(session, windowGroup, anchor)}
+                    onEnterTargets={cancelDesktopTargetPopoverClose}
+                    onLeaveTargets={scheduleDesktopTargetPopoverClose}
+                    onDragEnd={() => setDropTarget(null)}
+                    onKill={() => void killSession(session)}
+                    killLoading={isActionBusy(`session:kill:${session.id}`)}
+                  />
                 ))}
               </div>
             ))}
@@ -1791,6 +1991,15 @@ function App() {
           </Button>
         </div>
       </aside>
+      <DesktopWindowPanePreviewPopover
+        state={desktopTargetPopover}
+        previewStates={targetPreviewStates}
+        onHoverPane={hoverDesktopTargetPane}
+        onAttachPane={(target) => desktopTargetPopover && void attachDesktopTarget(desktopTargetPopover.session, target, "current")}
+        onAttachPaneNewTab={(target) => desktopTargetPopover && void attachDesktopTarget(desktopTargetPopover.session, target, "new-tab")}
+        onKeepOpen={cancelDesktopTargetPopoverClose}
+        onClose={closeDesktopTargetPopover}
+      />
 
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex min-h-11 items-center justify-between gap-2 border-b border-border bg-card px-2 py-1">
@@ -1839,6 +2048,7 @@ function App() {
               {currentUser ? <UserRound className="h-4 w-4" /> : <LogIn className="h-4 w-4" />}
               <span className="hidden sm:inline">{currentUser ? "Account" : "Sign in"}</span>
             </Button>
+            <TerminalChannelToggle value={terminalChannelPreference} onChange={updateTerminalChannelPreference} compact={compactLayout} />
             <span className={cn("h-2 w-2 rounded-full", status.tone === "ok" && "bg-emerald-500", status.tone === "warn" && "bg-amber-500", status.tone === "err" && "bg-red-500", status.tone === "idle" && "bg-muted-foreground")} />
           </div>
         </header>
@@ -1875,6 +2085,7 @@ function App() {
               sessionByID={sessionByID}
               workerByID={workerByID}
               terminalSettings={terminalSettings}
+              terminalChannelPreference={terminalChannelPreference}
               token={token}
               dropTarget={dropTarget}
               onActiveTabChange={setActiveTabId}
@@ -2016,30 +2227,34 @@ function AccessGate({
                 {authMode === "register" ? "Create account" : "Sign in"}
               </Button>
             </form>
-            <div className="grid grid-cols-2 gap-2">
-              <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")} loading={oauthLoading("github")}>
-                <Github className="h-4 w-4" />
-                GitHub
-              </Button>
-              <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")} loading={oauthLoading("google")}>
-                <Globe className="h-4 w-4" />
-                Google
-              </Button>
-            </div>
-            <form
-              className="space-y-2 rounded-md border border-border bg-background/80 p-3"
-              onSubmit={(event) => {
-                event.preventDefault();
-                onApplyDirectToken();
-              }}
-            >
-              <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
-              <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
-              <Button variant="secondary" className="w-full" type="submit" loading={directTokenLoading}>
-                <RefreshCw className="h-4 w-4" />
-                Use token
-              </Button>
-            </form>
+            {authMode === "login" ? (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")} loading={oauthLoading("github")}>
+                    <Github className="h-4 w-4" />
+                    GitHub
+                  </Button>
+                  <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")} loading={oauthLoading("google")}>
+                    <Globe className="h-4 w-4" />
+                    Google
+                  </Button>
+                </div>
+                <form
+                  className="space-y-2 rounded-md border border-border bg-background/80 p-3"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    onApplyDirectToken();
+                  }}
+                >
+                  <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
+                  <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
+                  <Button variant="secondary" className="w-full" type="submit" loading={directTokenLoading}>
+                    <RefreshCw className="h-4 w-4" />
+                    Use token
+                  </Button>
+                </form>
+              </>
+            ) : null}
             <form className="space-y-2 rounded-md border border-border bg-background/80 p-3" onSubmit={onSubmitSignal}>
               <div className="text-xs font-medium uppercase text-muted-foreground">Signal</div>
               <Input value={signal} onChange={(event) => onSignalChange(event.target.value)} placeholder="join or control signal" spellCheck={false} />
@@ -2130,10 +2345,13 @@ function MobileTargetNavigator({
         <Button variant="ghost" size="icon-sm" onClick={onBack} title="Back to sessions">
           <ChevronLeft className="h-4 w-4" />
         </Button>
-        <div className="min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold">{state.session.name || state.session.id}</div>
-          <div className="truncate text-[11px] text-muted-foreground">Select a window, then attach a pane</div>
+          <div className="truncate text-[11px] text-muted-foreground">Open the full session or attach an individual pane</div>
         </div>
+        <Button variant="secondary" size="icon-sm" onClick={onAttachSession} title="Open full session">
+          <Monitor className="h-4 w-4" />
+        </Button>
       </div>
 
       {state.loading ? (
@@ -2236,6 +2454,333 @@ function MobileTargetNavigator({
   );
 }
 
+function SidebarSessionItem({
+  session,
+  worker,
+  active,
+  favorite,
+  targetSummary,
+  expanded,
+  targetState,
+  sessionButtonRef,
+  onAttach,
+  onAttachNewTab,
+  onAttachPane,
+  onToggleFavorite,
+  onToggleTargets,
+  onOpenMobileTargets,
+  onRefreshTargets,
+  onHoverWindow,
+  onEnterTargets,
+  onLeaveTargets,
+  onDragEnd,
+  onKill,
+  killLoading,
+}: {
+  session: SessionView;
+  worker: WorkerView | null;
+  active: boolean;
+  favorite: boolean;
+  targetSummary?: SessionTargetSummary;
+  expanded: boolean;
+  targetState?: DesktopSessionTargetsState;
+  sessionButtonRef: (node: HTMLButtonElement | null) => void;
+  onAttach: () => void;
+  onAttachNewTab: () => void;
+  onAttachPane: (target: TerminalTargetView, mode?: AttachMode) => void;
+  onToggleFavorite: () => void;
+  onToggleTargets: () => void;
+  onOpenMobileTargets: () => void;
+  onRefreshTargets: () => void;
+  onHoverWindow: (group: TargetWindowGroup, anchor: DOMRect) => void;
+  onEnterTargets: () => void;
+  onLeaveTargets: () => void;
+  onDragEnd: () => void;
+  onKill: () => void;
+  killLoading: boolean;
+}) {
+  const groups = groupTerminalTargetsByWindow(targetState?.targets || []);
+
+  return (
+    <div
+      className={cn(
+        "rounded-md border border-transparent hover:border-border hover:bg-secondary",
+        active && "border-primary/40 bg-primary/10",
+        expanded && "border-border bg-background/70",
+      )}
+      onMouseEnter={onEnterTargets}
+      onMouseLeave={onLeaveTargets}
+    >
+      <div className="flex items-start gap-1">
+        <button
+          ref={sessionButtonRef}
+          type="button"
+          draggable
+          className="min-w-0 flex-1 px-2 py-1.5 text-left"
+          onClick={onAttach}
+          onDragStart={(event) => setDragPayload(event, { kind: "session", sessionId: session.id })}
+          onDragEnd={onDragEnd}
+        >
+          <div className="mb-1 flex flex-wrap items-center gap-1">
+            <StatusBadge>session</StatusBadge>
+            {targetSummary ? (
+              <>
+                <StatusBadge>{targetSummary.windows} window{targetSummary.windows === 1 ? "" : "s"}</StatusBadge>
+                <StatusBadge>{targetSummary.panes} pane{targetSummary.panes === 1 ? "" : "s"}</StatusBadge>
+              </>
+            ) : null}
+          </div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div className="truncate text-sm font-medium">{session.name || session.id}</div>
+            <BackendBadge value={sessionBackendLabel(session, worker)} />
+          </div>
+          <div className="truncate text-xs text-muted-foreground">{session.command || "shell"} · {session.status || "unknown"}</div>
+          <div className="truncate text-xs text-muted-foreground">{session.cwd}</div>
+        </button>
+        <div className="mt-1 mr-1 flex shrink-0 items-center gap-1">
+          <Button
+            variant={favorite ? "secondary" : "ghost"}
+            size="icon-sm"
+            onClick={onToggleFavorite}
+            title={favorite ? "Remove session favorite" : "Favorite session"}
+          >
+            <Star className={cn("h-4 w-4", favorite && "fill-primary text-primary")} />
+          </Button>
+          <Button
+            variant={expanded ? "secondary" : "ghost"}
+            size="icon-sm"
+            className="hidden md:inline-flex"
+            onClick={onToggleTargets}
+            loading={Boolean(targetState?.loading)}
+            title="Expand windows and panes"
+            aria-expanded={expanded}
+          >
+            <PanelTop className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="md:hidden"
+            onClick={onOpenMobileTargets}
+            title="Open window and pane targets"
+          >
+            <LayoutGrid className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={onAttachNewTab}
+            title="Open in new tab"
+          >
+            <Plus className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={onKill}
+            loading={killLoading}
+            title="Exit session"
+          >
+            <Power className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+      {expanded ? (
+        <div className="hidden border-t border-border/80 bg-background/45 px-1.5 pb-1.5 pt-2 md:block">
+          {targetState?.loading ? (
+            <div className="ml-2 border-l border-border/80 pl-2">
+              <div className="rounded border border-dashed border-border bg-card/50 px-2 py-3 text-center text-xs text-muted-foreground">Loading windows...</div>
+            </div>
+          ) : targetState?.error ? (
+            <div className="ml-2 space-y-1 border-l border-border/80 pl-2">
+              <div className="rounded border border-amber-500/35 bg-amber-500/10 px-2 py-2 text-xs text-amber-100">{targetState.error}</div>
+              <Button variant="ghost" size="xs" className="w-full" onClick={onRefreshTargets}>
+                <RefreshCw className="h-3.5 w-3.5" />
+                Retry
+              </Button>
+            </div>
+          ) : groups.length ? (
+            <div className="ml-2 space-y-1 border-l border-border/80 pl-2">
+              <div className="px-1 pb-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground/80">Windows</div>
+              {groups.map((group) => (
+                <button
+                  key={group.key}
+                  type="button"
+                  className="flex w-full min-w-0 items-center justify-between gap-2 rounded-md border border-border/60 bg-card/55 px-2 py-1.5 text-left transition-colors hover:border-primary/50 hover:bg-secondary"
+                  onMouseEnter={(event) => onHoverWindow(group, event.currentTarget.getBoundingClientRect())}
+                  onFocus={(event) => onHoverWindow(group, event.currentTarget.getBoundingClientRect())}
+                  onClick={() => {
+                    const activePane = group.targets.find((target) => target.pane_active && target.pane_id) || group.targets.find((target) => target.pane_id);
+                    if (activePane) onAttachPane(activePane, "current");
+                  }}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-medium">{targetWindowLabel(group)}</div>
+                    <div className="truncate text-[11px] text-muted-foreground">{group.targets.length} pane{group.targets.length === 1 ? "" : "s"}</div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {group.active ? <StatusBadge tone="ok">active</StatusBadge> : null}
+                    <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="ml-2 border-l border-border/80 pl-2">
+              <div className="rounded border border-dashed border-border bg-card/50 px-2 py-3 text-center text-xs text-muted-foreground">No windows found.</div>
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function DesktopWindowPanePreviewPopover({
+  state,
+  previewStates,
+  onHoverPane,
+  onAttachPane,
+  onAttachPaneNewTab,
+  onKeepOpen,
+  onClose,
+}: {
+  state: DesktopTargetPopoverState | null;
+  previewStates: Record<string, PreviewState>;
+  onHoverPane: (paneKey: string) => void;
+  onAttachPane: (target: TerminalTargetView) => void;
+  onAttachPaneNewTab: (target: TerminalTargetView) => void;
+  onKeepOpen: () => void;
+  onClose: () => void;
+}) {
+  if (!state) return null;
+  const left = Math.min(window.innerWidth - 380, Math.max(320, state.anchor.right + 8));
+  const top = Math.min(window.innerHeight - 300, Math.max(56, state.anchor.top - 8));
+  const hoveredPane = state.group.targets.find((target, index) => (terminalTargetKey(target) || String(index)) === state.hoveredPaneKey);
+
+  return (
+    <div
+      className="fixed z-50 hidden w-[360px] rounded-md border border-border bg-card p-2 shadow-xl md:block"
+      style={{ left, top }}
+      onMouseEnter={onKeepOpen}
+      onMouseLeave={onClose}
+    >
+      <div className="mb-2 flex min-w-0 items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold">{targetWindowLabel(state.group)}</div>
+          <div className="truncate text-xs text-muted-foreground">{state.session.name || state.session.id} · {state.group.targets.length} pane{state.group.targets.length === 1 ? "" : "s"}</div>
+        </div>
+        {state.group.active ? <StatusBadge tone="ok">active</StatusBadge> : null}
+      </div>
+      <PaneLayoutPreview
+        sessionId={state.session.id}
+        targets={state.group.targets}
+        previewStates={previewStates}
+        hoveredPaneKey={state.hoveredPaneKey}
+        onHoverPane={onHoverPane}
+        onAttachPane={onAttachPane}
+        onAttachPaneNewTab={onAttachPaneNewTab}
+      />
+      <div className="mt-2 min-h-[34px] rounded border border-border bg-background/70 px-2 py-1.5 text-[11px] text-muted-foreground">
+        {hoveredPane ? (
+          <>
+            <div className="truncate font-medium text-foreground">{terminalTargetLabel(hoveredPane, hoveredPane.pane_index ?? 0)} {hoveredPane.pane_active ? "· active" : ""}</div>
+            <div className="truncate">{terminalTargetDetail(hoveredPane) || "shell"}</div>
+          </>
+        ) : (
+          <div className="truncate">Hover a pane, click to attach.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PaneLayoutPreview({
+  sessionId,
+  targets,
+  previewStates,
+  hoveredPaneKey,
+  onHoverPane,
+  onAttachPane,
+  onAttachPaneNewTab,
+}: {
+  sessionId: string;
+  targets: TerminalTargetView[];
+  previewStates: Record<string, PreviewState>;
+  hoveredPaneKey?: string;
+  onHoverPane: (paneKey: string) => void;
+  onAttachPane: (target: TerminalTargetView) => void;
+  onAttachPaneNewTab: (target: TerminalTargetView) => void;
+}) {
+  const layout = paneLayoutBounds(targets);
+  if (!layout) {
+    return (
+      <div className="space-y-1">
+        {targets.map((target, index) => {
+          const paneKey = terminalTargetKey(target) || String(index);
+          return (
+            <button
+              key={paneKey}
+              type="button"
+              className={cn("flex w-full min-w-0 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1.5 text-left hover:border-primary/60", paneKey === hoveredPaneKey && "border-primary bg-primary/10")}
+              onMouseEnter={() => onHoverPane(paneKey)}
+              onClick={() => onAttachPane(target)}
+            >
+              <span className="min-w-0 truncate text-xs">{terminalTargetLabel(target, index)}</span>
+              <StatusBadge>{terminalTargetShortLabel(target)}</StatusBadge>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+  return (
+    <div className="relative h-44 overflow-hidden rounded border border-border bg-[#050607]">
+      {targets.map((target, index) => {
+        const paneKey = terminalTargetKey(target) || String(index);
+        const preview = previewStates[targetPreviewKey(sessionId, target)];
+        const left = (((target.left || 0) - layout.left) / layout.width) * 100;
+        const top = (((target.top || 0) - layout.top) / layout.height) * 100;
+        const width = ((target.width || 1) / layout.width) * 100;
+        const height = ((target.height || 1) / layout.height) * 100;
+        const previewText = preview?.loading ? "loading..." : preview?.error ? "preview error" : preview?.data?.trimEnd() || terminalTargetDetail(target) || "shell";
+        return (
+          <button
+            key={paneKey}
+            type="button"
+            className={cn(
+              "absolute overflow-hidden border border-border bg-background/80 p-1 text-left transition-colors hover:border-primary hover:bg-primary/10",
+              target.pane_active && "border-emerald-400/60",
+              paneKey === hoveredPaneKey && "border-primary bg-primary/15 ring-1 ring-primary",
+            )}
+            style={{
+              left: `${left}%`,
+              top: `${top}%`,
+              width: `${width}%`,
+              height: `${height}%`,
+            }}
+            onMouseEnter={() => onHoverPane(paneKey)}
+            onClick={() => onAttachPane(target)}
+            onDoubleClick={(event) => {
+              event.preventDefault();
+              onAttachPaneNewTab(target);
+            }}
+            title={`${terminalTargetLabel(target, index)} · ${terminalTargetDetail(target)}`}
+          >
+            <div className="mb-1 flex min-w-0 items-center justify-between gap-1 text-[10px] font-medium">
+              <span className="truncate">{terminalTargetShortLabel(target)}</span>
+              {target.pane_active ? <span className="text-emerald-300">active</span> : null}
+            </div>
+            <pre className="h-full overflow-hidden whitespace-pre-wrap break-words font-mono text-[9px] leading-[11px] text-[#d7e2df]">
+              {previewText.split(/\r?\n/).slice(-10).join("\n")}
+            </pre>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function PanePreviewCanvas({
   preview,
   onRefresh,
@@ -2285,7 +2830,9 @@ function SimpleDirectControlView({
   sessions,
   selectedSessionId,
   token,
+  terminalChannelPreference,
   onSelectSession,
+  onTerminalChannelPreferenceChange,
   onRefresh,
   onCreateSession,
   onSignIn,
@@ -2296,7 +2843,9 @@ function SimpleDirectControlView({
   sessions: SessionView[];
   selectedSessionId: string;
   token: string;
+  terminalChannelPreference: TerminalChannelPreference;
   onSelectSession: (sessionId: string) => void;
+  onTerminalChannelPreferenceChange: (value: TerminalChannelPreference) => void;
   onRefresh: () => void;
   onCreateSession: () => void;
   onSignIn: () => void;
@@ -2408,7 +2957,10 @@ function SimpleDirectControlView({
 	    </div>
 	    </div>
 	  </div>
-	  <StatusBadge tone="warn">limited</StatusBadge>
+	  <div className="flex shrink-0 items-center gap-2">
+	    <TerminalChannelToggle value={terminalChannelPreference} onChange={onTerminalChannelPreferenceChange} compact />
+	    <StatusBadge tone="warn">limited</StatusBadge>
+	  </div>
 	</header>
 	<div className="min-h-0 flex-1">
 	  {selectedSession ? (
@@ -2419,6 +2971,7 @@ function SimpleDirectControlView({
 	      active
 	      interactive
 	      terminalSettings={{ workers: {} }}
+	      terminalChannelPreference={terminalChannelPreference}
 	      token={token}
 	      onFocus={() => {}}
 	      onSplit={() => {}}
@@ -2903,6 +3456,7 @@ function WorkspaceView({
   sessionByID,
   workerByID,
   terminalSettings,
+  terminalChannelPreference,
   token,
   dropTarget,
   onActiveTabChange,
@@ -2924,6 +3478,7 @@ function WorkspaceView({
   sessionByID: Map<string, SessionView>;
   workerByID: Map<string, WorkerView>;
   terminalSettings: TerminalSettings;
+  terminalChannelPreference: TerminalChannelPreference;
   token: string;
   dropTarget: DropTarget | null;
   onActiveTabChange: (tabID: string) => void;
@@ -3080,6 +3635,7 @@ function WorkspaceView({
               sessionByID={sessionByID}
               workerByID={workerByID}
               terminalSettings={terminalSettings}
+              terminalChannelPreference={terminalChannelPreference}
               token={token}
               onFocusPane={onFocusPane}
               onSplitPane={onSplitPane}
@@ -3102,6 +3658,7 @@ function WorkspaceView({
               sessionByID={sessionByID}
               workerByID={workerByID}
               terminalSettings={terminalSettings}
+              terminalChannelPreference={terminalChannelPreference}
               token={token}
               onFocusPane={onFocusPane}
               onSplitPane={onSplitPane}
@@ -3136,6 +3693,40 @@ function StatusBadge({ tone, children }: { tone?: "ok" | "warn" | "err"; childre
     >
       {children}
     </span>
+  );
+}
+
+function TerminalChannelToggle({
+  value,
+  onChange,
+  compact = false,
+}: {
+  value: TerminalChannelPreference;
+  onChange: (value: TerminalChannelPreference) => void;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className="inline-flex h-8 shrink-0 items-center overflow-hidden rounded-md border border-border bg-background p-0.5"
+      title="P2P direct transport is experimental; current streams fall back to Hub relay."
+    >
+      <Button
+        variant={value === "relay" ? "secondary" : "ghost"}
+        size="xs"
+        className="h-6 px-2"
+        onClick={() => onChange("relay")}
+      >
+        Relay
+      </Button>
+      <Button
+        variant={value === "p2p_preferred" ? "secondary" : "ghost"}
+        size="xs"
+        className="h-6 px-2"
+        onClick={() => onChange("p2p_preferred")}
+      >
+        {compact ? "P2P" : "P2P preferred"}
+      </Button>
+    </div>
   );
 }
 
@@ -3257,24 +3848,28 @@ function AuthModal({
                   {authMode === "register" ? "Create account" : "Sign in"}
                 </Button>
               </form>
-              <div className="grid grid-cols-2 gap-2">
-                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")} loading={oauthLoading("github")}>
-                  <Github className="h-4 w-4" />
-                  GitHub
-                </Button>
-                <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")} loading={oauthLoading("google")}>
-                  <Globe className="h-4 w-4" />
-                  Google
-                </Button>
-              </div>
-              <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
-                <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
-                <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
-                <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken} loading={directTokenLoading}>
-                  <RefreshCw className="h-4 w-4" />
-                  Use token
-                </Button>
-              </div>
+              {authMode === "login" ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("github")} loading={oauthLoading("github")}>
+                      <Github className="h-4 w-4" />
+                      GitHub
+                    </Button>
+                    <Button variant="ghost" size="sm" type="button" onClick={() => onOAuth("google")} loading={oauthLoading("google")}>
+                      <Globe className="h-4 w-4" />
+                      Google
+                    </Button>
+                  </div>
+                  <div className="space-y-2 rounded-md border border-border bg-background/80 p-3">
+                    <div className="text-xs font-medium uppercase text-muted-foreground">Direct token</div>
+                    <Input value={token} onChange={(event) => onTokenChange(event.target.value)} placeholder="amx_cred_... or dev token" spellCheck={false} />
+                    <Button variant="secondary" className="w-full" type="button" onClick={onApplyDirectToken} loading={directTokenLoading}>
+                      <RefreshCw className="h-4 w-4" />
+                      Use token
+                    </Button>
+                  </div>
+                </>
+              ) : null}
             </>
           )}
         </div>
@@ -3496,6 +4091,7 @@ function LayoutRenderer({
   sessionByID,
   workerByID,
   terminalSettings,
+  terminalChannelPreference,
   token,
   onFocusPane,
   onSplitPane,
@@ -3514,6 +4110,7 @@ function LayoutRenderer({
   sessionByID: Map<string, SessionView>;
   workerByID: Map<string, WorkerView>;
   terminalSettings: TerminalSettings;
+  terminalChannelPreference: TerminalChannelPreference;
   token: string;
   onFocusPane: (tabID: string, id: string) => void;
   onSplitPane: (tabID: string, paneId: string, direction: SplitDirection) => void;
@@ -3536,6 +4133,7 @@ function LayoutRenderer({
         active={node.id === activePane}
         interactive={interactive && node.id === activePane}
         terminalSettings={terminalSettings}
+        terminalChannelPreference={terminalChannelPreference}
         token={token}
         onFocus={() => onFocusPane(tabId, node.id)}
         onSplit={(direction) => onSplitPane(tabId, node.id, direction)}
@@ -3559,6 +4157,15 @@ function LayoutRenderer({
                 "bg-border transition-colors hover:bg-primary",
                 node.direction === "horizontal" ? "w-0.5" : "h-0.5",
               )}
+              onPointerDown={() => {
+                layoutResizeInProgress = true;
+              }}
+              onPointerUp={() => {
+                layoutResizeInProgress = false;
+              }}
+              onPointerCancel={() => {
+                layoutResizeInProgress = false;
+              }}
             />
           ) : null}
           <Panel minSize={15} className="min-h-0 min-w-0 overflow-hidden">
@@ -3570,6 +4177,7 @@ function LayoutRenderer({
               sessionByID={sessionByID}
               workerByID={workerByID}
               terminalSettings={terminalSettings}
+              terminalChannelPreference={terminalChannelPreference}
               token={token}
               onFocusPane={onFocusPane}
               onSplitPane={onSplitPane}
@@ -3595,6 +4203,7 @@ function TerminalPane({
   active,
   interactive,
   terminalSettings,
+  terminalChannelPreference,
   token,
   onFocus,
   onSplit,
@@ -3612,6 +4221,7 @@ function TerminalPane({
   active: boolean;
   interactive: boolean;
   terminalSettings: TerminalSettings;
+  terminalChannelPreference: TerminalChannelPreference;
   token: string;
   onFocus: () => void;
   onSplit: (direction: SplitDirection) => void;
@@ -3629,6 +4239,8 @@ function TerminalPane({
   const socket = React.useRef<WebSocket | null>(null);
   const streamId = React.useRef("");
   const lastSize = React.useRef({ cols: 0, rows: 0 });
+  const lastSyncedRemoteSize = React.useRef({ cols: 0, rows: 0 });
+  const resizeSyncTimer = React.useRef<number | null>(null);
   const viewportSizeRef = React.useRef<TerminalSize>({});
   const resizePolicy = React.useRef("pending");
   const historyLoadingRef = React.useRef(false);
@@ -3663,6 +4275,7 @@ function TerminalPane({
   const paneTargetKey = terminalTargetKey(pane.target);
   const attachedLabel = terminalPaneAttachedLabel(pane, session);
   const workerStateMode = Boolean(pane.sessionId && terminalMode.mode && terminalMode.mode !== "attach");
+  const terminalChannel = terminalChannelStatus(terminalMode, terminalChannelPreference);
   const viewportHint = terminalViewportHint(terminalMode.remote_size, viewportSize);
   const statePanMaxX = terminalStatePanMaxX(cellSnapshot, viewportSize);
   const statePanMaxY = terminalStatePanMaxY(cellSnapshot, viewportSize);
@@ -3711,13 +4324,34 @@ function TerminalPane({
     terminal.current?.focus();
   }
 
-  function sendSizeSync() {
+  function sendSizeSync(manual = true, size = currentTerminalSize()) {
     if (!pane.sessionId || !streamId.current || !socket.current) return;
-    const size = currentTerminalSize();
     if (!size) return;
+    if (!manual && lastSyncedRemoteSize.current.cols === size.cols && lastSyncedRemoteSize.current.rows === size.rows) return;
+    lastSyncedRemoteSize.current = size;
     sendEnvelope(socket.current, "terminal.size.sync", pane.sessionId, streamId.current, { ...size, source: "control_viewport" });
-    setStatus({ tone: "warn", title: "Syncing remote size", detail: `${size.cols}x${size.rows}` });
+    if (manual) setStatus({ tone: "warn", title: "Syncing remote size", detail: `${size.cols}x${size.rows}` });
     terminal.current?.focus();
+  }
+
+  function clearResizeSyncTimer() {
+    if (resizeSyncTimer.current === null) return;
+    window.clearTimeout(resizeSyncTimer.current);
+    resizeSyncTimer.current = null;
+  }
+
+  function scheduleRemoteSizeSync(size: { cols: number; rows: number }) {
+    clearResizeSyncTimer();
+    resizeSyncTimer.current = window.setTimeout(() => {
+      resizeSyncTimer.current = null;
+      if (layoutResizeInProgress) {
+        scheduleRemoteSizeSync(size);
+        return;
+      }
+      if (resizePolicy.current !== "worker_state") return;
+      if (!socket.current || socket.current.readyState !== WebSocket.OPEN) return;
+      sendSizeSync(false, size);
+    }, terminalResizeDebounceMs);
   }
 
   function sendSizeReset() {
@@ -3859,6 +4493,7 @@ function TerminalPane({
     const term = new Terminal({
       cursorBlink: true,
       scrollback: 5000,
+      scrollOnUserInput: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
       fontSize: 14,
       theme: xtermTheme,
@@ -3911,6 +4546,8 @@ function TerminalPane({
       if (ws.readyState === WebSocket.OPEN) {
         if (resizePolicy.current === "follow_control") {
           sendEnvelope(ws, "terminal.resize", pane.sessionId!, streamId.current, size);
+        } else if (resizePolicy.current === "worker_state") {
+          scheduleRemoteSizeSync(size);
         }
       }
     };
@@ -3931,8 +4568,12 @@ function TerminalPane({
         transport_mode: "auto",
         render_mode: "worker_state_xterm",
         resize_policy: "worker_state",
+        channel_mode: terminalChannelPreference,
       });
-      if (size) lastSize.current = size;
+      if (size) {
+        lastSize.current = size;
+        lastSyncedRemoteSize.current = size;
+      }
       setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: streamId.current });
       scheduleFit();
     });
@@ -3947,11 +4588,19 @@ function TerminalPane({
         const payload = env.payload || {};
         if (payload.encoding === "ansi-screen-v1") {
           term.reset();
-          term.write(payload.data || "");
+          term.clear();
+          term.write(payload.data || "", () => {
+            term.scrollToBottom();
+            term.focus();
+          });
         }
         if (payload.encoding === "ansi-lines-v1") {
           term.reset();
-          term.write(snapshotLinesToTerminal(payload.data || ""));
+          term.clear();
+          term.write(snapshotLinesToTerminal(payload.data || ""), () => {
+            term.scrollToBottom();
+            term.focus();
+          });
         }
         if (payload.encoding === "cells-v1" && payload.cells) {
           setCellSnapshot({ ...(payload.cells as TerminalCellSnapshot), generation: payload.generation });
@@ -3981,9 +4630,33 @@ function TerminalPane({
       if (env.type === "terminal.mode") {
         const payload = (env.payload || {}) as TerminalModePayload;
         resizePolicy.current = payload.resize_policy || (payload.mode === "attach" ? "follow_control" : "worker_state");
-        setTerminalMode(payload);
+        setTerminalMode((current) => ({ ...current, ...payload }));
         if (payload.mode) setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: terminalModeDetail(payload) });
         scheduleFit();
+      }
+      if (env.type === "p2p.grant") {
+        const payload = (env.payload || {}) as P2PGrantPayload;
+        setTerminalMode((current) => ({
+          ...current,
+          channel_mode: payload.allowed_transport || current.channel_mode || "p2p_preferred",
+          channel_state: payload.state || "issued",
+          grant_id: payload.grant_id || current.grant_id,
+        }));
+        setStatus({ tone: "warn", title: "P2P grant issued", detail: payload.grant_id ? `grant ${shortID(payload.grant_id)}` : "waiting for signaling" });
+      }
+      if (env.type === "p2p.signal") {
+        const payload = (env.payload || {}) as P2PSignalPayload;
+        setTerminalMode((current) => ({
+          ...current,
+          channel_mode: current.channel_mode || "p2p_preferred",
+          channel_state: payload.state || (payload.signal === "fallback" ? "relay_fallback" : current.channel_state),
+          grant_id: payload.grant_id || current.grant_id,
+          fallback: payload.signal === "fallback" ? payload.message || current.fallback : current.fallback,
+          fallback_reason: payload.reason || current.fallback_reason,
+        }));
+        if (payload.signal === "fallback") {
+          setStatus({ tone: "warn", title: "P2P relay fallback", detail: payload.message || payload.reason || "using Hub relay" });
+        }
       }
       if (env.type === "terminal.history.page") {
         const payload = (env.payload || {}) as TerminalHistoryPage;
@@ -4081,6 +4754,7 @@ function TerminalPane({
     observer.observe(terminalRef.current);
 
     return () => {
+      clearResizeSyncTimer();
       dataDisposable.dispose();
       document.removeEventListener("keydown", onDocumentKeyDown, true);
       helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
@@ -4098,11 +4772,12 @@ function TerminalPane({
       fit.current = null;
       socket.current = null;
     };
-  }, [pane.sessionId, paneTargetKey, token, setStatus]);
+  }, [pane.sessionId, paneTargetKey, terminalChannelPreference, token, setStatus]);
 
   return (
     <div
-      className={cn("relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
+      data-overscroll-guard
+      className={cn("agentmux-session-window relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
       onPointerDown={(event) => {
         if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
         onFocus();
@@ -4143,6 +4818,7 @@ function TerminalPane({
 	          <span className="truncate">{attachedLabel || "Empty pane"}</span>
 	          {pane.sessionId ? <BackendBadge value={backend} /> : null}
 	          {pane.sessionId && terminalMode.mode ? <StatusBadge tone={workerStateMode ? "ok" : undefined}>{terminalMode.render_mode || terminalMode.mode}</StatusBadge> : null}
+	          {pane.sessionId ? <StatusBadge tone={terminalChannel.tone}>{terminalChannel.label}</StatusBadge> : null}
 	          {workerStateMode ? (
 	            <span className="hidden min-w-0 truncate text-[11px] font-normal text-muted-foreground/80 xl:inline">
 	              remote {formatTerminalSize(terminalMode.remote_size)} · viewport {formatTerminalSize(viewportSize)}
@@ -4943,7 +5619,9 @@ function base64ToBytes(value: string) {
 }
 
 function snapshotLinesToTerminal(value: string) {
-  return value.replace(/\r?\n/g, "\r\n");
+  const normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const screen = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
+  return screen.replace(/\n/g, "\r\n");
 }
 
 function suppressTerminalInput(durationMs = 600) {
@@ -5204,6 +5882,36 @@ function readStoredUser(): AuthUser | null {
   }
 }
 
+function readOAuthCallbackCredential(): AuthCredentialPayload | null {
+  const hash = window.location.hash || "";
+  if (!hash.startsWith("#oauth=")) return null;
+  const raw = hash.slice("#oauth=".length);
+  const params = new URLSearchParams(decodeURIComponent(raw));
+  if (params.get("error")) return null;
+  const credential = params.get("credential") || "";
+  if (!credential) return null;
+  const email = params.get("user_email") || "";
+  const name = params.get("user_name") || email;
+  return {
+    credential,
+    credential_id: params.get("credential_id") || credential.slice(0, 12),
+    tenant_id: params.get("tenant_id") || "",
+    device_id: params.get("device_id") || controlDeviceId(),
+    role: params.get("role") || "control",
+    expires_at: params.get("expires_at") || "",
+    refresh_token: params.get("refresh_token") || "",
+    refresh_expires_at: params.get("refresh_expires_at") || "",
+    user: email ? { email, name } : undefined,
+  };
+}
+
+function readOAuthCallbackError(): string {
+  const hash = window.location.hash || "";
+  if (!hash.startsWith("#oauth=")) return "";
+  const params = new URLSearchParams(decodeURIComponent(hash.slice("#oauth=".length)));
+  return params.get("error") || "";
+}
+
 function readTerminalSettings(): TerminalSettings {
   const fallback: TerminalSettings = { workers: {} };
   const value = localStorage.getItem("agentmux.terminal_settings");
@@ -5214,6 +5922,10 @@ function readTerminalSettings(): TerminalSettings {
   } catch {
     return fallback;
   }
+}
+
+function readTerminalChannelPreference(): TerminalChannelPreference {
+  return localStorage.getItem("agentmux.terminal_channel_mode") === "p2p_preferred" ? "p2p_preferred" : "relay";
 }
 
 function normalizeTerminalSettings(value: unknown): TerminalSettings {
@@ -5464,6 +6176,18 @@ function groupTerminalTargetsByWindow(targets: TerminalTargetView[]) {
   return Array.from(groups.values());
 }
 
+function paneLayoutBounds(targets: TerminalTargetView[]) {
+  const positioned = targets.filter((target) => target.left !== undefined || target.top !== undefined || target.width !== undefined || target.height !== undefined);
+  if (!positioned.length) return null;
+  const left = Math.min(...positioned.map((target) => target.left || 0));
+  const top = Math.min(...positioned.map((target) => target.top || 0));
+  const right = Math.max(...positioned.map((target) => (target.left || 0) + Math.max(1, target.width || 1)));
+  const bottom = Math.max(...positioned.map((target) => (target.top || 0) + Math.max(1, target.height || 1)));
+  const width = Math.max(1, right - left);
+  const height = Math.max(1, bottom - top);
+  return { left, top, width, height };
+}
+
 function targetWindowLabel(group: TargetWindowGroup) {
   const name = group.name ? ` · ${group.name}` : "";
   return `Window ${group.index}${name}`;
@@ -5629,11 +6353,29 @@ function terminalViewportHint(remote?: TerminalSize | null, viewport?: TerminalS
 function terminalModeDetail(mode: TerminalModePayload) {
   const parts = [`terminal mode ${mode.mode}`];
   if (mode.render_mode) parts.push(mode.render_mode);
+  if (mode.channel_mode || mode.channel_state) parts.push(`channel ${terminalChannelLabel(mode.channel_mode, mode.channel_state)}`);
+  if (mode.grant_id) parts.push(`grant ${shortID(mode.grant_id)}`);
   if (mode.remote_size?.cols && mode.remote_size?.rows) parts.push(`remote ${formatTerminalSize(mode.remote_size)}`);
   if (mode.default_size?.cols && mode.default_size?.rows) parts.push(`default ${formatTerminalSize(mode.default_size)}`);
   if (mode.resize_policy) parts.push(mode.resize_policy);
   if (mode.fallback) parts.push(`fallback ${mode.fallback}`);
   return parts.join(" · ");
+}
+
+function terminalChannelStatus(mode: TerminalModePayload, preference: TerminalChannelPreference): { label: string; tone?: "ok" | "warn" | "err" } {
+  const channelMode = mode.channel_mode || preference;
+  const channelState = mode.channel_state || (preference === "p2p_preferred" ? "pending" : "relay");
+  if (channelState === "p2p_direct" || channelMode === "p2p_direct") return { label: "p2p", tone: "ok" };
+  if (channelState === "relay_fallback") return { label: "p2p fallback", tone: "warn" };
+  if (channelMode === "p2p_preferred") return { label: "p2p pending", tone: "warn" };
+  return { label: "relay" };
+}
+
+function terminalChannelLabel(channelMode?: string, channelState?: string) {
+  if (channelState === "p2p_direct" || channelMode === "p2p_direct") return "p2p";
+  if (channelState === "relay_fallback") return "p2p fallback";
+  if (channelMode === "p2p_preferred") return "p2p preferred";
+  return channelState || channelMode || "relay";
 }
 
 function applyTerminalDiff(current: TerminalCellSnapshot | null, diff: TerminalDiffPayload) {

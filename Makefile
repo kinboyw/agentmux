@@ -13,6 +13,14 @@ DIST_DIR ?= dist
 WEB_DIR := web/control
 WEB_DIST := internal/hub/webdist
 
+PREV_SSH ?= aliyun
+PREV_HUB_BIN ?= /usr/local/bin/agentmux
+PREV_HUB_SERVICE ?= agentmux
+PREV_HUB_TMP ?= /tmp/agentmux-hub
+PREV_HUB_RESTART_CMD ?= sudo systemctl restart $(PREV_HUB_SERVICE)
+PREV_HUB_STATUS_CMD ?= sudo systemctl --no-pager --full status $(PREV_HUB_SERVICE)
+PREV_WORKER_BIN ?= $(HOME)/.local/bin/agentmux
+
 GOFLAGS ?= -trimpath
 LDFLAGS ?= -s -w -X private/agentmux/internal/version.Version=$(VERSION) -X private/agentmux/internal/version.Commit=$(COMMIT) -X private/agentmux/internal/version.BuildTime=$(BUILD_TIME)
 
@@ -31,6 +39,8 @@ help:
 	@printf "  make check            Run web build, Go tests, and local builds\n"
 	@printf "  make check-hub        Run hub-focused checks including Windows hub build\n"
 	@printf "  make release-assets   Build role-specific release tarballs into dist/\n"
+	@printf "  make prev-hub         Build and deploy Hub to PREV_SSH=%s\n" "$(PREV_SSH)"
+	@printf "  make prev-worker      Build and install local Worker binary\n"
 	@printf "  make clean            Remove local build outputs\n"
 
 .PHONY: web-deps
@@ -109,6 +119,11 @@ build-hub-linux:
 	mkdir -p $(BIN_DIR)
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CROSS_CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/agentmux-hub-linux-amd64 ./cmd/agentmux-hub
 
+.PHONY: build-agentmux-linux
+build-agentmux-linux:
+	mkdir -p $(BIN_DIR)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CROSS_CGO_ENABLED) GOCACHE=$(GOCACHE) $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/agentmux-linux-amd64 ./cmd/agentmux
+
 .PHONY: test test-hub
 test:
 	GOCACHE=$(GOCACHE) $(GO) test ./...
@@ -120,6 +135,21 @@ test-hub:
 check: web-build test build
 
 check-hub: web-build test-hub build-hub-linux build-hub-windows
+
+.PHONY: prev-hub prev-hub-upload prev-hub-restart prev-worker
+prev-hub: prev-hub-upload prev-hub-restart
+
+prev-hub-upload: web build-agentmux-linux
+	scp $(BIN_DIR)/agentmux-linux-amd64 $(PREV_SSH):$(PREV_HUB_TMP)
+	ssh $(PREV_SSH) "sudo install -m 0755 $(PREV_HUB_TMP) $(PREV_HUB_BIN) && rm -f $(PREV_HUB_TMP)"
+
+prev-hub-restart:
+	ssh $(PREV_SSH) "$(PREV_HUB_RESTART_CMD) && $(PREV_HUB_STATUS_CMD)"
+
+prev-worker: build-agentmux
+	mkdir -p "$$(dirname "$(PREV_WORKER_BIN)")"
+	install -m 0755 $(BIN_DIR)/agentmux "$(PREV_WORKER_BIN)"
+	"$(PREV_WORKER_BIN)" worker restart || true
 
 .PHONY: release-assets release-binaries release-worker-control release-hub
 release-assets: web release-binaries

@@ -90,6 +90,14 @@ protocol, not plain text.
 Make Control-Worker P2P the preferred terminal data path, with Hub relay as the
 automatic fallback.
 
+Current implementation status:
+
+- Web Control has a Relay/P2P preferred switch for new terminal streams.
+- `control.open` carries `channel_mode`, and `terminal.mode` reports
+  `channel_mode`, `channel_state`, and fallback reason.
+- P2P preferred currently falls back to Hub relay intentionally. No WebRTC
+  signaling or direct data channel is active yet.
+
 - Worker advertises direct-mode capabilities over the existing Hub control
   channel.
 - Control requests an attach grant from Hub before opening a terminal stream.
@@ -113,3 +121,40 @@ Candidate implementation order:
 6. Add detailed correlation logs and tests for fallback and revocation.
 
 ![AgentMux relay versus direct mode](assets/visuals/agentmux-7-relay-vs-direct-mode-v1.png)
+
+## Phase 7: AI Gateway And Config Control
+
+Extend AgentMux from terminal control into agent runtime configuration.
+
+Target capabilities:
+
+- Hub-managed AI provider definitions, model aliases, routing rules, and
+  redacted secrets.
+- Control UI for provider profiles, config profiles, rollout rules, usage
+  status, and audit events.
+- Worker capability flags for local AI gateway and managed config apply.
+- Worker-side local OpenAI-compatible gateway endpoint for managed sessions.
+- Hub-to-Worker config rollout with revision IDs, dry-run validation, atomic
+  writes, rollback metadata, and redacted logs.
+- Optional Hub-hosted gateway mode for deployments that want centralized proxy
+  traffic.
+
+Implementation order:
+
+1. Add data model for provider profiles, config profiles, secret references,
+   rollout targets, and revisions.
+2. Add Hub HTTP APIs gated to registered Control credentials; Direct Token mode
+   must not manage secrets or config.
+3. Add Worker hello capabilities such as `ai.gateway.local.v1` and
+   `agent.config.apply.v1`.
+4. Add `config.preview` and `config.apply` protocol messages with apply result
+   events.
+5. Implement Worker-side staging, atomic write, backup, rollback, and redacted
+   reporting.
+6. Add a local Worker gateway endpoint and inject `OPENAI_BASE_URL` /
+   `OPENAI_API_KEY` into new managed sessions.
+7. Add usage reporting and health status back to Hub.
+
+The first useful milestone is distributed cc-switch-style config rollout. The
+AI gateway can then reuse the same profile, rollout, audit, and Worker apply
+machinery instead of becoming a separate one-off subsystem.

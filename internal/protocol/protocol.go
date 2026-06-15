@@ -14,6 +14,11 @@ const (
 	RenderModeWorkerStateXterm = "worker_state_xterm"
 	RenderModeLiveAttachXterm  = "live_attach_xterm"
 
+	TerminalChannelRelay        = "relay"
+	TerminalChannelP2PPreferred = "p2p_preferred"
+	TerminalChannelP2PDirect    = "p2p_direct"
+	TerminalChannelP2PFallback  = "relay_fallback"
+
 	TypeWorkerHello         = "worker.hello"
 	TypeWorkerHeartbeat     = "worker.heartbeat"
 	TypeSessionSnapshot     = "session.snapshot"
@@ -39,6 +44,8 @@ const (
 	TypeTerminalResize      = "terminal.resize"
 	TypeControlOpen         = "control.open"
 	TypeControlInput        = "control.input"
+	TypeP2PGrant            = "p2p.grant"
+	TypeP2PSignal           = "p2p.signal"
 	TypeWorkerUpdateApply   = "worker.update.apply"
 	TypeWorkerUpdateResult  = "worker.update.result"
 	TypeError               = "error"
@@ -210,6 +217,8 @@ type TerminalOpen struct {
 	ResizePolicy  string          `json:"resize_policy,omitempty"`
 	TransportMode string          `json:"transport_mode,omitempty"`
 	RenderMode    string          `json:"render_mode,omitempty"`
+	ChannelMode   string          `json:"channel_mode,omitempty"`
+	GrantID       string          `json:"grant_id,omitempty"`
 }
 
 func NewTerminalOpen(size TerminalSize, target *TerminalTarget) TerminalOpen {
@@ -226,14 +235,43 @@ type TerminalOutput struct {
 }
 
 type TerminalMode struct {
-	Mode         string       `json:"mode"`
-	RenderMode   string       `json:"render_mode,omitempty"`
-	Capabilities []string     `json:"capabilities,omitempty"`
-	ResizePolicy string       `json:"resize_policy,omitempty"`
-	RemoteSize   TerminalSize `json:"remote_size,omitempty"`
-	ViewportSize TerminalSize `json:"viewport_size,omitempty"`
-	DefaultSize  TerminalSize `json:"default_size,omitempty"`
-	Fallback     string       `json:"fallback,omitempty"`
+	Mode           string       `json:"mode"`
+	RenderMode     string       `json:"render_mode,omitempty"`
+	Capabilities   []string     `json:"capabilities,omitempty"`
+	ResizePolicy   string       `json:"resize_policy,omitempty"`
+	RemoteSize     TerminalSize `json:"remote_size,omitempty"`
+	ViewportSize   TerminalSize `json:"viewport_size,omitempty"`
+	DefaultSize    TerminalSize `json:"default_size,omitempty"`
+	ChannelMode    string       `json:"channel_mode,omitempty"`
+	ChannelState   string       `json:"channel_state,omitempty"`
+	GrantID        string       `json:"grant_id,omitempty"`
+	Fallback       string       `json:"fallback,omitempty"`
+	FallbackReason string       `json:"fallback_reason,omitempty"`
+}
+
+type P2PGrant struct {
+	GrantID          string          `json:"grant_id"`
+	TenantID         string          `json:"tenant_id,omitempty"`
+	ControlID        string          `json:"control_id,omitempty"`
+	WorkerID         string          `json:"worker_id"`
+	SessionID        string          `json:"session_id"`
+	StreamID         string          `json:"stream_id"`
+	Target           *TerminalTarget `json:"target,omitempty"`
+	AllowedTransport string          `json:"allowed_transport"`
+	ExpiresAt        time.Time       `json:"expires_at"`
+	FallbackAfterMs  int             `json:"fallback_after_ms,omitempty"`
+	State            string          `json:"state,omitempty"`
+}
+
+type P2PSignal struct {
+	GrantID   string `json:"grant_id"`
+	From      string `json:"from,omitempty"`
+	To        string `json:"to,omitempty"`
+	Signal    string `json:"signal"`
+	State     string `json:"state,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Message   string `json:"message,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 type TerminalSnapshot struct {

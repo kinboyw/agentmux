@@ -40,6 +40,15 @@ body {
   overscroll-behavior: none;
 }
 
+.agentmux-app-root,
+.agentmux-session-window {
+  overscroll-behavior: none;
+}
+
+.agentmux-session-window {
+  touch-action: none;
+}
+
 @supports (height: 100dvh) {
   html,
   body,

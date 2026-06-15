@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,102 @@ func TestHandleVersion(t *testing.T) {
 	}
 	if _, ok := payload["compatibility"].(map[string]any); !ok {
 		t.Fatalf("compatibility payload missing: %#v", payload)
+	}
+}
+
+func TestHandleAuthOAuthConfiguredProviderReturnsAuthorizeURL(t *testing.T) {
+	server, err := NewWithOptions(ServerOptions{
+		Addr:      ":0",
+		PublicURL: "https://mux.example.com",
+		OAuth: map[string]oauthProviderConfig{
+			"github": {
+				ClientID:     "client-id",
+				ClientSecret: "client-secret",
+				AuthURL:      "https://github.example/authorize",
+				TokenURL:     "https://github.example/token",
+				UserURL:      "https://github.example/user",
+				Scopes:       []string{"read:user", "user:email"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/oauth/github?device_id=browser-1", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleAuthOAuth(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(payload.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	if query.Get("client_id") != "client-id" {
+		t.Fatalf("unexpected oauth url: %s", payload.URL)
+	}
+	if query.Get("redirect_uri") != "https://mux.example.com/api/auth/oauth/github/callback" {
+		t.Fatalf("unexpected redirect uri: %s", query.Get("redirect_uri"))
+	}
+	if query.Get("scope") != "read:user user:email" || query.Get("state") == "" {
+		t.Fatalf("missing scope or state: %s", payload.URL)
+	}
+}
+
+func TestExternalLoginDoesNotReusePasswordUserTenant(t *testing.T) {
+	store := newAuthStore()
+	passwordUser, err := store.Register(registerRequest{
+		Email: "user@example.com", Password: "password123", DeviceID: "browser-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalUser, err := store.LoginExternal(externalLoginRequest{
+		Provider: "google", Subject: "google-subject-1", Email: "user@example.com", Name: "User", DeviceID: "browser-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if externalUser.TenantID == passwordUser.TenantID {
+		t.Fatalf("oauth login reused password tenant: %s", externalUser.TenantID)
+	}
+	if externalUser.User.Email != "user@example.com" {
+		t.Fatalf("oauth login should expose display email, got %q", externalUser.User.Email)
+	}
+}
+
+func TestSQLiteExternalLoginDoesNotReusePasswordUserTenant(t *testing.T) {
+	store, err := OpenSQLiteAuthStore(filepath.Join(t.TempDir(), "agentmux.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	passwordUser, err := store.Register(registerRequest{
+		Email: "user@example.com", Password: "password123", DeviceID: "browser-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalUser, err := store.LoginExternal(externalLoginRequest{
+		Provider: "google", Subject: "google-subject-1", Email: "user@example.com", Name: "User", DeviceID: "browser-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if externalUser.TenantID == passwordUser.TenantID {
+		t.Fatalf("oauth login reused password tenant: %s", externalUser.TenantID)
+	}
+	if externalUser.User.Email != "user@example.com" {
+		t.Fatalf("oauth login should expose display email, got %q", externalUser.User.Email)
 	}
 }
 
@@ -1377,6 +1474,95 @@ func TestControlOpenForwardsInitialTerminalSize(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not receive terminal.open")
+	}
+}
+
+func TestControlOpenP2PPreferredIssuesGrantAndFallsBackToRelay(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 1),
+	}
+	server.registerWorker(worker)
+	control := &controlConn{id: "ctrl_test", send: make(chan protocol.Envelope, 4)}
+	payload, err := protocol.MarshalPayload(protocol.TerminalOpen{
+		Cols:        100,
+		Rows:        30,
+		ChannelMode: protocol.TerminalChannelP2PPreferred,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server.handleControlMessage(control, protocol.Envelope{
+		Type:      protocol.TypeControlOpen,
+		StreamID:  "stream-1",
+		SessionID: "local/demo",
+		Payload:   payload,
+	})
+
+	var open protocol.TerminalOpen
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeTerminalOpen {
+			t.Fatalf("unexpected worker envelope type: %s", env.Type)
+		}
+		if err := env.DecodePayload(&open); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive terminal.open")
+	}
+	if open.ChannelMode != protocol.TerminalChannelP2PPreferred || open.GrantID == "" {
+		t.Fatalf("expected p2p terminal.open with grant id, got %+v", open)
+	}
+
+	var grant protocol.P2PGrant
+	select {
+	case env := <-control.send:
+		if env.Type != protocol.TypeP2PGrant {
+			t.Fatalf("unexpected control envelope type: %s", env.Type)
+		}
+		if err := env.DecodePayload(&grant); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control did not receive p2p grant")
+	}
+	if grant.GrantID != open.GrantID || grant.WorkerID != "local" || grant.SessionID != "local/demo" || grant.StreamID != "stream-1" {
+		t.Fatalf("unexpected grant: %+v open=%+v", grant, open)
+	}
+
+	var firstSignal protocol.P2PSignal
+	select {
+	case env := <-control.send:
+		if env.Type != protocol.TypeP2PSignal {
+			t.Fatalf("unexpected first signal type: %s", env.Type)
+		}
+		if err := env.DecodePayload(&firstSignal); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control did not receive p2p signaling placeholder")
+	}
+	if firstSignal.Signal != "grant_issued" || firstSignal.GrantID != open.GrantID {
+		t.Fatalf("unexpected first signal: %+v", firstSignal)
+	}
+
+	var fallback protocol.P2PSignal
+	select {
+	case env := <-control.send:
+		if env.Type != protocol.TypeP2PSignal {
+			t.Fatalf("unexpected fallback signal type: %s", env.Type)
+		}
+		if err := env.DecodePayload(&fallback); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control did not receive p2p fallback signal")
+	}
+	if fallback.Signal != "fallback" || fallback.State != protocol.TerminalChannelP2PFallback || fallback.Reason != "p2p_signaling_not_implemented" {
+		t.Fatalf("unexpected fallback signal: %+v", fallback)
 	}
 }
 

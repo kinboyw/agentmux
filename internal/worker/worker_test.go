@@ -95,6 +95,43 @@ func TestEffectiveRenderModeNegotiatesWorkerStateXterm(t *testing.T) {
 	}
 }
 
+func TestTerminalModeWithChannelFallsBackForP2PPreferred(t *testing.T) {
+	mode := terminalModeWithChannel(protocol.TerminalMode{Mode: "state-bridge"}, protocol.TerminalOpen{
+		ChannelMode: protocol.TerminalChannelP2PPreferred,
+		GrantID:     "grant_test",
+	})
+	if mode.ChannelMode != protocol.TerminalChannelP2PPreferred {
+		t.Fatalf("unexpected channel mode: %+v", mode)
+	}
+	if mode.ChannelState != protocol.TerminalChannelP2PFallback {
+		t.Fatalf("expected relay fallback, got %+v", mode)
+	}
+	if mode.GrantID != "grant_test" {
+		t.Fatalf("expected grant id to be preserved, got %+v", mode)
+	}
+	if mode.FallbackReason != "p2p_signaling_not_implemented" || mode.Fallback == "" {
+		t.Fatalf("expected explicit fallback reason, got %+v", mode)
+	}
+
+	mode = terminalModeWithChannel(protocol.TerminalMode{Mode: "state-bridge"}, protocol.TerminalOpen{})
+	if mode.ChannelMode != protocol.TerminalChannelRelay || mode.ChannelState != protocol.TerminalChannelRelay {
+		t.Fatalf("default channel should be relay, got %+v", mode)
+	}
+}
+
+func TestInitialRemoteSizeUsesControlViewport(t *testing.T) {
+	w := New("https://hub.test", "token", "worker", "worker", nilBackend{}, nil)
+	w.StateSize = protocol.TerminalSize{Cols: 120, Rows: 36}
+	got := w.initialRemoteSize(protocol.TerminalSize{Cols: 101, Rows: 27}, "state-bridge")
+	if got.Cols != 101 || got.Rows != 27 {
+		t.Fatalf("expected control viewport size, got %+v", got)
+	}
+	got = w.initialRemoteSize(protocol.TerminalSize{}, "state-bridge")
+	if got.Cols != 120 || got.Rows != 36 {
+		t.Fatalf("expected worker default fallback, got %+v", got)
+	}
+}
+
 func TestTerminalHistoryPageUsesLimitAndBeforeSeq(t *testing.T) {
 	w := New("https://hub.test", "token", "worker", "worker", nilBackend{}, nil)
 	sessionID := protocol.SessionID("worker", "demo")

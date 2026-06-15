@@ -757,14 +757,11 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 	mode := w.effectiveTerminalMode(open)
 	renderMode := w.effectiveRenderMode(open, mode)
 	sendCells := renderMode == protocol.RenderModeWorkerStateXterm && terminalOpenRequestsCapability(open, "terminal.cells.v1")
-	remoteSize := size
-	if mode != "attach" {
-		remoteSize = w.defaultStateSize()
-	}
-	w.sendTerminalMode(conn, streamID, sessionID, protocol.TerminalMode{
+	remoteSize := w.initialRemoteSize(size, mode)
+	w.sendTerminalMode(conn, streamID, sessionID, terminalModeWithChannel(protocol.TerminalMode{
 		Mode: mode, RenderMode: renderMode, Capabilities: w.terminalModeCapabilities(mode, renderMode, sendCells), ResizePolicy: w.resizePolicyForMode(mode),
 		RemoteSize: remoteSize, ViewportSize: size, DefaultSize: w.defaultStateSize(),
-	})
+	}, open))
 	if mode != "attach" && terminalOpenRequestsCapability(open, "terminal.snapshot.v1") {
 		w.sendTerminalSnapshot(ctx, conn, streamID, sessionID, name, remoteSize, open.Target)
 	}
@@ -855,12 +852,18 @@ func (w *Worker) sendTerminalSnapshot(ctx context.Context, conn *ws.Conn, stream
 	var data string
 	var err error
 	if target != nil && target.PaneID != "" {
-		backend, ok := w.Backend.(sessionbackend.TargetCaptureBackend)
-		if !ok {
-			err = fmt.Errorf("worker backend %s does not support pane target snapshot", w.Backend.Name())
+		screenBackend, screenOK := w.Backend.(sessionbackend.TargetScreenCaptureBackend)
+		if screenOK {
+			scope = "pane_screen"
+			data, err = screenBackend.CaptureTargetScreen(ctx, sessionBackendTarget(name, target))
 		} else {
-			scope = "pane"
-			data, err = backend.CaptureTarget(ctx, sessionBackendTarget(name, target), lines)
+			backend, ok := w.Backend.(sessionbackend.TargetCaptureBackend)
+			if !ok {
+				err = fmt.Errorf("worker backend %s does not support pane target snapshot", w.Backend.Name())
+			} else {
+				scope = "pane"
+				data, err = backend.CaptureTarget(ctx, sessionBackendTarget(name, target), lines)
+			}
 		}
 	} else {
 		data, err = w.Backend.Capture(ctx, name, lines)
@@ -1276,6 +1279,13 @@ func (w *Worker) resizePolicyForMode(mode string) string {
 	return "worker_state"
 }
 
+func (w *Worker) initialRemoteSize(size protocol.TerminalSize, mode string) protocol.TerminalSize {
+	if size.Cols > 0 && size.Rows > 0 {
+		return size
+	}
+	return w.defaultStateSize()
+}
+
 func (w *Worker) terminalModeCapabilities(mode, renderMode string, includeCells bool) []string {
 	if mode == "attach" {
 		return []string{"terminal.open", "terminal.resize", "terminal.render.live_attach_xterm.v1"}
@@ -1378,6 +1388,31 @@ func (w *Worker) sendTerminalMode(conn *ws.Conn, streamID, sessionID string, mod
 	if err := writeEnvelope(conn, env); err != nil {
 		w.Logger.Debug("terminal mode write failed", "session_id", sessionID, "stream_id", streamID, "mode", mode.Mode, "error", err)
 	}
+}
+
+func terminalModeWithChannel(mode protocol.TerminalMode, open protocol.TerminalOpen) protocol.TerminalMode {
+	requested := strings.ToLower(strings.TrimSpace(open.ChannelMode))
+	mode.GrantID = strings.TrimSpace(open.GrantID)
+	switch requested {
+	case "", protocol.TerminalChannelRelay:
+		mode.ChannelMode = protocol.TerminalChannelRelay
+		mode.ChannelState = protocol.TerminalChannelRelay
+	case "p2p", protocol.TerminalChannelP2PPreferred:
+		mode.ChannelMode = protocol.TerminalChannelP2PPreferred
+		mode.ChannelState = protocol.TerminalChannelP2PFallback
+		mode.Fallback = "P2P direct transport is not enabled yet; using Hub relay."
+		if mode.GrantID != "" {
+			mode.FallbackReason = "p2p_signaling_not_implemented"
+		} else {
+			mode.FallbackReason = "p2p_not_implemented"
+		}
+	default:
+		mode.ChannelMode = protocol.TerminalChannelRelay
+		mode.ChannelState = protocol.TerminalChannelP2PFallback
+		mode.Fallback = fmt.Sprintf("unsupported channel mode %q; using Hub relay", requested)
+		mode.FallbackReason = "unsupported_channel_mode"
+	}
+	return mode
 }
 
 func terminalOpenRequestsCapability(open protocol.TerminalOpen, capability string) bool {

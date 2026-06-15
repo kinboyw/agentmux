@@ -615,6 +615,49 @@ func (s *sqliteAuthStore) Login(req loginRequest) (authCredentialResponse, error
 	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
 }
 
+func (s *sqliteAuthStore) LoginExternal(req externalLoginRequest) (authCredentialResponse, error) {
+	email := normalizeEmail(req.Email)
+	if email == "" {
+		return authCredentialResponse{}, fmt.Errorf("verified email is required")
+	}
+	userKey := externalUserKey(req.Provider, req.Subject, email)
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = email
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.cleanupLocked(now); err != nil {
+		return authCredentialResponse{}, err
+	}
+	user, ok, err := s.userByEmail(userKey)
+	if err != nil {
+		return authCredentialResponse{}, err
+	}
+	if !ok {
+		user = userEntry{
+			ID: "usr_" + randomID(), TenantID: "tenant_" + randomID(), Email: userKey,
+			DisplayEmail: email, Name: name, CreatedAt: now,
+		}
+		_, err = s.db.Exec(
+			`INSERT INTO users(email, id, tenant_id, name, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			user.Email, user.ID, user.TenantID, user.Name, "", "", formatTime(user.CreatedAt),
+		)
+		if err != nil {
+			return authCredentialResponse{}, err
+		}
+	} else if user.Name == "" || user.Name == user.Email {
+		user.Name = name
+		user.DisplayEmail = email
+		if _, err := s.db.Exec(`UPDATE users SET name = ? WHERE email = ?`, user.Name, user.Email); err != nil {
+			return authCredentialResponse{}, err
+		}
+	}
+	user.DisplayEmail = email
+	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
+}
+
 func (s *sqliteAuthStore) Refresh(req refreshRequest) (authCredentialResponse, error) {
 	if req.RefreshToken == "" {
 		return authCredentialResponse{}, fmt.Errorf("refresh token is required")
@@ -840,7 +883,7 @@ func (s *sqliteAuthStore) PollDeviceAuth(req devicePollRequest) (devicePollRespo
 		Role: credential.Role, DeviceID: credential.DeviceID, ExpiresAt: credential.ExpiresAt,
 		Scopes: append([]string(nil), credential.Scopes...), RefreshToken: device.RefreshToken,
 		RefreshExpiresAt: refresh.ExpiresAt,
-		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: userDisplayEmail(user), Name: user.Name},
 	}
 	_, _ = s.db.Exec(`DELETE FROM device_auth_sessions WHERE device_code_hash = ?`, device.DeviceCodeHash)
 	return devicePollResponse{Status: "approved", Credential: &response}, nil
@@ -862,6 +905,20 @@ func (s *sqliteAuthStore) DeviceAuthInfo(userCode string) (deviceAuthInfo, bool)
 		return deviceAuthInfo{}, false
 	}
 	return deviceInfoFromEntry(device), true
+}
+
+func (s *sqliteAuthStore) UserView(email string) (authUserView, bool) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return authUserView{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok, err := s.userByEmail(email)
+	if err != nil || !ok {
+		return authUserView{}, false
+	}
+	return authUserView{ID: user.ID, TenantID: user.TenantID, Email: userDisplayEmail(user), Name: user.Name}, true
 }
 
 func (s *sqliteAuthStore) Credential(token string) (credentialEntry, bool) {
@@ -937,7 +994,7 @@ func (s *sqliteAuthStore) issueControlCredentialLocked(user userEntry, deviceID,
 		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
 		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
 		RefreshExpiresAt: refresh.ExpiresAt,
-		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: userDisplayEmail(user), Name: user.Name},
 	}, nil
 }
 

@@ -1,7 +1,6 @@
 package tmux
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -654,11 +653,7 @@ func (a Adapter) OpenTarget(ctx context.Context, target sessionbackend.TerminalT
 	if err := validateTmuxPaneID(target.PaneID); err != nil {
 		return nil, err
 	}
-	initial, err := a.capturePaneScrollback(ctx, target.PaneID, rows)
-	if err != nil {
-		return nil, err
-	}
-	stream, err := a.openPanePipe(ctx, target.PaneID, initial)
+	stream, err := a.openPanePipe(ctx, target.PaneID)
 	if err != nil {
 		return nil, err
 	}
@@ -678,6 +673,20 @@ func (a Adapter) CaptureTarget(ctx context.Context, target sessionbackend.Termin
 	return a.capturePaneScrollback(ctx, target.PaneID, lines)
 }
 
+func (a Adapter) CaptureTargetScreen(ctx context.Context, target sessionbackend.TerminalTarget) (string, error) {
+	if target.PaneID == "" {
+		return a.Capture(ctx, target.SessionName, target.Height)
+	}
+	if err := validateTmuxPaneID(target.PaneID); err != nil {
+		return "", err
+	}
+	output, err := a.Runner.Run(ctx, "tmux", "capture-pane", "-t", target.PaneID, "-p", "-e", "-S", "0", "-E", "-")
+	if err != nil {
+		return "", fmt.Errorf("tmux capture-pane screen: %w", err)
+	}
+	return output, nil
+}
+
 func validateTmuxPaneID(value string) error {
 	if !strings.HasPrefix(value, "%") || len(value) < 2 {
 		return fmt.Errorf("invalid tmux pane id %q", value)
@@ -690,7 +699,7 @@ func validateTmuxPaneID(value string) error {
 	return nil
 }
 
-func (a Adapter) openPanePipe(ctx context.Context, paneID, initial string) (sessionbackend.Stream, error) {
+func (a Adapter) openPanePipe(ctx context.Context, paneID string) (sessionbackend.Stream, error) {
 	dir, err := os.MkdirTemp("", "agentmux-tmux-pane-*")
 	if err != nil {
 		return nil, err
@@ -701,7 +710,7 @@ func (a Adapter) openPanePipe(ctx context.Context, paneID, initial string) (sess
 		return nil, fmt.Errorf("tmux pane fifo: %w", err)
 	}
 	command := "cat > " + shellQuote(fifo)
-	if _, err := a.Runner.Run(ctx, "tmux", "pipe-pane", "-o", "-t", paneID, command); err != nil {
+	if _, err := a.Runner.Run(ctx, "tmux", "pipe-pane", "-t", paneID, command); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("tmux pipe-pane: %w", err)
 	}
@@ -711,17 +720,12 @@ func (a Adapter) openPanePipe(ctx context.Context, paneID, initial string) (sess
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("tmux pane fifo open: %w", err)
 	}
-	prefix := "\x1b[2J\x1b[H" + initial
-	if prefix != "" && !strings.HasSuffix(prefix, "\n") {
-		prefix += "\n"
-	}
 	return &panePipeStream{
-		ctx:     ctx,
-		runner:  a.Runner,
-		paneID:  paneID,
-		dir:     dir,
-		file:    file,
-		initial: bytes.NewReader([]byte(prefix)),
+		ctx:    ctx,
+		runner: a.Runner,
+		paneID: paneID,
+		dir:    dir,
+		file:   file,
 	}, nil
 }
 
@@ -731,14 +735,10 @@ type panePipeStream struct {
 	paneID    string
 	dir       string
 	file      *os.File
-	initial   *bytes.Reader
 	closeOnce sync.Once
 }
 
 func (s *panePipeStream) Read(p []byte) (int, error) {
-	if s.initial != nil && s.initial.Len() > 0 {
-		return s.initial.Read(p)
-	}
 	if s.file == nil {
 		return 0, os.ErrClosed
 	}

@@ -264,6 +264,52 @@ func TestCaptureFallsBackToPaneScrollbackWhenGeometryFails(t *testing.T) {
 	}
 }
 
+func TestOpenTargetTakesOverPanePipe(t *testing.T) {
+	calls := []string(nil)
+	runner := fakeRunnerFunc(func(_ context.Context, _ string, args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "", nil
+	})
+	adapter := New(runner)
+	stream, err := adapter.OpenTarget(context.Background(), sessionbackend.TerminalTarget{SessionName: "demo", PaneID: "%1"}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream == nil {
+		t.Fatal("expected pane stream")
+	}
+	defer stream.Close()
+
+	if len(calls) != 1 {
+		t.Fatalf("expected one pipe-pane call, got %d: %v", len(calls), calls)
+	}
+	got := calls[0]
+	if !strings.HasPrefix(got, "pipe-pane -t %1 cat > ") {
+		t.Fatalf("unexpected pipe-pane call: %s", got)
+	}
+	if strings.Contains(got, " -o ") || strings.HasPrefix(got, "pipe-pane -o ") {
+		t.Fatalf("pane attach should take over output pipe, got: %s", got)
+	}
+}
+
+func TestCaptureTargetScreenUsesVisiblePaneOnly(t *testing.T) {
+	runner := fakeRunnerFunc(func(_ context.Context, _ string, args ...string) (string, error) {
+		got := strings.Join(args, " ")
+		if got != "capture-pane -t %1 -p -e -S 0 -E -" {
+			return "", fmt.Errorf("unexpected call: %s", got)
+		}
+		return "visible\nprompt $", nil
+	})
+	adapter := New(runner)
+	output, err := adapter.CaptureTargetScreen(context.Background(), sessionbackend.TerminalTarget{SessionName: "demo", PaneID: "%1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != "visible\nprompt $" {
+		t.Fatalf("unexpected output: %q", output)
+	}
+}
+
 func TestTargetsParsesSessionWindowsAndPanes(t *testing.T) {
 	runner := fakeRunnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
 		got := strings.Join(args, " ")

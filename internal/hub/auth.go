@@ -41,12 +41,14 @@ type AuthStore interface {
 	Exchange(req exchangeRequest) (exchangedCredential, error)
 	Register(req registerRequest) (authCredentialResponse, error)
 	Login(req loginRequest) (authCredentialResponse, error)
+	LoginExternal(req externalLoginRequest) (authCredentialResponse, error)
 	Refresh(req refreshRequest) (authCredentialResponse, error)
 	StartDeviceAuth(req deviceStartRequest) (deviceStartResponse, error)
 	ApproveDeviceAuth(req deviceApproveRequest) (authCredentialResponse, error)
 	ApproveDeviceAuthForUser(userEmail, userCode string) (authCredentialResponse, error)
 	PollDeviceAuth(req devicePollRequest) (devicePollResponse, error)
 	DeviceAuthInfo(userCode string) (deviceAuthInfo, bool)
+	UserView(email string) (authUserView, bool)
 	Credential(token string) (credentialEntry, bool)
 	HasActiveControlCredential(tenantID string, now time.Time) bool
 }
@@ -103,6 +105,7 @@ type userEntry struct {
 	ID           string
 	TenantID     string
 	Email        string
+	DisplayEmail string
 	Name         string
 	PasswordSalt string
 	PasswordHash string
@@ -178,6 +181,15 @@ type registerRequest struct {
 type loginRequest struct {
 	Email      string `json:"email"`
 	Password   string `json:"password"`
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+}
+
+type externalLoginRequest struct {
+	Provider   string `json:"provider"`
+	Subject    string `json:"subject"`
+	Email      string `json:"email"`
+	Name       string `json:"name"`
 	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
 }
@@ -399,6 +411,35 @@ func (s *authStore) Login(req loginRequest) (authCredentialResponse, error) {
 	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
 }
 
+func (s *authStore) LoginExternal(req externalLoginRequest) (authCredentialResponse, error) {
+	email := normalizeEmail(req.Email)
+	if email == "" {
+		return authCredentialResponse{}, fmt.Errorf("verified email is required")
+	}
+	userKey := externalUserKey(req.Provider, req.Subject, email)
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = email
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	user, ok := s.users[userKey]
+	if !ok {
+		user = userEntry{
+			ID: "usr_" + randomID(), TenantID: "tenant_" + randomID(), Email: userKey,
+			DisplayEmail: email, Name: name, CreatedAt: now,
+		}
+		s.users[userKey] = user
+	} else if user.Name == "" || user.Name == user.Email {
+		user.Name = name
+		user.DisplayEmail = email
+		s.users[userKey] = user
+	}
+	return s.issueControlCredentialLocked(user, req.DeviceID, req.DeviceName, now)
+}
+
 func (s *authStore) Refresh(req refreshRequest) (authCredentialResponse, error) {
 	if req.RefreshToken == "" {
 		return authCredentialResponse{}, fmt.Errorf("refresh token is required")
@@ -593,7 +634,7 @@ func (s *authStore) PollDeviceAuth(req devicePollRequest) (devicePollResponse, e
 		Role: credential.Role, DeviceID: credential.DeviceID, ExpiresAt: credential.ExpiresAt,
 		Scopes: append([]string(nil), credential.Scopes...), RefreshToken: device.RefreshToken,
 		RefreshExpiresAt: refresh.ExpiresAt,
-		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: userDisplayEmail(user), Name: user.Name},
 	}
 	delete(s.devices, tokenHash(req.DeviceCode))
 	return devicePollResponse{Status: "approved", Credential: &response}, nil
@@ -614,6 +655,20 @@ func (s *authStore) DeviceAuthInfo(userCode string) (deviceAuthInfo, bool) {
 		}
 	}
 	return deviceAuthInfo{}, false
+}
+
+func (s *authStore) UserView(email string) (authUserView, bool) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return authUserView{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[email]
+	if !ok {
+		return authUserView{}, false
+	}
+	return authUserView{ID: user.ID, TenantID: user.TenantID, Email: userDisplayEmail(user), Name: user.Name}, true
 }
 
 func (s *authStore) issueControlCredentialLocked(user userEntry, deviceID, deviceName string, now time.Time) (authCredentialResponse, error) {
@@ -647,7 +702,7 @@ func (s *authStore) issueControlCredentialLocked(user userEntry, deviceID, devic
 		Role: entry.Role, DeviceID: entry.DeviceID, ExpiresAt: entry.ExpiresAt,
 		Scopes: append([]string(nil), entry.Scopes...), RefreshToken: refreshToken,
 		RefreshExpiresAt: refresh.ExpiresAt,
-		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: user.Email, Name: user.Name},
+		User:             authUserView{ID: user.ID, TenantID: user.TenantID, Email: userDisplayEmail(user), Name: user.Name},
 	}, nil
 }
 
@@ -841,6 +896,22 @@ func shellQuote(value string) string {
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func externalUserKey(provider, subject, email string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		subject = normalizeEmail(email)
+	}
+	return "oauth:" + provider + ":" + subject
+}
+
+func userDisplayEmail(user userEntry) string {
+	if user.DisplayEmail != "" {
+		return user.DisplayEmail
+	}
+	return user.Email
 }
 
 func normalizeUserCode(code string) string {

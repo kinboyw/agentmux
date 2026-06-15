@@ -11,10 +11,12 @@ Cloudflare Tunnel or another reverse proxy.
 Install a release binary into `/usr/local/bin/agentmux`, then create config:
 
 ```bash
-sudo useradd --system --home /var/lib/agentmux --shell /usr/sbin/nologin agentmux
+sudo groupadd --system agentmux
+sudo useradd --system --home /var/lib/agentmux --shell /usr/sbin/nologin --gid agentmux agentmux
 sudo install -d -o agentmux -g agentmux /var/lib/agentmux
 sudo install -d /etc/agentmux
 sudo install -m 0640 deploy/systemd/agentmux.env.example /etc/agentmux/agentmux.env
+sudo chown root:agentmux /etc/agentmux/agentmux.env
 sudo install -m 0644 deploy/systemd/agentmux.service /etc/systemd/system/agentmux.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now agentmux
@@ -25,8 +27,22 @@ edit `/etc/agentmux/agentmux.env`:
 
 ```text
 AGENTMUX_TOKEN=change-me-long-random-admin-token
+AGENTMUX_ADDR=127.0.0.1:8080
 AGENTMUX_PUBLIC_URL=https://hub.example.com
 AGENTMUX_DATA=/var/lib/agentmux/agentmux.db
+AGENTMUX_RELEASE_REPO=kinboyw/agentmux
+AGENTMUX_OAUTH_GITHUB_CLIENT_ID=
+AGENTMUX_OAUTH_GITHUB_CLIENT_SECRET=
+AGENTMUX_OAUTH_GOOGLE_CLIENT_ID=
+AGENTMUX_OAUTH_GOOGLE_CLIENT_SECRET=
+```
+
+Optional Google/GitHub login is enabled when the matching client id and secret
+are set. Configure OAuth app callback URLs as:
+
+```text
+https://hub.example.com/api/auth/oauth/github/callback
+https://hub.example.com/api/auth/oauth/google/callback
 ```
 
 Named tunnel setup:
@@ -117,6 +133,7 @@ The Hub serves:
 
 ```text
 GET /install.sh
+GET /deploy-hub.sh
 ```
 
 The landing page uses it for one-line worker/control commands:
@@ -125,6 +142,29 @@ The landing page uses it for one-line worker/control commands:
 curl -fsSL https://hub.example.com/install.sh | sh -s -- worker --join 'amx_sig_...' --name "$(hostname)"
 curl -fsSL https://hub.example.com/install.sh | sh -s -- control
 ```
+
+For a Linux/systemd self-hosted Hub, use the deployment script:
+
+```bash
+curl -fsSL https://hub.example.com/deploy-hub.sh | sh
+```
+
+Typical production override:
+
+```bash
+AGENTMUX_PUBLIC_URL=https://hub.example.com \
+AGENTMUX_ADDR=127.0.0.1:8081 \
+curl -fsSL https://hub.example.com/deploy-hub.sh | sh
+```
+
+The script installs `agentmux-hub`, writes `/etc/agentmux/agentmux.env`,
+creates `agentmux.service`, enables it, and starts the Hub. It supports
+`AGENTMUX_REPO`, `AGENTMUX_VERSION`, `AGENTMUX_PUBLIC_URL`, `AGENTMUX_ADDR`,
+`AGENTMUX_DATA`, `AGENTMUX_TOKEN`, `AGENTMUX_HUB_BIN`, and
+`AGENTMUX_SERVICE`. `AGENTMUX_HEALTH_URL` can override the post-start health
+check URL. The script also creates the configured system user/group, fixes
+ownership for the data directory and env file, and runs a local `/health` check
+after systemd starts the service.
 
 By default the script downloads release assets from:
 

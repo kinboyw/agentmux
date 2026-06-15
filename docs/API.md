@@ -60,6 +60,28 @@ with fallback to older `agentmux-control-*` and legacy `agentmux-*` assets.
 Hub-only Windows artifacts are published separately as
 `agentmux-hub-windows-amd64.tar.gz`.
 
+### `GET /deploy-hub.sh`
+
+Serves a Linux/systemd self-host deployment script for Hub:
+
+```bash
+curl -fsSL https://hub.example.com/deploy-hub.sh | sh
+```
+
+Common overrides:
+
+```bash
+AGENTMUX_PUBLIC_URL=https://hub.example.com \
+AGENTMUX_ADDR=127.0.0.1:8081 \
+AGENTMUX_DATA=/var/lib/agentmux/agentmux.db \
+curl -fsSL https://hub.example.com/deploy-hub.sh | sh
+```
+
+The script downloads and verifies the `agentmux-hub-linux-${arch}` release
+archive, installs the binary, writes `/etc/agentmux/agentmux.env`, creates a
+systemd unit, creates the configured system user/group, fixes data/env
+ownership, starts `agentmux.service`, and checks `/health`.
+
 ### `GET /run.sh`
 
 Serves an `npx`-style cached runner. It downloads and verifies a release asset

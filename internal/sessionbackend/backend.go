@@ -58,6 +58,10 @@ type TargetCaptureBackend interface {
 	CaptureTarget(ctx context.Context, target TerminalTarget, lines int) (string, error)
 }
 
+type TargetScreenCaptureBackend interface {
+	CaptureTargetScreen(ctx context.Context, target TerminalTarget) (string, error)
+}
+
 func ValidateSessionName(name string) error {
 	if !sessionNamePattern.MatchString(name) {
 		return fmt.Errorf("invalid session name %q", name)

@@ -16,6 +16,11 @@ The core invariant remains:
 > Workers own local tmux/PTY state. Hub coordinates identity, discovery, routing,
 > and policy. Control renders and operates sessions.
 
+Terminal access is the first runtime capability, not the only one. The same
+Hub, Worker, and Control model can later manage adjacent agent-runtime concerns
+such as AI API gateway policy and local agent configuration, because those
+concerns share the same tenant, device, audit, and enforcement boundaries.
+
 ![AgentMux system architecture](assets/visuals/agentmux-1-system-architecture-v1.png)
 
 ## Roles
@@ -32,6 +37,7 @@ Hub is the product entrypoint.
 - WebSocket routing.
 - Optional terminal-state service for Plan B.
 - Deployment command generator.
+- Future AI gateway and agent configuration control plane.
 
 Hub should be deployable behind a reverse proxy with HTTPS/WSS. Later it can
 serve TLS directly.
@@ -61,6 +67,9 @@ Worker is an outbound connector.
 - Keeps an outbound Hub control channel for enrollment, signaling, policy, and
   revocation. Terminal streams should prefer direct P2P transport and fall back
   to Hub relay when direct negotiation is unavailable or fails.
+- Applies Hub-issued runtime configuration for local agent tools, including AI
+  provider routing, environment variables, config files, and local gateway
+  endpoints.
 
 ### Control
 
@@ -69,6 +78,8 @@ Control is the user-facing client. It should have multiple implementations:
 - Go CLI for debugging and emergency access.
 - Web control as the main product surface.
 - Future native/mobile control clients if useful.
+- Future admin surfaces for AI gateway keys, model routing, quotas, and
+  Worker-side configuration rollout.
 
 The browser control should become the primary user experience because it can
 render with xterm.js and place UI outside the terminal buffer.
@@ -238,10 +249,12 @@ POST /api/auth/device/start
 POST /api/auth/device/poll
 POST /api/auth/device/approve
 GET  /api/auth/oauth/{github|google}
+GET  /api/auth/oauth/{github|google}/callback
 ```
 
-Register/login issue control credentials for the user's tenant. OAuth routes are
-kept as stable frontend integration points before provider configuration lands.
+Register/login and OAuth callbacks issue control credentials for the user's
+tenant. Google and GitHub OAuth are enabled by provider client id/secret
+environment variables on Hub.
 
 ## Control-Worker P2P Direction
 
@@ -361,6 +374,108 @@ Required effect:
 The important product invariant is that losing a Direct Token should not create
 an immortal anonymous Worker. Hub must always have a way to revoke or interrupt
 both relay and direct P2P paths.
+
+## AI Gateway And Agent Configuration Direction
+
+AgentMux can grow from a terminal control plane into an agent runtime control
+plane. Two adjacent capabilities fit the existing architecture:
+
+- AI API gateway: a Hub-managed proxy layer similar in spirit to sub2api-style
+  services, with provider keys, model aliases, routing policy, usage accounting,
+  and audit events.
+- Agent config switching: a Hub-managed configuration layer similar in spirit to
+  cc-switch, but distributed across registered Workers instead of being a
+  single-machine tool.
+
+The goal is not to couple AgentMux to one AI vendor, editor, or agent. The goal
+is to give the operator one place to manage runtime policy for machines that
+already trust AgentMux Worker.
+
+### Gateway Model
+
+The AI gateway should be a separate capability, not part of the terminal stream.
+Hub owns configuration and policy; the gateway data plane can be deployed in
+more than one shape:
+
+```text
+agent process -> local Worker gateway -> upstream AI provider
+agent process -> Hub gateway endpoint   -> upstream AI provider
+agent process -> external gateway       -> Hub-managed config/policy
+```
+
+Recommended progression:
+
+1. Hub stores provider definitions, model aliases, routing rules, and redacted
+   secrets.
+2. Control manages those resources with tenant-scoped RBAC and audit logs.
+3. Worker receives an effective gateway config over the existing control
+   channel.
+4. Worker exposes a local OpenAI-compatible endpoint, for example
+   `127.0.0.1:<port>/v1`, and injects `OPENAI_BASE_URL`/`OPENAI_API_KEY` into
+   managed sessions.
+5. Hub aggregates usage and health reported by Workers.
+6. Optional Hub-hosted gateway mode can proxy traffic centrally when local
+   gateways are not desirable.
+
+Keeping a local Worker gateway as the first implementation has pragmatic
+benefits:
+
+- agent traffic does not have to hairpin through Hub;
+- existing terminal/session ownership maps naturally to local env injection;
+- per-machine network constraints and provider endpoints can differ;
+- Hub remains the source of truth for policy without becoming a mandatory
+  high-throughput LLM proxy.
+
+### Config Switching Model
+
+cc-switch-style behavior should become a managed Worker capability:
+
+```text
+Control -> Hub: update config profile / rollout rule
+Hub -> Worker: config.apply(profile, revision)
+Worker: validate, stage, write local config, reload affected sessions if allowed
+Worker -> Hub: config.applied / failed with logs
+```
+
+Profiles should be explicit and revisioned:
+
+- provider profile: base URLs, model aliases, default model, fallback model;
+- secret reference: never expose raw provider secrets to Direct Token controls;
+- environment profile: variables injected into new sessions;
+- file profile: generated files such as Claude/Codex config fragments;
+- rollout rule: target Workers, labels, workspaces, or sessions;
+- reload policy: new sessions only, restart Worker-managed process, or manual.
+
+Worker-side apply must be conservative:
+
+- validate config before writing;
+- write atomically with backup and rollback metadata;
+- report exact file paths and revision IDs, but redact secret values;
+- never mutate unrelated user files outside configured roots;
+- avoid restarting long-running sessions unless the operator explicitly chooses
+  that policy.
+
+### Security And Product Boundaries
+
+AI gateway and config switching are higher-risk than terminal attach because
+they manage secrets and agent behavior. They should require registered Control
+credentials, not anonymous Direct Tokens.
+
+Minimum boundaries:
+
+- tenant-scoped provider secrets encrypted at rest or stored via an external
+  secret backend;
+- audit events for create/update/delete/apply/revoke;
+- Worker capability flags such as `ai.gateway.local.v1` and
+  `agent.config.apply.v1`;
+- Worker labels and policy filters before rollout;
+- dry-run/preview diff in Control before applying config;
+- emergency revoke that disables a profile and interrupts affected local
+  gateway credentials.
+
+This should remain additive to terminal control. A Worker that does not
+advertise AI gateway/config capabilities should continue to work as a terminal
+Worker.
 
 ### Signal Exchange
 

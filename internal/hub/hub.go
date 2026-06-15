@@ -2,7 +2,10 @@ package hub
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +32,8 @@ const (
 	wsPongWait               = 45 * time.Second
 	sessionAuxRequestWait    = 8 * time.Second
 	sessionCreateRequestWait = 5 * time.Second
+	p2pGrantTTL              = 30 * time.Second
+	p2pFallbackAfter         = 1500 * time.Millisecond
 )
 
 //go:embed webdist docassets
@@ -54,6 +60,17 @@ type Server struct {
 	auth        AuthStore
 	runtime     RuntimeStore
 	rateLimiter *rateLimiter
+	oauth       map[string]oauthProviderConfig
+}
+
+type oauthProviderConfig struct {
+	Provider     string
+	ClientID     string
+	ClientSecret string
+	AuthURL      string
+	TokenURL     string
+	UserURL      string
+	Scopes       []string
 }
 
 type workerConn struct {
@@ -199,6 +216,7 @@ type ServerOptions struct {
 	Logger       *slog.Logger
 	AuthStore    AuthStore
 	RuntimeStore RuntimeStore
+	OAuth        map[string]oauthProviderConfig
 }
 
 func NewWithOptions(options ServerOptions) (*Server, error) {
@@ -227,6 +245,7 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		auth:        auth,
 		runtime:     runtime,
 		rateLimiter: newRateLimiter(10, time.Minute),
+		oauth:       defaultOAuthProviders(options.OAuth),
 	}
 	if err := server.loadRuntimeState(); err != nil {
 		return nil, err
@@ -249,6 +268,52 @@ func defaultRuntimeStore(store RuntimeStore, auth AuthStore) RuntimeStore {
 		return runtime
 	}
 	return newMemoryRuntimeStore()
+}
+
+func defaultOAuthProviders(configured map[string]oauthProviderConfig) map[string]oauthProviderConfig {
+	providers := map[string]oauthProviderConfig{}
+	if configured != nil {
+		for name, config := range configured {
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name == "" {
+				continue
+			}
+			config.Provider = name
+			if oauthProviderConfigured(config) {
+				providers[name] = config
+			}
+		}
+	}
+	for _, config := range []oauthProviderConfig{
+		{
+			Provider:     "github",
+			ClientID:     strings.TrimSpace(os.Getenv("AGENTMUX_OAUTH_GITHUB_CLIENT_ID")),
+			ClientSecret: strings.TrimSpace(os.Getenv("AGENTMUX_OAUTH_GITHUB_CLIENT_SECRET")),
+			AuthURL:      "https://github.com/login/oauth/authorize",
+			TokenURL:     "https://github.com/login/oauth/access_token",
+			UserURL:      "https://api.github.com/user",
+			Scopes:       []string{"read:user", "user:email"},
+		},
+		{
+			Provider:     "google",
+			ClientID:     strings.TrimSpace(os.Getenv("AGENTMUX_OAUTH_GOOGLE_CLIENT_ID")),
+			ClientSecret: strings.TrimSpace(os.Getenv("AGENTMUX_OAUTH_GOOGLE_CLIENT_SECRET")),
+			AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+			TokenURL:     "https://oauth2.googleapis.com/token",
+			UserURL:      "https://openidconnect.googleapis.com/v1/userinfo",
+			Scopes:       []string{"openid", "email", "profile"},
+		},
+	} {
+		if _, exists := providers[config.Provider]; !exists && oauthProviderConfigured(config) {
+			providers[config.Provider] = config
+		}
+	}
+	return providers
+}
+
+func oauthProviderConfigured(config oauthProviderConfig) bool {
+	return strings.TrimSpace(config.ClientID) != "" && strings.TrimSpace(config.ClientSecret) != "" &&
+		strings.TrimSpace(config.AuthURL) != "" && strings.TrimSpace(config.TokenURL) != "" && strings.TrimSpace(config.UserURL) != ""
 }
 
 func (s *Server) loadRuntimeState() error {
@@ -329,6 +394,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/", s.handleLanding)
 	mux.HandleFunc("/agentmux-mark.svg", s.handleRootAsset)
 	mux.HandleFunc("/install.sh", s.handleInstallScript)
+	mux.HandleFunc("/deploy-hub.sh", s.handleDeployHubScript)
 	mux.HandleFunc("/run.sh", s.handleRunScript)
 	mux.HandleFunc("/device", s.handleDevicePage)
 	mux.HandleFunc("/control", s.handleControlPage)
@@ -529,6 +595,8 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 			"api.version",
 			"worker.software_inventory",
 			"terminal.snapshot.v1",
+			"terminal.channel.p2p.entry.v1",
+			"terminal.channel.relay_fallback.v1",
 			"control.web",
 			"control.device_login",
 			"update.local",
@@ -622,6 +690,16 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	baseURL := s.requestBaseURL(r)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = fmt.Fprintf(w, installScriptTemplate, s.releaseRepo, baseURL, websocketBase(baseURL))
+}
+
+func (s *Server) handleDeployHubScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	baseURL := s.requestBaseURL(r)
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = fmt.Fprintf(w, deployHubScriptTemplate, s.releaseRepo, baseURL)
 }
 
 func (s *Server) handleRunScript(w http.ResponseWriter, r *http.Request) {
@@ -774,10 +852,10 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		payload["role"] = "admin"
 		payload["user"] = authUserView{Name: "Admin"}
 	} else if auth.Credential.UserEmail != "" {
-		payload["user"] = authUserView{
-			TenantID: auth.Credential.TenantID,
-			Email:    auth.Credential.UserEmail,
-			Name:     auth.Credential.Name,
+		if user, ok := s.auth.UserView(auth.Credential.UserEmail); ok {
+			payload["user"] = user
+		} else {
+			payload["user"] = authUserView{TenantID: auth.Credential.TenantID, Email: auth.Credential.UserEmail, Name: auth.Credential.Name}
 		}
 	}
 	writeJSON(w, http.StatusOK, payload)
@@ -920,15 +998,308 @@ func (s *Server) handleDevicePage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthOAuth(w http.ResponseWriter, r *http.Request) {
-	provider := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/auth/oauth/"), "/")
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/auth/oauth/"), "/"), "/")
+	provider := ""
+	if len(parts) > 0 {
+		provider = parts[0]
+	}
 	if provider != "github" && provider != "google" {
 		writeError(w, http.StatusNotFound, "unsupported oauth provider")
 		return
 	}
-	writeJSON(w, http.StatusNotImplemented, map[string]string{
-		"error":    "oauth provider is not configured",
-		"provider": provider,
+	config, ok := s.oauth[provider]
+	if !ok {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error":    "oauth provider is not configured",
+			"provider": provider,
+		})
+		return
+	}
+	if len(parts) > 1 && parts[1] == "callback" {
+		s.handleAuthOAuthCallback(w, r, config)
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	deviceID := strings.TrimSpace(r.URL.Query().Get("device_id"))
+	if deviceID == "" {
+		deviceID = "web"
+	}
+	state, err := s.oauthState(provider, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	authURL, err := s.oauthAuthorizeURL(config, state)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": authURL})
+}
+
+func (s *Server) handleAuthOAuthCallback(w http.ResponseWriter, r *http.Request, config oauthProviderConfig) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	deviceID, err := s.verifyOAuthState(config.Provider, r.URL.Query().Get("state"))
+	if err != nil {
+		s.redirectOAuthError(w, r, err.Error())
+		return
+	}
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		s.redirectOAuthError(w, r, "oauth code is missing")
+		return
+	}
+	token, err := s.exchangeOAuthCode(r.Context(), config, code)
+	if err != nil {
+		s.redirectOAuthError(w, r, err.Error())
+		return
+	}
+	profile, err := s.fetchOAuthProfile(r.Context(), config, token)
+	if err != nil {
+		s.redirectOAuthError(w, r, err.Error())
+		return
+	}
+	credential, err := s.auth.LoginExternal(externalLoginRequest{
+		Provider: config.Provider, Subject: profile.Subject, Email: profile.Email, Name: profile.Name,
+		DeviceID: deviceID, DeviceName: "Web Control",
 	})
+	if err != nil {
+		s.redirectOAuthError(w, r, err.Error())
+		return
+	}
+	values := url.Values{}
+	values.Set("credential", credential.Credential)
+	values.Set("credential_id", credential.CredentialID)
+	values.Set("tenant_id", credential.TenantID)
+	values.Set("device_id", credential.DeviceID)
+	values.Set("role", credential.Role)
+	values.Set("expires_at", credential.ExpiresAt.Format(time.RFC3339))
+	values.Set("refresh_token", credential.RefreshToken)
+	values.Set("refresh_expires_at", credential.RefreshExpiresAt.Format(time.RFC3339))
+	values.Set("user_email", credential.User.Email)
+	values.Set("user_name", credential.User.Name)
+	http.Redirect(w, r, "/control#oauth="+url.QueryEscape(values.Encode()), http.StatusFound)
+}
+
+type oauthTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	Error       string `json:"error"`
+	Description string `json:"error_description"`
+}
+
+type oauthProfile struct {
+	Subject string
+	Email   string
+	Name    string
+}
+
+func (s *Server) oauthAuthorizeURL(config oauthProviderConfig, state string) (string, error) {
+	callback, err := s.oauthCallbackURL(config.Provider)
+	if err != nil {
+		return "", err
+	}
+	values := url.Values{}
+	values.Set("client_id", config.ClientID)
+	values.Set("redirect_uri", callback)
+	values.Set("response_type", "code")
+	values.Set("state", state)
+	if len(config.Scopes) > 0 {
+		values.Set("scope", strings.Join(config.Scopes, " "))
+	}
+	if config.Provider == "google" {
+		values.Set("access_type", "online")
+		values.Set("prompt", "select_account")
+	}
+	return config.AuthURL + "?" + values.Encode(), nil
+}
+
+func (s *Server) oauthCallbackURL(provider string) (string, error) {
+	base := strings.TrimRight(s.publicURL, "/")
+	if base == "" {
+		return "", fmt.Errorf("AGENTMUX_PUBLIC_URL is required for OAuth")
+	}
+	return base + "/api/auth/oauth/" + provider + "/callback", nil
+}
+
+func (s *Server) oauthState(provider, deviceID string) (string, error) {
+	nonce, err := randomToken("oauth_")
+	if err != nil {
+		return "", err
+	}
+	payload := strings.Join([]string{provider, deviceID, strconv.FormatInt(time.Now().UTC().Unix(), 10), nonce}, "|")
+	signature := s.oauthStateSignature(payload)
+	return base64.RawURLEncoding.EncodeToString([]byte(payload + "|" + signature)), nil
+}
+
+func (s *Server) verifyOAuthState(provider, state string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(state))
+	if err != nil {
+		return "", fmt.Errorf("invalid oauth state")
+	}
+	parts := strings.Split(string(raw), "|")
+	if len(parts) != 5 || parts[0] != provider {
+		return "", fmt.Errorf("invalid oauth state")
+	}
+	payload := strings.Join(parts[:4], "|")
+	if !hmac.Equal([]byte(parts[4]), []byte(s.oauthStateSignature(payload))) {
+		return "", fmt.Errorf("invalid oauth state signature")
+	}
+	issuedAt, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || time.Since(time.Unix(issuedAt, 0)) > 10*time.Minute || time.Since(time.Unix(issuedAt, 0)) < -time.Minute {
+		return "", fmt.Errorf("oauth state expired")
+	}
+	deviceID := strings.TrimSpace(parts[1])
+	if deviceID == "" {
+		deviceID = "web"
+	}
+	return deviceID, nil
+}
+
+func (s *Server) oauthStateSignature(payload string) string {
+	key := s.token
+	if key == "" {
+		key = s.publicURL
+	}
+	if key == "" {
+		key = "agentmux-dev-oauth-state"
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) exchangeOAuthCode(ctx context.Context, config oauthProviderConfig, code string) (string, error) {
+	callback, err := s.oauthCallbackURL(config.Provider)
+	if err != nil {
+		return "", err
+	}
+	values := url.Values{}
+	values.Set("client_id", config.ClientID)
+	values.Set("client_secret", config.ClientSecret)
+	values.Set("code", code)
+	values.Set("redirect_uri", callback)
+	values.Set("grant_type", "authorization_code")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, config.TokenURL, strings.NewReader(values.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", oauthNetworkError(config.Provider, "token exchange", err)
+	}
+	defer res.Body.Close()
+	var token oauthTokenResponse
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&token); err != nil {
+		return "", fmt.Errorf("oauth token response invalid: %w", err)
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 || token.AccessToken == "" {
+		if token.Description != "" {
+			return "", fmt.Errorf("oauth token exchange failed: %s", token.Description)
+		}
+		if token.Error != "" {
+			return "", fmt.Errorf("oauth token exchange failed: %s", token.Error)
+		}
+		return "", fmt.Errorf("oauth token exchange failed: %s", res.Status)
+	}
+	return token.AccessToken, nil
+}
+
+func (s *Server) fetchOAuthProfile(ctx context.Context, config oauthProviderConfig, accessToken string) (oauthProfile, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, config.UserURL, nil)
+	if err != nil {
+		return oauthProfile{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return oauthProfile{}, oauthNetworkError(config.Provider, "userinfo", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return oauthProfile{}, fmt.Errorf("oauth userinfo failed: %s", res.Status)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
+		return oauthProfile{}, fmt.Errorf("oauth userinfo invalid: %w", err)
+	}
+	profile := oauthProfile{
+		Subject: mapStringValue(body, "sub"),
+		Email:   normalizeEmail(mapStringValue(body, "email")),
+		Name:    strings.TrimSpace(firstNonEmpty(mapStringValue(body, "name"), mapStringValue(body, "login"))),
+	}
+	if config.Provider == "github" {
+		profile.Subject = firstNonEmpty(mapStringValue(body, "node_id"), mapStringValue(body, "id"), mapStringValue(body, "login"))
+		if profile.Email == "" {
+			email, err := fetchGitHubPrimaryEmail(ctx, accessToken)
+			if err != nil {
+				return oauthProfile{}, err
+			}
+			profile.Email = normalizeEmail(email)
+		}
+	}
+	if profile.Email == "" {
+		return oauthProfile{}, fmt.Errorf("oauth profile does not include a verified email")
+	}
+	if profile.Name == "" {
+		profile.Name = profile.Email
+	}
+	return profile, nil
+}
+
+func fetchGitHubPrimaryEmail(ctx context.Context, accessToken string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user/emails", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", oauthNetworkError("github", "email lookup", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", fmt.Errorf("github email lookup failed: %s", res.Status)
+	}
+	var emails []struct {
+		Email    string `json:"email"`
+		Primary  bool   `json:"primary"`
+		Verified bool   `json:"verified"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&emails); err != nil {
+		return "", fmt.Errorf("github email response invalid: %w", err)
+	}
+	for _, item := range emails {
+		if item.Primary && item.Verified && item.Email != "" {
+			return item.Email, nil
+		}
+	}
+	for _, item := range emails {
+		if item.Verified && item.Email != "" {
+			return item.Email, nil
+		}
+	}
+	return "", fmt.Errorf("github account has no verified email")
+}
+
+func (s *Server) redirectOAuthError(w http.ResponseWriter, r *http.Request, message string) {
+	values := url.Values{}
+	values.Set("error", message)
+	http.Redirect(w, r, "/control#oauth="+url.QueryEscape(values.Encode()), http.StatusFound)
+}
+
+func oauthNetworkError(provider, step string, err error) error {
+	return fmt.Errorf("Hub cannot reach %s OAuth %s endpoint. Configure HTTPS_PROXY/HTTP_PROXY for the Hub and retry. Detail: %w", provider, step, err)
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
@@ -1789,6 +2160,21 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func mapStringValue(values map[string]any, key string) string {
+	value := values[key]
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case float64:
+		if typed == float64(int64(typed)) {
+			return strconv.FormatInt(int64(typed), 10)
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
 func workerView(worker workerRecord) protocol.WorkerView {
 	status := "offline"
 	if worker.connected {
@@ -1845,7 +2231,11 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 			return
 		}
 		size := open.Size()
-		s.logger.Debug("control open stream", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "cols", size.Cols, "rows", size.Rows, "pane_id", terminalTargetPane(open.Target))
+		grant := s.issueP2PGrantIfRequested(control, workerID, env.SessionID, env.StreamID, open)
+		if grant != nil {
+			open.GrantID = grant.GrantID
+		}
+		s.logger.Debug("control open stream", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", open.GrantID, "channel_mode", open.ChannelMode, "cols", size.Cols, "rows", size.Rows, "pane_id", terminalTargetPane(open.Target))
 		staleStreams := s.addSubscriber(env.StreamID, control, streamSubscription{
 			controlID: control.id,
 			workerID:  workerID,
@@ -1857,6 +2247,10 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, open, name, env.SessionID, env.StreamID); err != nil {
 			s.logger.Debug("control open forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
 			sendError(control.send, env.SessionID, err.Error())
+			return
+		}
+		if grant != nil {
+			s.emitP2PSignalingPlaceholder(control, *grant)
 		}
 	case protocol.TypeControlInput:
 		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
@@ -2590,6 +2984,76 @@ func pingLoop(conn *ws.Conn, done <-chan struct{}, interval time.Duration) {
 	}
 }
 
+func (s *Server) issueP2PGrantIfRequested(control *controlConn, workerID, sessionID, streamID string, open protocol.TerminalOpen) *protocol.P2PGrant {
+	requested := strings.ToLower(strings.TrimSpace(open.ChannelMode))
+	if requested != "p2p" && requested != protocol.TerminalChannelP2PPreferred && requested != protocol.TerminalChannelP2PDirect {
+		return nil
+	}
+	now := time.Now().UTC()
+	grant := protocol.P2PGrant{
+		GrantID:          "grant_" + randomID(),
+		TenantID:         control.tenantID,
+		ControlID:        control.id,
+		WorkerID:         workerID,
+		SessionID:        sessionID,
+		StreamID:         streamID,
+		Target:           open.Target,
+		AllowedTransport: protocol.TerminalChannelP2PPreferred,
+		ExpiresAt:        now.Add(p2pGrantTTL),
+		FallbackAfterMs:  int(p2pFallbackAfter / time.Millisecond),
+		State:            "issued",
+	}
+	env, err := protocol.NewEnvelope(protocol.TypeP2PGrant, grant)
+	if err == nil {
+		env.SessionID = sessionID
+		env.StreamID = streamID
+		select {
+		case control.send <- env:
+		default:
+			s.logger.Debug("p2p grant dropped; control send queue full", "control", control.id, "worker", workerID, "session_id", sessionID, "stream_id", streamID, "grant_id", grant.GrantID)
+		}
+	}
+	s.logger.Debug("p2p grant issued", "control", control.id, "worker", workerID, "session_id", sessionID, "stream_id", streamID, "grant_id", grant.GrantID, "expires_at", grant.ExpiresAt)
+	return &grant
+}
+
+func (s *Server) emitP2PSignalingPlaceholder(control *controlConn, grant protocol.P2PGrant) {
+	signals := []protocol.P2PSignal{
+		{
+			GrantID: grant.GrantID,
+			From:    "hub",
+			To:      "control",
+			Signal:  "grant_issued",
+			State:   "signaling",
+			Message: "P2P attach grant issued; direct signaling channel is not implemented yet.",
+		},
+		{
+			GrantID: grant.GrantID,
+			From:    "hub",
+			To:      "control",
+			Signal:  "fallback",
+			State:   protocol.TerminalChannelP2PFallback,
+			Reason:  "p2p_signaling_not_implemented",
+			Message: "Using Hub relay while P2P signaling is staged.",
+		},
+	}
+	for _, signal := range signals {
+		env, err := protocol.NewEnvelope(protocol.TypeP2PSignal, signal)
+		if err != nil {
+			continue
+		}
+		env.SessionID = grant.SessionID
+		env.StreamID = grant.StreamID
+		select {
+		case control.send <- env:
+		default:
+			s.logger.Debug("p2p signal dropped; control send queue full", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal)
+			return
+		}
+		s.logger.Debug("p2p signal emitted", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	}
+}
+
 func sendError(send chan<- protocol.Envelope, sessionID, message string) {
 	raw, _ := protocol.MarshalPayload(protocol.ErrorPayload{Message: message})
 	select {
@@ -2793,6 +3257,166 @@ case "$ROLE" in
     exec "$INSTALL_BIN" hub "$@"
     ;;
 esac
+`
+
+const deployHubScriptTemplate = `#!/bin/sh
+set -eu
+
+REPO="${AGENTMUX_REPO:-%s}"
+VERSION="${AGENTMUX_VERSION:-latest}"
+PUBLIC_URL="${AGENTMUX_PUBLIC_URL:-%s}"
+ADDR="${AGENTMUX_ADDR:-127.0.0.1:8081}"
+DATA="${AGENTMUX_DATA:-/var/lib/agentmux/agentmux.db}"
+DATA_DIR="$(dirname "$DATA")"
+TOKEN="${AGENTMUX_TOKEN:-}"
+USER="${AGENTMUX_USER:-agentmux}"
+GROUP="${AGENTMUX_GROUP:-$USER}"
+BIN="${AGENTMUX_HUB_BIN:-/usr/local/bin/agentmux-hub}"
+ENV_FILE="${AGENTMUX_ENV_FILE:-/etc/agentmux/agentmux.env}"
+SERVICE="${AGENTMUX_SERVICE:-agentmux.service}"
+SERVICE_PATH="${AGENTMUX_SERVICE_PATH:-/etc/systemd/system/$SERVICE}"
+RUN_HEALTH_CHECK="${AGENTMUX_HEALTH_CHECK:-1}"
+HEALTH_URL="${AGENTMUX_HEALTH_URL:-}"
+
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "deploy-hub.sh currently supports Linux systemd hosts only." >&2
+  exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "systemctl is required. Use /install.sh hub for non-systemd hosts." >&2
+  exit 1
+fi
+if ! command -v sudo >/dev/null 2>&1; then
+  echo "sudo is required for system install." >&2
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+  echo "curl and tar are required." >&2
+  exit 1
+fi
+
+verify_sha256() {
+  archive="$1"
+  checksum_file="$2"
+  expected="$(cut -d ' ' -f 1 "$checksum_file" | head -n 1)"
+  if [ -z "$expected" ]; then
+    echo "empty checksum file: $checksum_file" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$archive" | cut -d ' ' -f 1)"
+  else
+    echo "sha256 verification requires sha256sum or shasum" >&2
+    exit 1
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "sha256 mismatch for $archive" >&2
+    echo "expected: $expected" >&2
+    echo "actual:   $actual" >&2
+    exit 1
+  fi
+}
+
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+esac
+
+asset_base="agentmux-hub-linux-${arch}"
+asset="${asset_base}.tar.gz"
+if [ "$VERSION" = "latest" ]; then
+  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+else
+  url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+echo "Downloading $url" >&2
+curl -fsSL "$url" -o "$tmp/$asset"
+echo "Verifying ${url}.sha256" >&2
+curl -fsSL "${url}.sha256" -o "$tmp/$asset.sha256"
+verify_sha256 "$tmp/$asset" "$tmp/$asset.sha256"
+tar -xzf "$tmp/$asset" -C "$tmp"
+
+if ! getent group "$GROUP" >/dev/null 2>&1; then
+  sudo groupadd --system "$GROUP"
+fi
+if ! id "$USER" >/dev/null 2>&1; then
+  if [ -x /usr/sbin/nologin ]; then
+    nologin=/usr/sbin/nologin
+  else
+    nologin=/sbin/nologin
+  fi
+  sudo useradd --system --home "$DATA_DIR" --shell "$nologin" --gid "$GROUP" "$USER"
+fi
+
+sudo install -d -o "$USER" -g "$GROUP" "$DATA_DIR"
+sudo install -d -m 0755 /etc/agentmux
+sudo install -m 0755 "$tmp/${asset_base}" "$BIN"
+
+token_line=""
+if [ -n "$TOKEN" ]; then
+  token_line="AGENTMUX_TOKEN=$TOKEN"
+fi
+sudo sh -c "cat > '$ENV_FILE'" <<EOF
+AGENTMUX_ADDR=$ADDR
+AGENTMUX_PUBLIC_URL=$PUBLIC_URL
+AGENTMUX_DATA=$DATA
+AGENTMUX_RELEASE_REPO=$REPO
+$token_line
+EOF
+sudo chmod 0640 "$ENV_FILE"
+sudo chown "root:$GROUP" "$ENV_FILE" || true
+
+sudo sh -c "cat > '$SERVICE_PATH'" <<EOF
+[Unit]
+Description=AgentMux Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+Group=$GROUP
+EnvironmentFile=$ENV_FILE
+ExecStart=$BIN --addr \${AGENTMUX_ADDR} --data \${AGENTMUX_DATA} --public-url \${AGENTMUX_PUBLIC_URL} --release-repo \${AGENTMUX_RELEASE_REPO}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$DATA_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now "$SERVICE"
+sudo systemctl restart "$SERVICE"
+if ! sudo systemctl --no-pager --full status "$SERVICE"; then
+  sudo journalctl -u "$SERVICE" -n 80 --no-pager || true
+  exit 1
+fi
+if [ "$RUN_HEALTH_CHECK" != "0" ]; then
+  if [ -z "$HEALTH_URL" ]; then
+    health_port="${ADDR##*:}"
+    health_url="http://127.0.0.1:${health_port}/health"
+  else
+    health_url="$HEALTH_URL"
+  fi
+  echo "Checking $health_url" >&2
+  if ! curl -fsS "$health_url" >/dev/null; then
+    sudo journalctl -u "$SERVICE" -n 80 --no-pager || true
+    exit 1
+  fi
+fi
 `
 
 const runScriptTemplate = `#!/bin/sh
@@ -3514,6 +4138,12 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         </div>
         <div class="grid">
           <div class="command">
+            <div class="command-title"><span data-i18n="deployHubSystemd">One-line Linux systemd deploy</span></div>
+            <pre>curl -fsSL {{.BaseURL}}/deploy-hub.sh | sh
+# optional:
+# AGENTMUX_PUBLIC_URL=https://hub.example.com AGENTMUX_ADDR=127.0.0.1:8081 curl -fsSL {{.BaseURL}}/deploy-hub.sh | sh</pre>
+          </div>
+          <div class="command">
             <div class="command-title"><span data-i18n="runHubDocker">Run Hub with Docker</span></div>
             <pre>docker run -d --name agentmux --restart unless-stopped -p 8081:8081 {{.ContainerImage}}:latest</pre>
           </div>
@@ -3592,6 +4222,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         controlStepBody: 'After the Worker is connected, open the share URL for simple Direct Token access, or sign in for the full management workspace.',
         selfHostTitle: 'Self-host Hub',
         selfHostLead: 'Only use this when you want to run your own Hub. The Docker image already defaults to port 8081 and stores data under /var/lib/agentmux.',
+        deployHubSystemd: 'One-line Linux systemd deploy',
         runHubBinary: 'Run Hub with binary',
         runHubDocker: 'Run Hub with Docker',
         runHubPersist: 'Optional Docker persistence',
@@ -3652,6 +4283,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         controlStepBody: 'Worker 接入后，打开分享链接即可简单连接会话；登录账号后可使用完整管理工作区。',
         selfHostTitle: '自托管 Hub',
         selfHostLead: '只有当你想运行自己的 Hub 时才需要这里。Docker 镜像已默认使用 8081 端口，并把数据放在 /var/lib/agentmux。',
+        deployHubSystemd: 'Linux systemd 一键部署',
         runHubBinary: '用二进制运行 Hub',
         runHubDocker: '用 Docker 运行 Hub',
         runHubPersist: '可选 Docker 持久化',

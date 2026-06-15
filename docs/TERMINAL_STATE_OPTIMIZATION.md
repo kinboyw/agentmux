@@ -684,6 +684,32 @@ The Worker-side state path should support two terminal modes:
 Worker may degrade to attach mode when the backend, parser, or target does not
 support state safely.
 
+### Default Scope Policy
+
+The default Web Control action should attach the whole tmux session. This keeps
+the native tmux mirror semantics intact: status line, window switching, pane
+navigation, prefix shortcuts, copy mode, mouse mode, and remote layout changes
+all behave like a normal `tmux attach-session` client.
+
+This default can resize the remote tmux client. That side effect is acceptable
+for the primary remote-control workflow because preserving the user's existing
+tmux operating model is more valuable than making the browser viewport fully
+independent.
+
+Window and pane targets are explicit fine-grained entries. They use the Worker
+state pipeline:
+
+```text
+snapshot -> live terminal.output append -> history.request/page
+```
+
+Control still renders the final output with xterm. Worker and Hub prepare,
+cache, route, and page the data; they do not replace xterm as the terminal
+renderer. Pane targets should avoid mutating the remote tmux size where the
+backend can provide live output without a real attached tmux client. Window
+targets may start as composed snapshots/previews and later grow into a fuller
+stateful target model.
+
 ### Size Model
 
 PlanB uses three size concepts, but only two should drive remote output:
@@ -694,10 +720,16 @@ worker_state_size  canonical Worker screen size
 control_viewport   local browser/TUI pane size
 ```
 
-`process_size` and `worker_state_size` must stay equal. The remote program sees
-the canonical Worker size, for example `120x36`, and produces output for that
-shape. `control_viewport` is only a viewing window over that canonical screen.
-Control must crop, pad, and scroll; it must not reflow remote terminal output.
+For explicit Worker-state targets, `process_size` and `worker_state_size` should
+stay equal. The remote program sees the canonical Worker size, for example
+`120x36`, and produces output for that shape. `control_viewport` is only a
+viewing window over that canonical screen. Control should crop, pad, and scroll;
+it should not reflow remote terminal output.
+
+For the default whole-session attach, the backend may use a real tmux client.
+In that mode the browser viewport can drive the attached tmux client size, and
+the remote session may repaint accordingly. That is the expected compatibility
+mode, not a PlanB state-mode failure.
 
 This preserves ASCII diagrams, tables, progress bars, and full-screen TUIs. A
 small Control viewport sees a clipped window into the canonical remote screen.
@@ -724,11 +756,13 @@ For tmux, the stable state key should be built from the target identity:
 worker_id/session_name/window_id/pane_id
 ```
 
-If a Control attaches to the whole tmux session/window, Worker can expose a
-composed window target, but pane-level targets should remain independent. Mobile
-Control should avoid rendering multiple remote panes side by side or stacked in
-the same terminal viewport because that shrinks already constrained content and
-changes the user's mental model of the remote pane. Instead, it should support
+If a Control attaches to the whole tmux session, Worker should preserve native
+session mirror semantics by default. If Control attaches to an explicit window
+or pane target, Worker state should be keyed by that target. Pane-level targets
+should remain independent. Mobile Control should avoid rendering multiple remote
+panes side by side or stacked in the same terminal viewport because that shrinks
+already constrained content and changes the user's mental model of the remote
+pane. Instead, it should support
 multiple pane attachments as switchable focus targets:
 
 - one tab per pane,
@@ -755,9 +789,9 @@ The help page should show the current mode, available commands, and short usage
 examples. It should be generated from the same keybinding registry used by the
 TUI so documentation and behavior cannot drift.
 
-The fallback attach mode may still attach to the whole tmux session for maximum
-compatibility. PlanB state mode should prefer pane/window targets because they
-are deterministic and compose cleanly on small screens.
+The whole-session mirror is the default attach mode for maximum compatibility.
+PlanB state mode remains available for explicit pane/window targets because
+they are deterministic and compose cleanly on small screens.
 
 ### Control TUI Layout Policy
 
