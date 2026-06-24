@@ -45,8 +45,25 @@ body {
   overscroll-behavior: none;
 }
 
-.agentmux-session-window {
+.agentmux-terminal-interactive {
+  touch-action: auto;
+}
+
+.agentmux-terminal-state-surface {
   touch-action: none;
+}
+
+.agentmux-mobile-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+}
+
+.agentmux-xterm-underlay {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: auto;
 }
 
 @supports (height: 100dvh) {
@@ -80,6 +97,7 @@ body {
   height: 100%;
   min-width: 0;
   overflow: hidden;
+  position: relative;
   width: 100%;
 }
 
@@ -87,22 +105,61 @@ body {
 .xterm .xterm-screen,
 .xterm .xterm-helpers,
 .xterm .xterm-helper-textarea {
+  max-height: 100%;
   max-width: 100%;
+  width: 100%;
+}
+
+.xterm .xterm-viewport,
+.xterm .xterm-screen,
+.xterm .xterm-helpers {
+  height: 100%;
+}
+
+.xterm .xterm-viewport {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
 }
 
 .xterm .xterm-screen {
   overflow: hidden;
 }
 
+.xterm .xterm-screen canvas {
+  height: 100%;
+  left: 0;
+  top: 0;
+  width: 100%;
+}
+
+.xterm .composition-view {
+  max-width: 100%;
+  overflow: hidden;
+  pointer-events: none;
+  text-orientation: mixed;
+  white-space: pre;
+  writing-mode: horizontal-tb;
+}
+
 .agentmux-cell-screen {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-variant-ligatures: none;
+  letter-spacing: 0;
+  line-height: 1;
+  word-spacing: 0;
   tab-size: 1;
 }
 
 .agentmux-cell {
   display: inline-block;
+  height: var(--agentmux-cell-height, 16px);
+  line-height: var(--agentmux-cell-height, 16px);
   min-width: 1ch;
+  min-height: 1em;
   white-space: pre;
+  vertical-align: top;
+  width: var(--agentmux-cell-width, 8px);
 }
 
 .agentmux-cell-cursor {
@@ -145,5 +202,13 @@ body {
 
   .xterm .xterm-helper-textarea {
     font-size: 16px !important;
+  }
+
+  .xterm .composition-view {
+    background: transparent !important;
+    color: hsl(var(--foreground));
+    left: 0 !important;
+    right: auto;
+    text-shadow: 0 0 0 currentColor;
   }
 }

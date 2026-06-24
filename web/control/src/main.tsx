@@ -53,6 +53,9 @@ const xtermTheme = {
   foreground: "#eef2f3",
   cursor: "#35c98f",
 } as const;
+const terminalFontFamily = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+const terminalFontSize = 14;
+const terminalLineHeight = 1.2;
 
 type WorkerView = {
   id: string;
@@ -101,6 +104,7 @@ type SplitDirection = "horizontal" | "vertical";
 type DropZone = "left" | "right" | "top" | "bottom" | "center";
 type AttachMode = "current" | "new-tab";
 type TerminalChannelPreference = "relay" | "p2p_preferred";
+type DirectTransportState = "idle" | "issued" | "negotiating" | "direct" | "relay_fallback" | "closed";
 
 type TerminalTargetView = {
   session_name?: string;
@@ -281,6 +285,14 @@ type P2PGrantPayload = {
   state?: string;
   allowed_transport?: string;
   fallback_after_ms?: number;
+  expires_at?: string;
+  ice_servers?: P2PICEServerPayload[];
+};
+
+type P2PICEServerPayload = {
+  urls?: string[];
+  username?: string;
+  credential?: string;
 };
 
 type P2PSignalPayload = {
@@ -289,6 +301,34 @@ type P2PSignalPayload = {
   state?: string;
   reason?: string;
   message?: string;
+  sdp_type?: RTCSdpType;
+  sdp?: string;
+  candidate?: string;
+  sdp_mline_index?: number;
+  sdp_mid?: string;
+  ice_servers?: P2PICEServerPayload[];
+};
+
+type DirectTransportGrant = {
+  grant_id?: string;
+  fallback_after_ms?: number;
+  allowed_transport?: string;
+  expires_at?: string;
+  ice_servers?: P2PICEServerPayload[];
+};
+
+type DirectTransportStatus = {
+  state: DirectTransportState;
+  grantId?: string;
+  reason?: string;
+  message?: string;
+  detail?: string;
+};
+
+type MobileExitConfirmDialogProps = {
+  open: boolean;
+  onStay: () => void;
+  onLeave: () => void;
 };
 
 type TerminalHistoryLine = {
@@ -343,6 +383,11 @@ type TerminalDiffOp = {
   row?: number;
   cells?: TerminalCell[];
   cursor?: TerminalCursor;
+};
+
+type TerminalCellMetrics = {
+  width: number;
+  height: number;
 };
 
 type TerminalDiffPayload = {
@@ -426,6 +471,7 @@ type DragPayload =
   | {
       kind: "session";
       sessionId: string;
+      target?: TerminalTargetView;
     }
   | {
       kind: "pane";
@@ -518,6 +564,7 @@ function nearestScrollable(target: Element, root: HTMLElement) {
 function App() {
   const compactLayout = useMediaQuery("(max-width: 767px)");
   const appRootRef = React.useRef<HTMLDivElement | null>(null);
+  const [mobileViewportHeight, setMobileViewportHeight] = React.useState<number | null>(null);
   const [token, setToken] = React.useState(initialToken);
   const [tokenExpiresAt, setTokenExpiresAt] = React.useState(initialTokenExpiresAt);
   const [refreshToken, setRefreshToken] = React.useState(initialRefreshToken);
@@ -554,6 +601,7 @@ function App() {
   const [workerUpdateJobs, setWorkerUpdateJobs] = React.useState<Record<string, WorkerUpdateJob>>({});
   const [actionLoading, setActionLoading] = React.useState<Record<string, boolean>>({});
   const [mobileTargets, setMobileTargets] = React.useState<MobileTargetBrowser | null>(null);
+  const [mobileExitConfirmOpen, setMobileExitConfirmOpen] = React.useState(false);
   const [expandedDesktopSessionId, setExpandedDesktopSessionId] = React.useState<string | null>(null);
   const [desktopTargetStates, setDesktopTargetStates] = React.useState<Record<string, DesktopSessionTargetsState>>({});
   const [desktopTargetPopover, setDesktopTargetPopover] = React.useState<DesktopTargetPopoverState | null>(null);
@@ -572,10 +620,66 @@ function App() {
   const lastActivityAt = React.useRef(Date.now());
   const workersRef = React.useRef<WorkerView[]>([]);
   const workerEventsReady = React.useRef(false);
+  const mobileTargetsRef = React.useRef<MobileTargetBrowser | null>(null);
+  const sidebarOpenRef = React.useRef(sidebarOpen);
+  const allowMobileHistoryBack = React.useRef(false);
 
   React.useEffect(() => {
     if (!compactLayout || !appRootRef.current) return;
     return installTouchOverscrollGuard(appRootRef.current);
+  }, [compactLayout]);
+
+  React.useEffect(() => {
+    if (!compactLayout) {
+      setMobileViewportHeight(null);
+      return;
+    }
+    const applyViewportHeight = () => {
+      const height = window.visualViewport?.height || window.innerHeight || 0;
+      setMobileViewportHeight(height > 0 ? Math.round(height) : null);
+    };
+    applyViewportHeight();
+    window.visualViewport?.addEventListener("resize", applyViewportHeight);
+    window.visualViewport?.addEventListener("scroll", applyViewportHeight);
+    window.addEventListener("orientationchange", applyViewportHeight);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", applyViewportHeight);
+      window.visualViewport?.removeEventListener("scroll", applyViewportHeight);
+      window.removeEventListener("orientationchange", applyViewportHeight);
+    };
+  }, [compactLayout]);
+
+  const mobileViewportStyle = compactLayout && mobileViewportHeight ? ({ height: `${mobileViewportHeight}px` } as React.CSSProperties) : undefined;
+
+  React.useEffect(() => {
+    mobileTargetsRef.current = mobileTargets;
+  }, [mobileTargets]);
+
+  React.useEffect(() => {
+    sidebarOpenRef.current = sidebarOpen;
+  }, [sidebarOpen]);
+
+  React.useEffect(() => {
+    if (!compactLayout) return;
+    window.history.pushState({ ...(window.history.state || {}), agentmux_mobile_guard: true }, "", window.location.href);
+    const onPopState = () => {
+      if (allowMobileHistoryBack.current) {
+        allowMobileHistoryBack.current = false;
+        return;
+      }
+      window.history.pushState({ ...(window.history.state || {}), agentmux_mobile_guard: true }, "", window.location.href);
+      if (mobileTargetsRef.current) {
+        setMobileTargets(null);
+        return;
+      }
+      if (sidebarOpenRef.current) {
+        setSidebarOpen(false);
+        return;
+      }
+      setMobileExitConfirmOpen(true);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
   }, [compactLayout]);
 
   React.useEffect(() => {
@@ -1524,6 +1628,12 @@ function App() {
     setMobileTargets(null);
   }
 
+  function confirmMobileExit() {
+    allowMobileHistoryBack.current = true;
+    setMobileExitConfirmOpen(false);
+    window.history.back();
+  }
+
   async function attachMobileTarget(target?: TerminalTargetView | null) {
     if (!mobileTargets) return;
     const { session, mode } = mobileTargets;
@@ -1571,6 +1681,19 @@ function App() {
     setTabs((items) => [...items, tab]);
     setActiveTabId(tab.id);
     setMainView("workspace");
+  }
+
+  function createWorkspaceTabFromDrag(payload: DragPayload) {
+    if (payload.kind === "session") {
+      createWorkspaceTab(payload.sessionId, payload.target);
+      return;
+    }
+    for (const tab of tabs) {
+      const pane = findPane(tab.layout, payload.paneId);
+      if (!pane?.sessionId) continue;
+      createWorkspaceTab(pane.sessionId, pane.target);
+      return;
+    }
   }
 
   function closeWorkspaceTab(tabId: string) {
@@ -1739,9 +1862,10 @@ function App() {
   function dropOnPane(tabId: string, targetPaneId: string, zone: DropZone, payload: DragPayload) {
     setDropTarget(null);
     if (payload.kind === "session") {
-      const pane = zone === "center" ? undefined : newPane(payload.sessionId);
+      const target = normalizeTerminalTarget(payload.target);
+      const pane = zone === "center" ? undefined : newPane(payload.sessionId, target);
       setLayoutForTab(tabId, (node) => {
-        if (zone === "center") return updatePane(node, targetPaneId, (pane) => ({ ...pane, sessionId: payload.sessionId, target: undefined }));
+        if (zone === "center") return updatePane(node, targetPaneId, (pane) => ({ ...pane, sessionId: payload.sessionId, target }));
         return insertPaneRelative(node, targetPaneId, zone, pane!).node;
       });
       setActivePaneForTab(tabId, pane?.id || targetPaneId);
@@ -1801,7 +1925,7 @@ function App() {
 
   if (directAccess) {
     return (
-      <div className="flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen">
+      <div className="flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen" style={mobileViewportStyle}>
 	<SimpleDirectControlView
 	  workers={workerOptions}
 	  sessions={sessions}
@@ -1834,7 +1958,7 @@ function App() {
           submitting={isActionBusy(`auth:${authMode}`)}
           directTokenLoading={isActionBusy("auth:direct-token")}
           oauthLoading={(provider) => isActionBusy(`auth:oauth:${provider}`)}
-	/>
+	  />
 	<CreateSessionModal
 	  open={createOpen}
 	  createForm={createForm}
@@ -1848,12 +1972,17 @@ function App() {
 	  onSelectCWD={(cwd) => setCreateForm((form) => ({ ...form, cwd }))}
           submitting={isActionBusy("session:create")}
 	/>
+        <MobileExitConfirmDialog
+          open={mobileExitConfirmOpen}
+          onStay={() => setMobileExitConfirmOpen(false)}
+          onLeave={confirmMobileExit}
+        />
       </div>
     );
   }
 
   return (
-    <div ref={appRootRef} className="agentmux-app-root relative flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen">
+    <div ref={appRootRef} className="agentmux-app-root relative flex h-[100dvh] overflow-hidden bg-background text-foreground md:h-screen" style={mobileViewportStyle}>
       {sidebarOpen ? <button type="button" className="fixed inset-0 z-30 bg-black/60 md:hidden" onClick={() => setSidebarOpen(false)} aria-label="Close sessions drawer" /> : null}
       <aside className={cn(
         "fixed inset-y-0 left-0 z-40 flex h-full w-[min(88vw,20rem)] shrink-0 flex-col border-r border-border bg-card transition-all duration-200 md:static md:z-auto md:translate-x-0",
@@ -2090,6 +2219,7 @@ function App() {
               dropTarget={dropTarget}
               onActiveTabChange={setActiveTabId}
               onCreateTab={() => createWorkspaceTab()}
+              onCreateTabFromDrag={createWorkspaceTabFromDrag}
               onCloseTab={closeWorkspaceTab}
               onRenameTab={renameWorkspaceTab}
               onFocusPane={setActivePaneForTab}
@@ -2104,6 +2234,11 @@ function App() {
           </div>
         </div>
       </main>
+      <MobileExitConfirmDialog
+        open={mobileExitConfirmOpen}
+        onStay={() => setMobileExitConfirmOpen(false)}
+        onLeave={confirmMobileExit}
+      />
       <ToastViewport toasts={toasts} onDismiss={dismissToast} />
       <AuthModal
         open={authOpen}
@@ -2144,6 +2279,26 @@ function App() {
         onClose={() => setJoinOpen(false)}
         onGenerate={() => void generateJoinSignal()}
       />
+    </div>
+  );
+}
+
+function MobileExitConfirmDialog({ open, onStay, onLeave }: MobileExitConfirmDialogProps) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[90] flex items-end justify-center bg-black/60 p-3 backdrop-blur-sm md:hidden">
+      <div className="w-full max-w-sm rounded-md border border-border bg-card p-3 shadow-2xl">
+        <div className="text-sm font-semibold">Leave Web Control?</div>
+        <div className="mt-1 text-xs leading-5 text-muted-foreground">Confirm before leaving this control session.</div>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <Button variant="secondary" onClick={onStay}>
+            Stay
+          </Button>
+          <Button variant="destructive" onClick={onLeave}>
+            Leave
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2602,28 +2757,37 @@ function SidebarSessionItem({
           ) : groups.length ? (
             <div className="ml-2 space-y-1 border-l border-border/80 pl-2">
               <div className="px-1 pb-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground/80">Windows</div>
-              {groups.map((group) => (
-                <button
-                  key={group.key}
-                  type="button"
-                  className="flex w-full min-w-0 items-center justify-between gap-2 rounded-md border border-border/60 bg-card/55 px-2 py-1.5 text-left transition-colors hover:border-primary/50 hover:bg-secondary"
-                  onMouseEnter={(event) => onHoverWindow(group, event.currentTarget.getBoundingClientRect())}
-                  onFocus={(event) => onHoverWindow(group, event.currentTarget.getBoundingClientRect())}
-                  onClick={() => {
-                    const activePane = group.targets.find((target) => target.pane_active && target.pane_id) || group.targets.find((target) => target.pane_id);
-                    if (activePane) onAttachPane(activePane, "current");
-                  }}
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-xs font-medium">{targetWindowLabel(group)}</div>
-                    <div className="truncate text-[11px] text-muted-foreground">{group.targets.length} pane{group.targets.length === 1 ? "" : "s"}</div>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1">
-                    {group.active ? <StatusBadge tone="ok">active</StatusBadge> : null}
-                    <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-                  </div>
-                </button>
-              ))}
+              {groups.map((group) => {
+                const defaultTarget = defaultTargetForWindowGroup(group);
+                return (
+                  <button
+                    key={group.key}
+                    type="button"
+                    draggable={Boolean(defaultTarget)}
+                    className="flex w-full min-w-0 items-center justify-between gap-2 rounded-md border border-border/60 bg-card/55 px-2 py-1.5 text-left transition-colors hover:border-primary/50 hover:bg-secondary"
+                    onMouseEnter={(event) => onHoverWindow(group, event.currentTarget.getBoundingClientRect())}
+                    onFocus={(event) => onHoverWindow(group, event.currentTarget.getBoundingClientRect())}
+                    onDragStart={(event) => {
+                      if (!defaultTarget) return;
+                      event.stopPropagation();
+                      setDragPayload(event, { kind: "session", sessionId: session.id, target: defaultTarget });
+                    }}
+                    onDragEnd={onDragEnd}
+                    onClick={() => {
+                      if (defaultTarget) onAttachPane(defaultTarget, "current");
+                    }}
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-xs font-medium">{targetWindowLabel(group)}</div>
+                      <div className="truncate text-[11px] text-muted-foreground">{group.targets.length} pane{group.targets.length === 1 ? "" : "s"}</div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {group.active ? <StatusBadge tone="ok">active</StatusBadge> : null}
+                      <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           ) : (
             <div className="ml-2 border-l border-border/80 pl-2">
@@ -2722,8 +2886,13 @@ function PaneLayoutPreview({
             <button
               key={paneKey}
               type="button"
+              draggable
               className={cn("flex w-full min-w-0 items-center justify-between gap-2 rounded border border-border bg-background px-2 py-1.5 text-left hover:border-primary/60", paneKey === hoveredPaneKey && "border-primary bg-primary/10")}
               onMouseEnter={() => onHoverPane(paneKey)}
+              onDragStart={(event) => {
+                event.stopPropagation();
+                setDragPayload(event, { kind: "session", sessionId, target });
+              }}
               onClick={() => onAttachPane(target)}
             >
               <span className="min-w-0 truncate text-xs">{terminalTargetLabel(target, index)}</span>
@@ -2748,6 +2917,7 @@ function PaneLayoutPreview({
           <button
             key={paneKey}
             type="button"
+            draggable
             className={cn(
               "absolute overflow-hidden border border-border bg-background/80 p-1 text-left transition-colors hover:border-primary hover:bg-primary/10",
               target.pane_active && "border-emerald-400/60",
@@ -2760,6 +2930,10 @@ function PaneLayoutPreview({
               height: `${height}%`,
             }}
             onMouseEnter={() => onHoverPane(paneKey)}
+            onDragStart={(event) => {
+              event.stopPropagation();
+              setDragPayload(event, { kind: "session", sessionId, target });
+            }}
             onClick={() => onAttachPane(target)}
             onDoubleClick={(event) => {
               event.preventDefault();
@@ -3468,6 +3642,7 @@ function WorkspaceView({
   onClosePane,
   onDropTarget,
   onDropPayload,
+  onCreateTabFromDrag,
   onTerminalSettingsChange,
   setStatus,
 }: {
@@ -3490,12 +3665,14 @@ function WorkspaceView({
   onClosePane: (tabID: string, id: string) => void;
   onDropTarget: (target: DropTarget | null) => void;
   onDropPayload: (tabID: string, paneId: string, zone: DropZone, payload: DragPayload) => void;
+  onCreateTabFromDrag: (payload: DragPayload) => void;
   onTerminalSettingsChange: (workerId: string, settings: WorkerTerminalSettings) => void;
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
   simple?: boolean;
 }) {
   const [editingTabId, setEditingTabId] = React.useState("");
   const [editingTitle, setEditingTitle] = React.useState("");
+  const [newTabDropActive, setNewTabDropActive] = React.useState(false);
   const editInputRef = React.useRef<HTMLInputElement | null>(null);
   const activeTab = React.useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0], [tabs, activeTabId]);
   const compactPanes = React.useMemo(() => (activeTab ? collectPanes(activeTab.layout) : []), [activeTab]);
@@ -3529,6 +3706,26 @@ function WorkspaceView({
   function cancelRename() {
     setEditingTabId("");
     setEditingTitle("");
+  }
+
+  function dragLeavesElement(event: React.DragEvent<HTMLElement>) {
+    return !event.currentTarget.contains(event.relatedTarget as Node | null);
+  }
+
+  function handleNewTabDragOver(event: React.DragEvent<HTMLDivElement>) {
+    if (!hasAgentMuxDragPayload(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setNewTabDropActive(true);
+  }
+
+  function handleNewTabDrop(event: React.DragEvent<HTMLDivElement>) {
+    const payload = readDragPayload(event);
+    if (!payload) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setNewTabDropActive(false);
+    onCreateTabFromDrag(payload);
   }
 
   return (
@@ -3597,10 +3794,19 @@ function WorkspaceView({
               ) : null}
             </div>
           ))}
+          <div
+            className={cn("shrink-0 rounded-md transition-colors", newTabDropActive && "bg-primary/10 ring-1 ring-primary/60")}
+            onDragOver={handleNewTabDragOver}
+            onDragLeave={(event) => {
+              if (dragLeavesElement(event)) setNewTabDropActive(false);
+            }}
+            onDrop={handleNewTabDrop}
+          >
+            <Button variant="ghost" size="icon-sm" onClick={onCreateTab} title="New workspace tab">
+              <Plus className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
-        <Button variant="ghost" size="icon-sm" onClick={onCreateTab} title="New workspace tab">
-          <Plus className="h-4 w-4" />
-        </Button>
       </div>
       {compact && activeTab && compactPanes.length > 1 ? (
         <div className="flex min-h-8 items-center gap-1 overflow-x-auto border-b border-border bg-background px-2 py-1 md:hidden">
@@ -4233,6 +4439,7 @@ function TerminalPane({
   setStatus: React.Dispatch<React.SetStateAction<Status>>;
   simple?: boolean;
 }) {
+  const compactLayout = useMediaQuery("(max-width: 767px)");
   const terminalRef = React.useRef<HTMLDivElement | null>(null);
   const terminal = React.useRef<Terminal | null>(null);
   const fit = React.useRef<FitAddon | null>(null);
@@ -4240,16 +4447,27 @@ function TerminalPane({
   const streamId = React.useRef("");
   const lastSize = React.useRef({ cols: 0, rows: 0 });
   const lastSyncedRemoteSize = React.useRef({ cols: 0, rows: 0 });
+  const cellMetricsRef = React.useRef<TerminalCellMetrics>({ width: 8, height: 14 });
+  const latestXtermSelection = React.useRef("");
   const resizeSyncTimer = React.useRef<number | null>(null);
+  const attachRecoveryTimer = React.useRef<number | null>(null);
+  const delayedFitTimers = React.useRef<number[]>([]);
+  const directTransport = React.useRef<DirectTransportController | null>(null);
   const viewportSizeRef = React.useRef<TerminalSize>({});
   const resizePolicy = React.useRef("pending");
   const historyLoadingRef = React.useRef(false);
   const historyBeforeSeq = React.useRef<number | undefined>(undefined);
+  const helperTextareaRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const historyPanelRef = React.useRef<HTMLDivElement | null>(null);
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
   const activeRef = React.useRef(interactive);
   const mouseDownButton = React.useRef("");
+  const touchFocusGesture = React.useRef<{ x: number; y: number; moved: boolean; scrollTop: number } | null>(null);
+  const stateTouch = React.useRef<{ x: number; y: number; carryX: number; carryY: number; axis?: "x" | "y" } | null>(null);
+  const statePanYRef = React.useRef(0);
+  const statePanMaxYRef = React.useRef(0);
   const mobileActionsRef = React.useRef<HTMLDivElement | null>(null);
   const inlineStateScreenRef = React.useRef<HTMLDivElement | null>(null);
   const modalStateScreenRef = React.useRef<HTMLDivElement | null>(null);
@@ -4257,6 +4475,7 @@ function TerminalPane({
   const [mobileActionsOpen, setMobileActionsOpen] = React.useState(false);
   const [terminalMode, setTerminalMode] = React.useState<TerminalModePayload>({});
   const [viewportSize, setViewportSize] = React.useState<TerminalSize>({});
+  const [cellMetrics, setCellMetrics] = React.useState<TerminalCellMetrics>({ width: 8, height: 14 });
   const [historyOpen, setHistoryOpen] = React.useState(false);
   const [historyLines, setHistoryLines] = React.useState<TerminalHistoryLine[]>([]);
   const [historyLoading, setHistoryLoading] = React.useState(false);
@@ -4280,6 +4499,7 @@ function TerminalPane({
   const statePanMaxX = terminalStatePanMaxX(cellSnapshot, viewportSize);
   const statePanMaxY = terminalStatePanMaxY(cellSnapshot, viewportSize);
   const stateViewActive = Boolean(workerStateMode && stateRenderer && cellSnapshot);
+  const canShowTerminalRecoveryActions = Boolean(pane.sessionId);
   const hasMobileActions = Boolean((isTmux && !simple) || workerStateMode || !simple);
 
   React.useEffect(() => {
@@ -4314,8 +4534,31 @@ function TerminalPane({
     setStatePanY((value) => clampNumber(value, 0, statePanMaxY));
   }, [statePanMaxX, statePanMaxY]);
 
+  React.useEffect(() => {
+    statePanYRef.current = statePanY;
+    statePanMaxYRef.current = statePanMaxY;
+  }, [statePanY, statePanMaxY]);
+
+  React.useEffect(() => {
+    if (!historyOpen || !compactLayout) return;
+    const alignHistoryPanel = () => {
+      requestAnimationFrame(() => {
+        historyPanelRef.current?.scrollIntoView({ block: "nearest" });
+      });
+    };
+    alignHistoryPanel();
+    const visualViewport = window.visualViewport;
+    visualViewport?.addEventListener("resize", alignHistoryPanel);
+    visualViewport?.addEventListener("scroll", alignHistoryPanel);
+    return () => {
+      visualViewport?.removeEventListener("resize", alignHistoryPanel);
+      visualViewport?.removeEventListener("scroll", alignHistoryPanel);
+    };
+  }, [historyOpen, compactLayout]);
+
   function sendControlInput(data: string) {
     if (!pane.sessionId || !streamId.current || !socket.current) return;
+    if (directTransport.current?.sendInput(data)) return;
     sendEnvelope(socket.current, "control.input", pane.sessionId, streamId.current, { data });
   }
 
@@ -4338,6 +4581,32 @@ function TerminalPane({
     if (resizeSyncTimer.current === null) return;
     window.clearTimeout(resizeSyncTimer.current);
     resizeSyncTimer.current = null;
+  }
+
+  function clearAttachRecoveryTimer() {
+    if (attachRecoveryTimer.current === null) return;
+    window.clearTimeout(attachRecoveryTimer.current);
+    attachRecoveryTimer.current = null;
+  }
+
+  function clearDelayedFitTimers() {
+    if (delayedFitTimers.current.length === 0) return;
+    delayedFitTimers.current.forEach((timer) => window.clearTimeout(timer));
+    delayedFitTimers.current = [];
+  }
+
+  function scheduleAttachRecovery() {
+    clearAttachRecoveryTimer();
+    attachRecoveryTimer.current = window.setTimeout(() => {
+      attachRecoveryTimer.current = null;
+      if (!pane.sessionId || !socket.current || socket.current.readyState !== WebSocket.OPEN) return;
+      const hasRenderedState = Boolean(terminalMode.mode) || Boolean(cellSnapshot) || Boolean(terminal.current?.buffer.active.length);
+      if (hasRenderedState) return;
+      sendSizeReset();
+      const size = currentTerminalSize();
+      if (size) scheduleRemoteSizeSync(size);
+      setStatus({ tone: "warn", title: "Terminal recovery", detail: "Attach stalled; retrying remote size reset." });
+    }, 2200);
   }
 
   function scheduleRemoteSizeSync(size: { cols: number; rows: number }) {
@@ -4375,21 +4644,86 @@ function TerminalPane({
     });
   }
 
+  function applyDirectTransportStatus(status: DirectTransportStatus) {
+    setTerminalMode((current) => ({
+      ...current,
+      channel_mode: current.channel_mode || "p2p_preferred",
+      channel_state: status.state === "direct" ? "p2p_direct" : status.state,
+      grant_id: status.grantId || current.grant_id,
+      fallback: status.state === "relay_fallback" ? status.message || current.fallback : current.fallback,
+      fallback_reason: status.reason || current.fallback_reason,
+    }));
+    if (status.state === "negotiating") {
+      setStatus({ tone: "warn", title: "P2P negotiating", detail: status.detail || (status.grantId ? `grant ${shortID(status.grantId)}` : "waiting for worker") });
+    }
+    if (status.state === "relay_fallback") {
+      setStatus({ tone: "warn", title: "P2P relay fallback", detail: status.detail || status.message || status.reason || "using Hub relay" });
+    }
+    if (status.state === "direct") {
+      setStatus({ tone: "ok", title: "P2P direct", detail: status.detail || (status.grantId ? `grant ${shortID(status.grantId)}` : "connected") });
+    }
+  }
+
   function openHistoryPanel() {
+    if (compactLayout && document.activeElement === helperTextareaRef.current) {
+      helperTextareaRef.current?.blur();
+    }
+    setMobileActionsOpen(false);
     setHistoryOpen(true);
     if (historyLines.length === 0) {
       requestHistoryPage(true);
     }
+    requestAnimationFrame(() => {
+      historyPanelRef.current?.scrollIntoView({ block: "nearest" });
+    });
   }
 
-  function nudgeStatePan(delta: number) {
+  function blurTerminalInput() {
+    helperTextareaRef.current?.blur();
+  }
+
+  function focusTerminalInput() {
+    requestAnimationFrame(() => terminal.current?.focus());
+  }
+
+  function handleTerminalTouchStart(event: React.TouchEvent<HTMLDivElement>) {
+    const touch = event.touches[0];
+    if (!touch) return;
+    const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+    touchFocusGesture.current = { x: touch.clientX, y: touch.clientY, moved: false, scrollTop: viewport?.scrollTop || 0 };
+    onFocus();
+  }
+
+  function handleTerminalTouchMove(event: React.TouchEvent<HTMLDivElement>) {
+    const touch = event.touches[0];
+    const gesture = touchFocusGesture.current;
+    if (!touch || !gesture) return;
+    const deltaX = touch.clientX - gesture.x;
+    const deltaY = touch.clientY - gesture.y;
+    if (Math.abs(deltaX) > 8 || Math.abs(deltaY) > 8) {
+      gesture.moved = true;
+      blurTerminalInput();
+    }
+    const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+    if (!viewport) return;
+    viewport.scrollTop = gesture.scrollTop - deltaY;
+  }
+
+  function handleTerminalTouchEnd() {
+    const gesture = touchFocusGesture.current;
+    touchFocusGesture.current = null;
+    if (!gesture || gesture.moved) return;
+    focusTerminalInput();
+  }
+
+  function nudgeStatePan(delta: number, focusTerminal = true) {
     setStatePanX((value) => clampNumber(value + delta, 0, statePanMaxX));
-    terminal.current?.focus();
+    if (focusTerminal) terminal.current?.focus();
   }
 
-  function nudgeStatePanY(delta: number) {
+  function nudgeStatePanY(delta: number, focusTerminal = true) {
     setStatePanY((value) => clampNumber(value + delta, 0, statePanMaxY));
-    terminal.current?.focus();
+    if (focusTerminal) terminal.current?.focus();
   }
 
   function handleStateWheel(event: WheelEvent, target: HTMLDivElement) {
@@ -4428,8 +4762,9 @@ function TerminalPane({
     const rect = target.getBoundingClientRect();
     const viewportCols = Math.max(1, Math.min(viewportSize.cols || cellSnapshot.cols || 80, cellSnapshot.cols || viewportSize.cols || 80));
     const viewportRows = Math.max(1, Math.min(viewportSize.rows || cellSnapshot.rows || 24, cellSnapshot.rows || viewportSize.rows || 24));
-    const localCol = clampNumber(Math.floor(((event.clientX - rect.left) / Math.max(rect.width, 1)) * viewportCols), 0, viewportCols - 1);
-    const localRow = clampNumber(Math.floor(((event.clientY - rect.top) / Math.max(rect.height, 1)) * viewportRows), 0, viewportRows - 1);
+    const metrics = cellMetricsRef.current;
+    const localCol = clampNumber(Math.floor((event.clientX - rect.left) / Math.max(1, metrics.width)), 0, viewportCols - 1);
+    const localRow = clampNumber(Math.floor((event.clientY - rect.top) / Math.max(1, metrics.height)), 0, viewportRows - 1);
     const rowStart = cellViewportStartRow(cellSnapshot, viewportSize, statePanY);
     const x = clampNumber(statePanX + localCol, 0, Math.max(0, (cellSnapshot.cols || viewportCols) - 1));
     const y = clampNumber(rowStart + localRow, 0, Math.max(0, (cellSnapshot.rows || viewportRows) - 1));
@@ -4449,6 +4784,7 @@ function TerminalPane({
 
   function handleStatePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+    if (event.pointerType === "touch") return;
     const button = pointerButtonName(event.button);
     if (!button) return;
     mouseDownButton.current = button;
@@ -4458,16 +4794,85 @@ function TerminalPane({
   }
 
   function handleStatePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "touch") return;
     if (!mouseDownButton.current) return;
     sendTerminalMouse(event, mouseDownButton.current, { motion: true });
   }
 
   function handleStatePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "touch") return;
     if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
     const button = mouseDownButton.current || pointerButtonName(event.button);
     mouseDownButton.current = "";
     if (!button) return;
     sendTerminalMouse(event, button, { release: true });
+  }
+
+  function handleStateTouchStart(event: React.TouchEvent<HTMLDivElement>) {
+    const touch = event.touches[0];
+    if (!touch) return;
+    stateTouch.current = { x: touch.clientX, y: touch.clientY, carryX: 0, carryY: 0 };
+  }
+
+  function handleStateTouchMove(event: React.TouchEvent<HTMLDivElement>) {
+    const touch = event.touches[0];
+    const gesture = stateTouch.current;
+    if (!touch || !gesture) return;
+    const deltaX = touch.clientX - gesture.x;
+    const deltaY = touch.clientY - gesture.y;
+    if (Math.abs(deltaX) < 2 && Math.abs(deltaY) < 2) return;
+    event.preventDefault();
+    event.stopPropagation();
+    gesture.x = touch.clientX;
+    gesture.y = touch.clientY;
+    gesture.carryX += deltaX;
+    gesture.carryY += deltaY;
+    if (!gesture.axis) {
+      const absX = Math.abs(gesture.carryX);
+      const absY = Math.abs(gesture.carryY);
+      if (absY >= 6 && absY >= absX * 0.7) {
+        gesture.axis = "y";
+      } else if (statePanMaxX > 0 && absX >= 24 && absX > absY * 1.35) {
+        gesture.axis = "x";
+      }
+    }
+    if (gesture.axis === "x") {
+      const colPx = Math.max(6, cellMetricsRef.current.width);
+      const cols = Math.trunc(gesture.carryX / colPx);
+      if (cols !== 0) {
+        nudgeStatePan(-cols, false);
+        gesture.carryX -= cols * colPx;
+      }
+      return;
+    }
+    const rowPx = Math.max(10, cellMetricsRef.current.height * 0.7);
+    const rows = Math.trunc(gesture.carryY / rowPx);
+    if (rows === 0) return;
+    if (rows > 0 && statePanYRef.current >= statePanMaxYRef.current) {
+      requestHistoryPage(false);
+      gesture.carryY = 0;
+      return;
+    }
+    nudgeStatePanY(rows, false);
+    gesture.carryY -= rows * rowPx;
+  }
+
+  function handleStateTouchEnd() {
+    stateTouch.current = null;
+  }
+
+  function syncSelectionToClipboard(term: Terminal) {
+    if (!term.hasSelection()) return;
+    const selection = term.getSelection();
+    if (!selection || selection === latestXtermSelection.current) return;
+    void copyText(selection).then(
+      () => {
+        latestXtermSelection.current = selection;
+      },
+      () => {
+        latestXtermSelection.current = "";
+      },
+    );
   }
 
   function currentTerminalSize() {
@@ -4494,8 +4899,10 @@ function TerminalPane({
       cursorBlink: true,
       scrollback: 5000,
       scrollOnUserInput: true,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-      fontSize: 14,
+      fontFamily: terminalFontFamily,
+      fontSize: terminalFontSize,
+      lineHeight: terminalLineHeight,
+      letterSpacing: 0,
       theme: xtermTheme,
     });
     const fitAddon = new FitAddon();
@@ -4525,12 +4932,40 @@ function TerminalPane({
     streamId.current = makeStreamId(pane.sessionId);
     const ws = new WebSocket(`${wsBaseFromLocation()}/ws/control?token=${encodeURIComponent(token)}`);
     socket.current = ws;
+    const direct = new DirectTransportController(ws, pane.sessionId, streamId.current, applyDirectTransportStatus, (data) => term.write(data));
+    directTransport.current = direct;
+    const sendTerminalInput = (data: string) => {
+      if (!data) return;
+      if (direct.sendInput(data)) return;
+      sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+    };
 
     const fitTerminal = () => {
       if (!terminalRef.current) return;
       const rect = terminalRef.current.getBoundingClientRect();
       if (rect.width < 20 || rect.height < 20) return;
       fitAddon.fit();
+      const xterm = terminalRef.current.querySelector<HTMLElement>(".xterm");
+      const screen = terminalRef.current.querySelector<HTMLElement>(".xterm-screen");
+      const viewport = terminalRef.current.querySelector<HTMLElement>(".xterm-viewport");
+      if (xterm) {
+        xterm.style.width = `${Math.round(rect.width)}px`;
+        xterm.style.height = `${Math.round(rect.height)}px`;
+      }
+      if (screen) {
+        screen.style.width = `${Math.round(rect.width)}px`;
+        screen.style.height = `${Math.round(rect.height)}px`;
+      }
+      if (viewport) {
+        viewport.style.width = `${Math.round(rect.width)}px`;
+        viewport.style.height = `${Math.round(rect.height)}px`;
+      }
+      term.refresh(0, Math.max(0, term.rows - 1));
+      const metrics = measureXtermMetrics(terminalRef.current);
+      if (metrics.width > 0 && metrics.height > 0) {
+        cellMetricsRef.current = metrics;
+        setCellMetrics(metrics);
+      }
       const size = { cols: term.cols, rows: term.rows };
       if (viewportSizeRef.current.cols !== size.cols || viewportSizeRef.current.rows !== size.rows) {
         viewportSizeRef.current = size;
@@ -4552,10 +4987,19 @@ function TerminalPane({
       }
     };
     const scheduleFit = () => {
+      clearDelayedFitTimers();
       requestAnimationFrame(() => {
         fitAndSendResize();
         requestAnimationFrame(fitAndSendResize);
       });
+      if (compactLayout) {
+        [48, 120, 260].forEach((delay) => {
+          const timer = window.setTimeout(() => {
+            fitAndSendResize();
+          }, delay);
+          delayedFitTimers.current.push(timer);
+        });
+      }
     };
     scheduleFit();
 
@@ -4564,7 +5008,7 @@ function TerminalPane({
       sendEnvelope(ws, "control.open", pane.sessionId!, streamId.current, {
         ...(size || { cols: term.cols, rows: term.rows }),
         target: pane.target,
-        capabilities: ["terminal.snapshot.v1", "terminal.state_reset.v1", "terminal.size_control.v1", "terminal.history.v1"],
+        capabilities: ["terminal.snapshot.v1", "terminal.state_reset.v1", "terminal.size_control.v1", "terminal.history.v1", "terminal.cells.v1"],
         transport_mode: "auto",
         render_mode: "worker_state_xterm",
         resize_policy: "worker_state",
@@ -4576,15 +5020,18 @@ function TerminalPane({
       }
       setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: streamId.current });
       scheduleFit();
+      scheduleAttachRecovery();
     });
     ws.addEventListener("message", (event) => {
       const env = JSON.parse(event.data);
       if (env.type === "terminal.output") {
+        clearAttachRecoveryTimer();
         const payload = env.payload || {};
         if (payload.encoding === "base64") term.write(base64ToBytes(payload.data || ""));
         else term.write(payload.data || "");
       }
       if (env.type === "terminal.snapshot") {
+        clearAttachRecoveryTimer();
         const payload = env.payload || {};
         if (payload.encoding === "ansi-screen-v1") {
           term.reset();
@@ -4597,7 +5044,7 @@ function TerminalPane({
         if (payload.encoding === "ansi-lines-v1") {
           term.reset();
           term.clear();
-          term.write(snapshotLinesToTerminal(payload.data || ""), () => {
+          term.write(snapshotLinesToTerminal(payload.data || "", term.rows), () => {
             term.scrollToBottom();
             term.focus();
           });
@@ -4615,6 +5062,7 @@ function TerminalPane({
         setCellSnapshot((current) => applyTerminalDiff(current, payload));
       }
       if (env.type === "terminal.state.reset") {
+        clearAttachRecoveryTimer();
         const payload = env.payload || {};
         term.reset();
         setCellSnapshot(null);
@@ -4628,6 +5076,7 @@ function TerminalPane({
         setStatus({ tone: "warn", title: "Remote terminal resized", detail: `${payload.reason || "state reset"} · ${payload.cols || "?"}x${payload.rows || "?"}` });
       }
       if (env.type === "terminal.mode") {
+        clearAttachRecoveryTimer();
         const payload = (env.payload || {}) as TerminalModePayload;
         resizePolicy.current = payload.resize_policy || (payload.mode === "attach" ? "follow_control" : "worker_state");
         setTerminalMode((current) => ({ ...current, ...payload }));
@@ -4636,25 +5085,33 @@ function TerminalPane({
       }
       if (env.type === "p2p.grant") {
         const payload = (env.payload || {}) as P2PGrantPayload;
+        const grantId = payload.grant_id || "";
         setTerminalMode((current) => ({
           ...current,
           channel_mode: payload.allowed_transport || current.channel_mode || "p2p_preferred",
           channel_state: payload.state || "issued",
-          grant_id: payload.grant_id || current.grant_id,
+          grant_id: grantId || current.grant_id,
         }));
-        setStatus({ tone: "warn", title: "P2P grant issued", detail: payload.grant_id ? `grant ${shortID(payload.grant_id)}` : "waiting for signaling" });
+        if (grantId && terminalChannelPreference === "p2p_preferred") {
+          direct.start(payload);
+        } else {
+          setStatus({ tone: "warn", title: "P2P grant issued", detail: payload.ice_servers?.length ? `${grantId ? `grant ${shortID(grantId)} · ` : ""}${payload.ice_servers.length} ICE servers` : grantId ? `grant ${shortID(grantId)}` : "waiting for signaling" });
+        }
       }
       if (env.type === "p2p.signal") {
         const payload = (env.payload || {}) as P2PSignalPayload;
+        const directStatus = direct.acceptSignal(payload);
         setTerminalMode((current) => ({
           ...current,
           channel_mode: current.channel_mode || "p2p_preferred",
-          channel_state: payload.state || (payload.signal === "fallback" ? "relay_fallback" : current.channel_state),
+          channel_state: directStatus ? (directStatus.state === "direct" ? "p2p_direct" : directStatus.state) : payload.state || (payload.signal === "fallback" ? "relay_fallback" : current.channel_state),
           grant_id: payload.grant_id || current.grant_id,
-          fallback: payload.signal === "fallback" ? payload.message || current.fallback : current.fallback,
+          fallback: payload.signal === "fallback" || payload.signal === "unsupported" ? payload.message || current.fallback : current.fallback,
           fallback_reason: payload.reason || current.fallback_reason,
         }));
-        if (payload.signal === "fallback") {
+        if (directStatus) {
+          applyDirectTransportStatus(directStatus);
+        } else if (payload.signal === "fallback" || payload.signal === "unsupported") {
           setStatus({ tone: "warn", title: "P2P relay fallback", detail: payload.message || payload.reason || "using Hub relay" });
         }
       }
@@ -4679,6 +5136,7 @@ function TerminalPane({
     });
     ws.addEventListener("close", () => setStatus({ tone: "warn", title: `Detached ${attachedLabel}`, detail: "The browser stream closed." }));
     const helperTextarea = terminalRef.current.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+    helperTextareaRef.current = helperTextarea;
     const onCompositionStart = () => {
       composing.current = true;
       compositionText.current = "";
@@ -4691,12 +5149,31 @@ function TerminalPane({
       composing.current = false;
       compositionText.current = "";
       suppressNextText.current = data;
-      if (data && activeRef.current) sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+      if (data && activeRef.current) sendTerminalInput(data);
       if (helperTextarea) helperTextarea.value = "";
     };
     helperTextarea?.addEventListener("compositionstart", onCompositionStart);
     helperTextarea?.addEventListener("compositionupdate", onCompositionUpdate);
     helperTextarea?.addEventListener("compositionend", onCompositionEnd);
+    const onHelperBeforeInput = (event: InputEvent) => {
+      if (!activeRef.current) return;
+      if (event.inputType !== "insertLineBreak") return;
+      event.preventDefault();
+      suppressNextText.current = "";
+      sendTerminalInput("\r");
+      if (helperTextarea) helperTextarea.value = "";
+    };
+    const onHelperKeyDown = (event: KeyboardEvent) => {
+      if (!activeRef.current) return;
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      event.stopPropagation();
+      suppressNextText.current = "";
+      sendTerminalInput("\r");
+      if (helperTextarea) helperTextarea.value = "";
+    };
+    helperTextarea?.addEventListener("beforeinput", onHelperBeforeInput);
+    helperTextarea?.addEventListener("keydown", onHelperKeyDown, true);
     const terminalElement = terminalRef.current;
     const requestShortcutLock = () => {
       void lockTerminalShortcutKeys();
@@ -4717,8 +5194,18 @@ function TerminalPane({
       }
       if (composing.current && isPrintableText(data)) return;
       suppressNextText.current = "";
-      sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+      sendTerminalInput(data);
     });
+    const selectionDisposable = term.onSelectionChange(() => {
+      if (!term.hasSelection()) {
+        latestXtermSelection.current = "";
+      }
+    });
+    const onMouseUpCopySelection = () => {
+      syncSelectionToClipboard(term);
+    };
+    terminalElement.addEventListener("mouseup", onMouseUpCopySelection);
+    terminalElement.addEventListener("pointerup", onMouseUpCopySelection);
     term.attachCustomKeyEventHandler((event) => {
       if (terminalInputSuppressed()) return true;
       if (!activeRef.current) return true;
@@ -4729,12 +5216,20 @@ function TerminalPane({
       if (!data) return true;
       event.preventDefault();
       event.stopPropagation();
-      sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+      sendTerminalInput(data);
       return false;
     });
     const onDocumentKeyDown = (event: KeyboardEvent) => {
       if (terminalInputSuppressed()) return;
       if (!activeRef.current || event.defaultPrevented) return;
+      if (event.key === "Escape" && !isEditableEventTarget(event.target)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        term.focus();
+        sendTerminalInput("\x1b");
+        return;
+      }
       if (!terminalHasKeyboardFocus(event, terminalRef.current)) return;
       if (!shouldSendKeyDownManually(event)) return;
       const data = encodeKeyEvent(event);
@@ -4744,7 +5239,7 @@ function TerminalPane({
       event.stopPropagation();
       event.stopImmediatePropagation();
       term.focus();
-      sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
+      sendTerminalInput(data);
     };
     document.addEventListener("keydown", onDocumentKeyDown, true);
 
@@ -4752,27 +5247,48 @@ function TerminalPane({
       scheduleFit();
     });
     observer.observe(terminalRef.current);
+    const visualViewport = window.visualViewport;
+    const onVisualViewportResize = () => scheduleFit();
+    const onWindowResize = () => scheduleFit();
+    visualViewport?.addEventListener("resize", onVisualViewportResize);
+    visualViewport?.addEventListener("scroll", onVisualViewportResize);
+    window.addEventListener("resize", onWindowResize);
+    window.addEventListener("orientationchange", onWindowResize);
 
     return () => {
+      direct.close();
+      directTransport.current = null;
+      clearAttachRecoveryTimer();
       clearResizeSyncTimer();
+      clearDelayedFitTimers();
       dataDisposable.dispose();
       document.removeEventListener("keydown", onDocumentKeyDown, true);
       helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
       helperTextarea?.removeEventListener("compositionupdate", onCompositionUpdate);
       helperTextarea?.removeEventListener("compositionend", onCompositionEnd);
+      helperTextarea?.removeEventListener("beforeinput", onHelperBeforeInput);
+      helperTextarea?.removeEventListener("keydown", onHelperKeyDown, true);
       terminalElement.removeEventListener("pointerdown", requestShortcutLock);
+      terminalElement.removeEventListener("mouseup", onMouseUpCopySelection);
+      terminalElement.removeEventListener("pointerup", onMouseUpCopySelection);
       helperTextarea?.removeEventListener("focus", requestShortcutLock);
       helperTextarea?.removeEventListener("blur", releaseShortcutLock);
+      visualViewport?.removeEventListener("resize", onVisualViewportResize);
+      visualViewport?.removeEventListener("scroll", onVisualViewportResize);
+      window.removeEventListener("resize", onWindowResize);
+      window.removeEventListener("orientationchange", onWindowResize);
       unlockTerminalShortcutKeys();
       observer.disconnect();
+      selectionDisposable.dispose();
       if (ws.readyState === WebSocket.OPEN) sendEnvelope(ws, "terminal.close", pane.sessionId!, streamId.current, {});
       ws.close();
+      helperTextareaRef.current = null;
       term.dispose();
       terminal.current = null;
       fit.current = null;
       socket.current = null;
     };
-  }, [pane.sessionId, paneTargetKey, terminalChannelPreference, token, setStatus]);
+  }, [pane.sessionId, paneTargetKey, terminalChannelPreference, token, compactLayout, setStatus]);
 
   return (
     <div
@@ -4781,12 +5297,27 @@ function TerminalPane({
       onPointerDown={(event) => {
         if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
         onFocus();
-        terminal.current?.focus();
+        requestAnimationFrame(() => terminal.current?.focus());
       }}
       onMouseDown={(event) => {
         if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
         onFocus();
-        terminal.current?.focus();
+        requestAnimationFrame(() => terminal.current?.focus());
+      }}
+      onTouchStart={(event) => {
+        if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        handleTerminalTouchStart(event);
+      }}
+      onTouchMove={(event) => {
+        if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        handleTerminalTouchMove(event);
+      }}
+      onTouchEnd={(event) => {
+        if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        handleTerminalTouchEnd();
+      }}
+      onTouchCancel={() => {
+        touchFocusGesture.current = null;
       }}
       onDragOver={(event) => {
         if (simple) return;
@@ -4867,51 +5398,8 @@ function TerminalPane({
 	              ) : null}
 	            </>
 	          ) : null}
-	          {workerStateMode ? (
+	          {canShowTerminalRecoveryActions ? (
 	            <div className="hidden items-center gap-1 md:flex">
-	              <Button
-	                variant="ghost"
-	                size="xs"
-	                className="h-7 px-1.5"
-	                onClick={(event) => {
-	                  event.stopPropagation();
-	                  setStateOpen(true);
-	                }}
-	                disabled={!cellSnapshot}
-	                title={cellSnapshot ? "Open worker-side cell state" : "Worker-side cell state has not arrived yet"}
-	              >
-	                <Monitor className="h-3.5 w-3.5" />
-	                State
-	              </Button>
-	              <Button
-	                variant={stateRenderer ? "secondary" : "ghost"}
-	                size="xs"
-	                className="h-7 px-1.5"
-	                onClick={(event) => {
-	                  event.stopPropagation();
-	                  setStateRenderer((value) => !value);
-	                  requestAnimationFrame(() => terminal.current?.focus());
-	                }}
-		                disabled={!cellSnapshot}
-		                title={cellSnapshot ? "Show worker-side cell state for diagnostics" : "Waiting for worker-side cells snapshot"}
-		              >
-		                <Bug className="h-3.5 w-3.5" />
-		                Debug
-		              </Button>
-	              <Button
-	                variant="ghost"
-	                size="xs"
-	                className="h-7 px-1.5"
-	                onClick={(event) => {
-	                  event.stopPropagation();
-	                  openHistoryPanel();
-	                }}
-	                loading={historyLoading}
-	                title="Open worker-side history page"
-	              >
-	                <History className="h-3.5 w-3.5" />
-	                History
-	              </Button>
 	              <Button
 	                variant="ghost"
 	                size="xs"
@@ -4938,6 +5426,53 @@ function TerminalPane({
 		                <RefreshCw className="h-3.5 w-3.5" />
 		                Reset
 		              </Button>
+	              {workerStateMode ? (
+	                <>
+	                  <Button
+	                    variant="ghost"
+	                    size="xs"
+	                    className="h-7 px-1.5"
+	                    onClick={(event) => {
+	                      event.stopPropagation();
+	                      setStateOpen(true);
+	                    }}
+	                    disabled={!cellSnapshot}
+	                    title={cellSnapshot ? "Open worker-side cell state" : "Worker-side cell state has not arrived yet"}
+	                  >
+	                    <Monitor className="h-3.5 w-3.5" />
+	                    State
+	                  </Button>
+	                  <Button
+	                    variant={stateRenderer ? "secondary" : "ghost"}
+	                    size="xs"
+	                    className="h-7 px-1.5"
+	                    onClick={(event) => {
+	                      event.stopPropagation();
+	                      setStateRenderer((value) => !value);
+	                      requestAnimationFrame(() => terminal.current?.focus());
+	                    }}
+	                    disabled={!cellSnapshot}
+	                    title={cellSnapshot ? "Open worker-side cell diagnostics" : "Waiting for worker-side cells snapshot"}
+	                  >
+	                    <Bug className="h-3.5 w-3.5" />
+	                    Debug
+	                  </Button>
+	                  <Button
+	                    variant="ghost"
+	                    size="xs"
+	                    className="h-7 px-1.5"
+	                    onClick={(event) => {
+	                      event.stopPropagation();
+	                      openHistoryPanel();
+	                    }}
+	                    loading={historyLoading}
+	                    title="Open worker-side history page"
+	                  >
+	                    <History className="h-3.5 w-3.5" />
+	                    History
+	                  </Button>
+	                </>
+	              ) : null}
 	            </div>
 	          ) : null}
 	          {!simple ? (
@@ -5010,54 +5545,8 @@ function TerminalPane({
 	                      Prefix settings
 	                    </Button>
 	                  ) : null}
-	                  {workerStateMode ? (
+	                  {canShowTerminalRecoveryActions ? (
 	                    <>
-	                      <Button
-	                        variant="ghost"
-	                        size="sm"
-	                        className="w-full justify-start"
-	                        onClick={(event) => {
-	                          event.stopPropagation();
-	                          setMobileActionsOpen(false);
-	                          setStateOpen(true);
-	                        }}
-	                        disabled={!cellSnapshot}
-	                        title={cellSnapshot ? "Open worker-side cell state" : "Worker-side cell state has not arrived yet"}
-	                      >
-	                        <Monitor className="h-3.5 w-3.5" />
-	                        State
-	                      </Button>
-	                      <Button
-	                        variant={stateRenderer ? "secondary" : "ghost"}
-	                        size="sm"
-	                        className="w-full justify-start"
-	                        onClick={(event) => {
-	                          event.stopPropagation();
-	                          setMobileActionsOpen(false);
-	                          setStateRenderer((value) => !value);
-	                          requestAnimationFrame(() => terminal.current?.focus());
-	                        }}
-		                        disabled={!cellSnapshot}
-		                        title={cellSnapshot ? "Show worker-side cell state for diagnostics" : "Waiting for worker-side cells snapshot"}
-		                      >
-		                        <Bug className="h-3.5 w-3.5" />
-		                        Debug
-		                      </Button>
-	                      <Button
-	                        variant="ghost"
-	                        size="sm"
-	                        className="w-full justify-start"
-	                        onClick={(event) => {
-	                          event.stopPropagation();
-	                          setMobileActionsOpen(false);
-	                          openHistoryPanel();
-	                        }}
-	                        loading={historyLoading}
-	                        title="Open worker-side history page"
-	                      >
-	                        <History className="h-3.5 w-3.5" />
-	                        History
-	                      </Button>
 	                      <Button
 	                        variant="ghost"
 	                        size="sm"
@@ -5086,6 +5575,56 @@ function TerminalPane({
 		                        <RefreshCw className="h-3.5 w-3.5" />
 		                        Reset
 		                      </Button>
+	                      {workerStateMode ? (
+	                        <>
+	                          <Button
+	                            variant="ghost"
+	                            size="sm"
+	                            className="w-full justify-start"
+	                            onClick={(event) => {
+	                              event.stopPropagation();
+	                              setMobileActionsOpen(false);
+	                              setStateOpen(true);
+	                            }}
+	                            disabled={!cellSnapshot}
+	                            title={cellSnapshot ? "Open worker-side cell state" : "Worker-side cell state has not arrived yet"}
+	                          >
+	                            <Monitor className="h-3.5 w-3.5" />
+	                            State
+	                          </Button>
+	                          <Button
+	                            variant={stateRenderer ? "secondary" : "ghost"}
+	                            size="sm"
+	                            className="w-full justify-start"
+	                            onClick={(event) => {
+	                              event.stopPropagation();
+	                              setMobileActionsOpen(false);
+	                              setStateRenderer((value) => !value);
+	                              requestAnimationFrame(() => terminal.current?.focus());
+	                            }}
+	                            disabled={!cellSnapshot}
+	                            title={cellSnapshot ? "Open worker-side cell diagnostics" : "Waiting for worker-side cells snapshot"}
+	                          >
+	                            <Bug className="h-3.5 w-3.5" />
+	                            Debug
+	                          </Button>
+	                          <Button
+	                            variant="ghost"
+	                            size="sm"
+	                            className="w-full justify-start"
+	                            onClick={(event) => {
+	                              event.stopPropagation();
+	                              setMobileActionsOpen(false);
+	                              openHistoryPanel();
+	                            }}
+	                            loading={historyLoading}
+	                            title="Open worker-side history page"
+	                          >
+	                            <History className="h-3.5 w-3.5" />
+	                            History
+	                          </Button>
+	                        </>
+	                      ) : null}
 	                    </>
 	                  ) : null}
 	                  {!simple ? (
@@ -5143,17 +5682,22 @@ function TerminalPane({
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden p-1">
         {pane.sessionId ? (
           <div className="relative h-full min-h-0 min-w-0">
-            <div ref={terminalRef} className={cn("h-full w-full min-w-0 overflow-hidden", stateViewActive && "pointer-events-none opacity-0")} />
+            <div ref={terminalRef} className={cn("agentmux-terminal-interactive h-full w-full min-w-0 overflow-hidden", stateViewActive && "agentmux-xterm-underlay")} />
             {stateViewActive ? (
               <div
                 ref={inlineStateScreenRef}
-                className="agentmux-cell-screen absolute inset-0 overflow-hidden bg-[#050607] p-1 font-mono text-[11px] leading-5 text-[#eef2f3]"
+                className="agentmux-terminal-interactive agentmux-terminal-state-surface agentmux-cell-screen absolute inset-0 overflow-hidden bg-[#050607] text-[#eef2f3]"
+                style={terminalCellScreenStyle(viewportSize, cellMetrics)}
                 onPointerDown={handleStatePointerDown}
                 onPointerMove={handleStatePointerMove}
                 onPointerUp={handleStatePointerUp}
                 onPointerCancel={() => {
                   mouseDownButton.current = "";
                 }}
+                onTouchStart={handleStateTouchStart}
+                onTouchMove={handleStateTouchMove}
+                onTouchEnd={handleStateTouchEnd}
+                onTouchCancel={handleStateTouchEnd}
               >
                 {renderCellViewport(cellSnapshot!, viewportSize, statePanX, statePanY)}
                 {statePanMaxX > 0 || statePanMaxY > 0 ? (
@@ -5191,6 +5735,7 @@ function TerminalPane({
             ) : null}
             {historyOpen ? (
               <div
+                ref={historyPanelRef}
                 data-terminal-chrome
                 className="absolute inset-x-2 top-2 bottom-2 z-20 flex min-h-0 flex-col overflow-hidden rounded-md border border-border bg-card/95 shadow-2xl backdrop-blur"
                 onPointerDown={stopTerminalChromeEvent}
@@ -5228,7 +5773,7 @@ function TerminalPane({
                     </Button>
                   </div>
                 </div>
-                <div className="min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]">
+                <div className="agentmux-mobile-scroll min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]">
                   {historyError ? <div className="mb-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-red-200">{historyError}</div> : null}
                   {historyLines.length === 0 && !historyLoading ? <div className="text-muted-foreground">No worker-side history page returned yet.</div> : null}
                   {historyLines.map((line, index) => (
@@ -5287,9 +5832,10 @@ function TerminalPane({
                     </Button>
                   </div>
                 </div>
-                <div
-                  ref={modalStateScreenRef}
-                  className="agentmux-cell-screen min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]"
+              <div
+                ref={modalStateScreenRef}
+                  className="agentmux-cell-screen min-h-0 flex-1 overflow-auto bg-[#050607] text-[#eef2f3]"
+                  style={terminalCellScreenStyle(viewportSize, cellMetrics)}
                   onPointerDown={handleStatePointerDown}
                   onPointerMove={handleStatePointerMove}
                   onPointerUp={handleStatePointerUp}
@@ -5337,11 +5883,13 @@ function PrefixRecorderModal({
   onClose: () => void;
 }) {
   const [draft, setDraft] = React.useState(value || defaultTmuxPrefix);
+  const [manualDraft, setManualDraft] = React.useState(displayControlSequence(value || defaultTmuxPrefix));
   const recorderRef = React.useRef<HTMLDivElement | null>(null);
 
   React.useEffect(() => {
     if (!open) return;
     setDraft(value || defaultTmuxPrefix);
+    setManualDraft(displayControlSequence(value || defaultTmuxPrefix));
     void lockTerminalShortcutKeys();
     requestAnimationFrame(() => recorderRef.current?.focus());
     return () => {
@@ -5362,6 +5910,12 @@ function PrefixRecorderModal({
     const encoded = encodeKeyEvent(native);
     if (!encoded) return;
     setDraft(encoded);
+    setManualDraft(displayControlSequence(encoded));
+  }
+
+  function updateManualDraft(value: string) {
+    setManualDraft(value);
+    setDraft(parseControlSequence(value));
   }
 
   return (
@@ -5391,8 +5945,28 @@ function PrefixRecorderModal({
           {displayControlSequence(draft)}
         </div>
         <div className="mt-3 text-xs text-muted-foreground">Press a shortcut, then Enter or Save.</div>
+        <div className="mt-3 space-y-1">
+          <Input
+            value={manualDraft}
+            onChange={(event) => updateManualDraft(event.target.value)}
+            placeholder="Ctrl-b, C-t, Esc, \\x14, or literal text"
+            spellCheck={false}
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === "Enter" && draft) onSave(draft);
+            }}
+          />
+          <div className="text-[11px] text-muted-foreground">Type a sequence when the browser intercepts the real shortcut.</div>
+        </div>
         <div className="mt-4 flex items-center justify-between gap-2">
-          <Button variant="ghost" size="xs" onClick={() => setDraft(defaultTmuxPrefix)}>
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={() => {
+              setDraft(defaultTmuxPrefix);
+              setManualDraft(displayControlSequence(defaultTmuxPrefix));
+            }}
+          >
             Reset Ctrl-b
           </Button>
           <div className="flex items-center gap-2">
@@ -5573,8 +6147,12 @@ function clearSessionFromLayout(node: LayoutNode, sessionId: string): LayoutNode
 
 function setDragPayload(event: React.DragEvent, payload: DragPayload) {
   event.dataTransfer.effectAllowed = payload.kind === "pane" ? "move" : "copyMove";
-  event.dataTransfer.setData(dragMime, JSON.stringify(payload));
-  event.dataTransfer.setData("text/plain", payload.kind === "session" ? payload.sessionId : payload.paneId);
+  const normalizedPayload = payload.kind === "session" ? { ...payload, target: normalizeTerminalTarget(payload.target) } : payload;
+  event.dataTransfer.setData(dragMime, JSON.stringify(normalizedPayload));
+  event.dataTransfer.setData(
+    "text/plain",
+    normalizedPayload.kind === "session" ? [normalizedPayload.sessionId, terminalTargetShortLabel(normalizedPayload.target)].filter(Boolean).join(" ") : normalizedPayload.paneId,
+  );
 }
 
 function readDragPayload(event: React.DragEvent): DragPayload | null {
@@ -5582,7 +6160,7 @@ function readDragPayload(event: React.DragEvent): DragPayload | null {
   if (!value) return null;
   try {
     const payload = JSON.parse(value) as DragPayload;
-    if (payload.kind === "session" && payload.sessionId) return payload;
+    if (payload.kind === "session" && payload.sessionId) return { kind: "session", sessionId: payload.sessionId, target: normalizeTerminalTarget(payload.target) };
     if (payload.kind === "pane" && payload.paneId) return payload;
   } catch {
     return null;
@@ -5611,6 +6189,257 @@ function sendEnvelope(ws: WebSocket, type: string, sessionId: string, streamId: 
   ws.send(JSON.stringify({ type, session_id: sessionId, stream_id: streamId, payload }));
 }
 
+function normalizeRTCIceServers(servers?: P2PICEServerPayload[]): RTCIceServer[] {
+  if (!servers?.length) return [];
+  const normalized: RTCIceServer[] = [];
+  for (const server of servers) {
+    const urls = (server.urls || []).map((value) => value.trim()).filter(Boolean);
+    if (!urls.length) continue;
+    normalized.push({
+      urls,
+      username: (server.username || "").trim() || undefined,
+      credential: (server.credential || "").trim() || undefined,
+    });
+  }
+  return normalized;
+}
+
+class DirectTransportController {
+  private activeGrantId = "";
+  private fallbackTimer: number | null = null;
+  private peer: RTCPeerConnection | null = null;
+  private channel: RTCDataChannel | null = null;
+  private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
+
+  constructor(
+    private readonly ws: WebSocket,
+    private readonly sessionId: string,
+    private readonly streamId: string,
+    private readonly onStatus: (status: DirectTransportStatus) => void,
+    private readonly onData: (data: string | Uint8Array) => void,
+  ) {}
+
+  async start(grant: DirectTransportGrant) {
+    const grantId = grant.grant_id || "";
+    if (!grantId || this.activeGrantId === grantId || this.ws.readyState !== WebSocket.OPEN) return;
+    this.activeGrantId = grantId;
+    this.clearFallbackTimer();
+    this.onStatus({ state: "negotiating", grantId, detail: grant.ice_servers?.length ? `ice servers ${grant.ice_servers.length}` : "host candidates only" });
+    try {
+      await this.createOffer(grantId, grant);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "WebRTC offer failed";
+      this.onStatus({ state: "relay_fallback", grantId, reason: "control_webrtc_offer_failed", message });
+      sendEnvelope(this.ws, "p2p.signal", this.sessionId, this.streamId, {
+        grant_id: grantId,
+        from: "control",
+        to: "worker",
+        signal: "fallback",
+        state: "relay_fallback",
+        reason: "control_webrtc_offer_failed",
+        message,
+      });
+      return;
+    }
+    const fallbackAfterMs = Math.max(250, Math.min(30_000, grant.fallback_after_ms || 10_000));
+    this.fallbackTimer = window.setTimeout(() => {
+      if (this.activeGrantId !== grantId || this.ws.readyState !== WebSocket.OPEN) return;
+      const message = "P2P negotiation timed out; continuing over Hub relay.";
+      this.onStatus({ state: "relay_fallback", grantId, reason: "p2p_negotiation_timeout", message });
+      sendEnvelope(this.ws, "p2p.signal", this.sessionId, this.streamId, {
+        grant_id: grantId,
+        from: "control",
+        to: "worker",
+        signal: "fallback",
+        state: "relay_fallback",
+        reason: "p2p_negotiation_timeout",
+        message,
+      });
+    }, fallbackAfterMs);
+  }
+
+  acceptSignal(signal: P2PSignalPayload): DirectTransportStatus | null {
+    const grantId = signal.grant_id || this.activeGrantId;
+    if (!grantId || (this.activeGrantId && grantId !== this.activeGrantId)) return null;
+    if (!this.activeGrantId) this.activeGrantId = grantId;
+    if (signal.signal === "unsupported" || signal.signal === "fallback" || signal.state === "relay_fallback") {
+      this.clearFallbackTimer();
+      return { state: "relay_fallback", grantId, reason: signal.reason, message: signal.message };
+    }
+    if (signal.signal === "direct" || signal.state === "p2p_direct") {
+      this.clearFallbackTimer();
+      return { state: "direct", grantId, reason: signal.reason, message: signal.message };
+    }
+    if (signal.signal === "answer" && signal.sdp) {
+      void this.acceptAnswer(grantId, signal);
+      return { state: "negotiating", grantId, reason: signal.reason, message: signal.message };
+    }
+    if (signal.signal === "candidate" && signal.candidate) {
+      void this.acceptCandidate(signal);
+      return { state: "negotiating", grantId, reason: signal.reason, message: signal.message };
+    }
+    if (signal.signal === "close" || signal.state === "closed") {
+      this.clearFallbackTimer();
+      return { state: "closed", grantId, reason: signal.reason, message: signal.message };
+    }
+    if (signal.state === "negotiating" || signal.signal === "answer" || signal.signal === "answer_placeholder" || signal.signal === "candidate") {
+      return { state: "negotiating", grantId, reason: signal.reason, message: signal.message };
+    }
+    return null;
+  }
+
+  close() {
+    this.clearFallbackTimer();
+    this.activeGrantId = "";
+    this.channel?.close();
+    this.peer?.close();
+    this.channel = null;
+    this.peer = null;
+    this.pendingRemoteCandidates = [];
+  }
+
+  sendInput(data: string): boolean {
+    if (!data || !this.channel || this.channel.readyState !== "open") return false;
+    try {
+      this.channel.send(data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private clearFallbackTimer() {
+    if (this.fallbackTimer === null) return;
+    window.clearTimeout(this.fallbackTimer);
+    this.fallbackTimer = null;
+  }
+
+  private reportState(grantId: string, detail: string, state: DirectTransportState = "negotiating") {
+    this.onStatus({ state, grantId, detail });
+  }
+
+  private async createOffer(grantId: string, grant: DirectTransportGrant) {
+    this.peer?.close();
+    const peer = new RTCPeerConnection({ iceServers: normalizeRTCIceServers(grant.ice_servers) });
+    this.peer = peer;
+    this.pendingRemoteCandidates = [];
+    const pendingLocalCandidates: RTCIceCandidate[] = [];
+    let offerSent = false;
+    const sendCandidate = (candidate: RTCIceCandidate) => {
+      sendEnvelope(this.ws, "p2p.signal", this.sessionId, this.streamId, {
+        grant_id: grantId,
+        from: "control",
+        to: "worker",
+        signal: "candidate",
+        state: "negotiating",
+        candidate: candidate.candidate,
+        sdp_mid: candidate.sdpMid || "",
+        sdp_mline_index: candidate.sdpMLineIndex ?? undefined,
+      });
+    };
+    const channel = peer.createDataChannel("agentmux-terminal", { ordered: true });
+    channel.binaryType = "arraybuffer";
+    this.channel = channel;
+    channel.addEventListener("open", () => {
+      this.clearFallbackTimer();
+      this.onStatus({ state: "direct", grantId, message: "WebRTC data channel opened.", detail: "data channel open" });
+      sendEnvelope(this.ws, "p2p.signal", this.sessionId, this.streamId, {
+        grant_id: grantId,
+        from: "control",
+        to: "worker",
+        signal: "direct",
+        state: "p2p_direct",
+        message: "Control WebRTC data channel opened.",
+      });
+    });
+    channel.addEventListener("close", () => {
+      this.onStatus({ state: "closed", grantId, reason: "datachannel_closed", message: "WebRTC data channel closed.", detail: "data channel closed" });
+    });
+    channel.addEventListener("message", (event) => {
+      const data = event.data;
+      if (typeof data === "string") {
+        this.onData(data);
+        return;
+      }
+      if (data instanceof ArrayBuffer) {
+        this.onData(new Uint8Array(data));
+        return;
+      }
+      if (data instanceof Blob) {
+        void data.arrayBuffer().then((buffer) => this.onData(new Uint8Array(buffer)));
+      }
+    });
+    peer.addEventListener("icecandidate", (event) => {
+      if (!event.candidate) return;
+      if (!offerSent) {
+        pendingLocalCandidates.push(event.candidate);
+        return;
+      }
+      sendCandidate(event.candidate);
+    });
+    peer.addEventListener("icegatheringstatechange", () => {
+      this.reportState(grantId, `ice gathering ${peer.iceGatheringState}`);
+    });
+    peer.addEventListener("iceconnectionstatechange", () => {
+      const state = peer.iceConnectionState;
+      if (state === "failed" || state === "disconnected" || state === "closed") {
+        this.onStatus({ state: state === "closed" ? "closed" : "relay_fallback", grantId, reason: `ice_${state}`, message: `ICE ${state}.`, detail: `ice ${state}` });
+        return;
+      }
+      this.reportState(grantId, `ice ${state}`);
+    });
+    peer.addEventListener("connectionstatechange", () => {
+      const state = peer.connectionState;
+      if (state === "failed") {
+        this.onStatus({ state: "relay_fallback", grantId, reason: "peer_failed", message: "Peer connection failed.", detail: "peer failed" });
+        return;
+      }
+      if (state === "closed") {
+        this.onStatus({ state: "closed", grantId, reason: "peer_closed", message: "Peer connection closed.", detail: "peer closed" });
+        return;
+      }
+      this.reportState(grantId, `peer ${state}`);
+    });
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    sendEnvelope(this.ws, "p2p.signal", this.sessionId, this.streamId, {
+      grant_id: grantId,
+      from: "control",
+      to: "worker",
+      signal: "offer",
+      state: "negotiating",
+      sdp_type: offer.type,
+      sdp: offer.sdp || "",
+      message: "Control WebRTC offer.",
+    });
+    offerSent = true;
+    for (const candidate of pendingLocalCandidates.splice(0)) sendCandidate(candidate);
+  }
+
+  private async acceptAnswer(grantId: string, signal: P2PSignalPayload) {
+    if (!this.peer || !signal.sdp) return;
+    await this.peer.setRemoteDescription({ type: signal.sdp_type || "answer", sdp: signal.sdp });
+    for (const candidate of this.pendingRemoteCandidates.splice(0)) {
+      await this.peer.addIceCandidate(candidate);
+    }
+    this.onStatus({ state: "negotiating", grantId, message: "Worker WebRTC answer received.", detail: "answer received" });
+  }
+
+  private async acceptCandidate(signal: P2PSignalPayload) {
+    if (!this.peer || !signal.candidate) return;
+    const candidate: RTCIceCandidateInit = {
+      candidate: signal.candidate,
+      sdpMid: signal.sdp_mid || undefined,
+      sdpMLineIndex: signal.sdp_mline_index ?? undefined,
+    };
+    if (!this.peer.remoteDescription) {
+      this.pendingRemoteCandidates.push(candidate);
+      return;
+    }
+    await this.peer.addIceCandidate(candidate);
+  }
+}
+
 function base64ToBytes(value: string) {
   const text = atob(value);
   const bytes = new Uint8Array(text.length);
@@ -5618,10 +6447,12 @@ function base64ToBytes(value: string) {
   return bytes;
 }
 
-function snapshotLinesToTerminal(value: string) {
+function snapshotLinesToTerminal(value: string, rows = 0) {
   const normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const screen = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
-  return screen.replace(/\n/g, "\r\n");
+  const lines = screen === "" ? [] : screen.split("\n");
+  const padTop = rows > lines.length ? "\r\n".repeat(rows - lines.length) : "";
+  return padTop + lines.join("\r\n");
 }
 
 function suppressTerminalInput(durationMs = 600) {
@@ -5656,6 +6487,13 @@ function terminalHasKeyboardFocus(event: Event, element: Element | null) {
   if (!element) return false;
   if (event.target instanceof Node && element.contains(event.target)) return true;
   return document.activeElement instanceof Node && element.contains(document.activeElement);
+}
+
+function isEditableEventTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName.toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select";
 }
 
 const terminalShortcutLockCodes = [
@@ -5816,6 +6654,56 @@ function workerUpdateJobDetail(job: WorkerUpdateJob) {
   return [job.id, job.status, job.message].filter(Boolean).join(" · ");
 }
 
+function terminalCellScreenStyle(viewport?: TerminalSize | null, metrics?: TerminalCellMetrics): React.CSSProperties {
+  const width = Math.max(6, metrics?.width || cellMetricsFallbackWidth());
+  const height = Math.max(12, metrics?.height || cellMetricsFallbackHeight());
+  return {
+    fontFamily: terminalFontFamily,
+    fontSize: `${terminalFontSize}px`,
+    lineHeight: `${height}px`,
+    letterSpacing: 0,
+    wordSpacing: 0,
+    whiteSpace: "pre",
+    overflowAnchor: "none",
+    "--agentmux-cell-width": `${width}px`,
+    "--agentmux-cell-height": `${height}px`,
+    "--agentmux-view-cols": String(viewport?.cols || 0),
+    "--agentmux-view-rows": String(viewport?.rows || 0),
+  } as React.CSSProperties;
+}
+
+function cellSpanStyle(style?: React.CSSProperties): React.CSSProperties {
+  return {
+    ...style,
+    width: `var(--agentmux-cell-width, ${cellMetricsFallbackWidth()}px)`,
+    height: `var(--agentmux-cell-height, ${cellMetricsFallbackHeight()}px)`,
+    lineHeight: `var(--agentmux-cell-height, ${cellMetricsFallbackHeight()}px)`,
+    letterSpacing: 0,
+  };
+}
+
+function measureXtermMetrics(target: HTMLElement | null): TerminalCellMetrics {
+  if (!target) return { width: cellMetricsFallbackWidth(), height: cellMetricsFallbackHeight() };
+  const measure = target.querySelector<HTMLElement>(".xterm-char-measure-element");
+  if (!measure) return { width: cellMetricsFallbackWidth(), height: cellMetricsFallbackHeight() };
+  const rect = measure.getBoundingClientRect();
+  const style = window.getComputedStyle(measure);
+  const width = rect.width || Number.parseFloat(style.width || "") || cellMetricsFallbackWidth();
+  const height = rect.height || Number.parseFloat(style.height || "") || cellMetricsFallbackHeight();
+  return {
+    width: Math.max(6, width),
+    height: Math.max(12, height),
+  };
+}
+
+function cellMetricsFallbackWidth() {
+  return 8;
+}
+
+function cellMetricsFallbackHeight() {
+  return 16;
+}
+
 function workerUpdateRecommended(worker: WorkerView, recommendedVersion: string) {
   if (!normalizeComparableVersion(recommendedVersion)) return false;
   const current = normalizeComparableVersion(worker.software?.version || "");
@@ -5836,9 +6724,13 @@ function sleep(ms: number) {
 }
 
 async function copyText(value: string) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+  } catch {
+    // fall through
   }
   const textarea = document.createElement("textarea");
   textarea.value = value;
@@ -6176,6 +7068,10 @@ function groupTerminalTargetsByWindow(targets: TerminalTargetView[]) {
   return Array.from(groups.values());
 }
 
+function defaultTargetForWindowGroup(group: TargetWindowGroup) {
+  return group.targets.find((target) => target.pane_active && target.pane_id) || group.targets.find((target) => target.pane_id) || group.targets[0];
+}
+
 function paneLayoutBounds(targets: TerminalTargetView[]) {
   const positioned = targets.filter((target) => target.left !== undefined || target.top !== undefined || target.width !== undefined || target.height !== undefined);
   if (!positioned.length) return null;
@@ -6367,6 +7263,7 @@ function terminalChannelStatus(mode: TerminalModePayload, preference: TerminalCh
   const channelState = mode.channel_state || (preference === "p2p_preferred" ? "pending" : "relay");
   if (channelState === "p2p_direct" || channelMode === "p2p_direct") return { label: "p2p", tone: "ok" };
   if (channelState === "relay_fallback") return { label: "p2p fallback", tone: "warn" };
+  if (channelState === "negotiating") return { label: "p2p negotiating", tone: "warn" };
   if (channelMode === "p2p_preferred") return { label: "p2p pending", tone: "warn" };
   return { label: "relay" };
 }
@@ -6374,6 +7271,7 @@ function terminalChannelStatus(mode: TerminalModePayload, preference: TerminalCh
 function terminalChannelLabel(channelMode?: string, channelState?: string) {
   if (channelState === "p2p_direct" || channelMode === "p2p_direct") return "p2p";
   if (channelState === "relay_fallback") return "p2p fallback";
+  if (channelState === "negotiating") return "p2p negotiating";
   if (channelMode === "p2p_preferred") return "p2p preferred";
   return channelState || channelMode || "relay";
 }
@@ -6404,6 +7302,17 @@ function terminalStatePanMaxY(snapshot?: TerminalCellSnapshot | null, viewport?:
   const remoteRows = snapshot?.rows || snapshot?.lines?.length || 0;
   const viewportRows = viewport?.rows || remoteRows;
   return Math.max(0, remoteRows - viewportRows);
+}
+
+function terminalCellPixelSize(target: HTMLElement | null) {
+  if (!target) return { width: 8, height: 16 };
+  const style = window.getComputedStyle(target);
+  const fontSize = Number.parseFloat(style.fontSize || "14");
+  const lineHeight = Number.parseFloat(style.lineHeight || String(fontSize * 1.4));
+  return {
+    width: Math.max(6, fontSize * 0.6),
+    height: Math.max(10, Number.isFinite(lineHeight) ? lineHeight : fontSize * 1.4),
+  };
 }
 
 function cellViewportStartRow(snapshot: TerminalCellSnapshot, viewport?: TerminalSize | null, panY = 0) {
@@ -6462,7 +7371,7 @@ function renderCellLine(line: TerminalCell[], row: number, cols: number, startCo
           cell.link && "agentmux-cell-link",
           isCursor && "agentmux-cell-cursor",
         )}
-        style={style}
+        style={cellSpanStyle(style)}
         title={cell.link || undefined}
       >
         {text}
@@ -6592,16 +7501,28 @@ function displayControlSequence(value: string) {
 
 function parseControlSequence(value: string) {
   const trimmed = value.trim();
-  const ctrl = /^ctrl[-+ ](.+)$/i.exec(trimmed);
+  const ctrl = /^(?:ctrl|control|c)[-+ ](.+)$/i.exec(trimmed);
   if (ctrl) {
     const key = ctrl[1].trim();
     if (key.toLowerCase() === "space") return "\x00";
     if (key.length === 1) return controlSequence(key);
   }
+  const caret = /^\^(.+)$/i.exec(trimmed);
+  if (caret) {
+    const key = caret[1].trim();
+    if (key.length === 1) return controlSequence(key);
+  }
   if (/^\\x[0-9a-f]{2}$/i.test(trimmed)) {
     return String.fromCharCode(Number.parseInt(trimmed.slice(2), 16));
   }
+  if (/^\\u[0-9a-f]{4}$/i.test(trimmed)) {
+    return String.fromCharCode(Number.parseInt(trimmed.slice(2), 16));
+  }
   if (trimmed.toLowerCase() === "esc") return "\x1b";
+  if (trimmed.toLowerCase() === "escape") return "\x1b";
+  if (trimmed.toLowerCase() === "tab") return "\t";
+  if (trimmed.toLowerCase() === "enter") return "\r";
+  if (trimmed.toLowerCase() === "backspace") return "\x7f";
   return trimmed || defaultTmuxPrefix;
 }
 
