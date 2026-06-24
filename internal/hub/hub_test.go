@@ -241,7 +241,7 @@ func TestReapExpiredAnonymousWorkersKeepsActiveDirectToken(t *testing.T) {
 	}
 }
 
-func TestReapExpiredAnonymousWorkersInterruptsLiveWorker(t *testing.T) {
+func TestReapExpiredAnonymousWorkersDefersLiveWorker(t *testing.T) {
 	server, err := NewWithOptions(ServerOptions{Addr: ":0"})
 	if err != nil {
 		t.Fatal(err)
@@ -255,12 +255,9 @@ func TestReapExpiredAnonymousWorkersInterruptsLiveWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
-	controlDone := make(chan struct{})
 	worker := &workerConn{id: "anon-worker", tenantID: credential.TenantID, name: "anon", done: done}
-	control := &controlConn{id: "ctrl-anon", tenantID: credential.TenantID, done: controlDone}
 	record := workerRecord{id: worker.id, tenantID: worker.tenantID, name: worker.name, lastSeen: time.Now().UTC(), connected: true}
 	server.workers[worker.id] = worker
-	server.controls[control.id] = control
 	server.workerViews[worker.id] = record
 	if err := server.runtime.SaveWorker(record); err != nil {
 		t.Fatal(err)
@@ -270,33 +267,19 @@ func TestReapExpiredAnonymousWorkersInterruptsLiveWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reaped != 1 {
-		t.Fatalf("expected one worker reaped, got %d", reaped)
+	if reaped != 0 {
+		t.Fatalf("live worker should defer anonymous reap, got %d", reaped)
 	}
-	if _, ok := server.workerViews[worker.id]; ok {
-		t.Fatal("worker view should be removed")
+	if _, ok := server.workerViews[worker.id]; !ok {
+		t.Fatal("live worker view should remain")
 	}
-	if _, ok := server.workers[worker.id]; ok {
-		t.Fatal("live worker should be removed")
+	if _, ok := server.workers[worker.id]; !ok {
+		t.Fatal("live worker connection should remain")
 	}
 	select {
 	case <-done:
+		t.Fatal("live worker should not be interrupted")
 	default:
-		t.Fatal("live worker should be interrupted")
-	}
-	select {
-	case <-controlDone:
-	default:
-		t.Fatal("direct control connection should be interrupted")
-	}
-	workers, err := server.runtime.LoadWorkers()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, worker := range workers {
-		if worker.tenantID == credential.TenantID {
-			t.Fatalf("runtime worker should be deleted: %+v", worker)
-		}
 	}
 }
 
@@ -1477,14 +1460,15 @@ func TestControlOpenForwardsInitialTerminalSize(t *testing.T) {
 	}
 }
 
-func TestControlOpenP2PPreferredIssuesGrantAndFallsBackToRelay(t *testing.T) {
+func TestControlOpenP2PPreferredIssuesGrantAndSignals(t *testing.T) {
 	server := New(":0", "secret", nil)
 	worker := &workerConn{
 		id:   "local",
-		send: make(chan protocol.Envelope, 1),
+		send: make(chan protocol.Envelope, 4),
 	}
 	server.registerWorker(worker)
 	control := &controlConn{id: "ctrl_test", send: make(chan protocol.Envelope, 4)}
+	server.addControl(control)
 	payload, err := protocol.MarshalPayload(protocol.TerminalOpen{
 		Cols:        100,
 		Rows:        30,
@@ -1532,6 +1516,9 @@ func TestControlOpenP2PPreferredIssuesGrantAndFallsBackToRelay(t *testing.T) {
 	if grant.GrantID != open.GrantID || grant.WorkerID != "local" || grant.SessionID != "local/demo" || grant.StreamID != "stream-1" {
 		t.Fatalf("unexpected grant: %+v open=%+v", grant, open)
 	}
+	if len(grant.ICEServers) != 0 {
+		t.Fatalf("unexpected default ice servers in grant: %+v", grant.ICEServers)
+	}
 
 	var firstSignal protocol.P2PSignal
 	select {
@@ -1549,6 +1536,52 @@ func TestControlOpenP2PPreferredIssuesGrantAndFallsBackToRelay(t *testing.T) {
 		t.Fatalf("unexpected first signal: %+v", firstSignal)
 	}
 
+	offer, err := protocol.MarshalPayload(protocol.P2PSignal{GrantID: open.GrantID, From: "control", To: "worker", Signal: "offer_placeholder", State: "negotiating"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleControlMessage(control, protocol.Envelope{
+		Type:      protocol.TypeP2PSignal,
+		SessionID: "local/demo",
+		StreamID:  "stream-1",
+		Payload:   offer,
+	})
+
+	var forwardedOffer protocol.P2PSignal
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeP2PSignal {
+			t.Fatalf("unexpected forwarded signal type: %s", env.Type)
+		}
+		if err := env.DecodePayload(&forwardedOffer); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive p2p offer signal")
+	}
+	if forwardedOffer.Signal != "offer_placeholder" || forwardedOffer.GrantID != open.GrantID || forwardedOffer.To != "worker" {
+		t.Fatalf("unexpected forwarded offer: %+v", forwardedOffer)
+	}
+
+	unsupported, err := protocol.MarshalPayload(protocol.P2PSignal{
+		GrantID: open.GrantID,
+		From:    "worker",
+		To:      "control",
+		Signal:  "unsupported",
+		State:   protocol.TerminalChannelP2PFallback,
+		Reason:  "worker_direct_transport_not_implemented",
+		Message: "Worker direct transport is not implemented yet; continuing over Hub relay.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleWorkerMessage(worker, protocol.Envelope{
+		Type:      protocol.TypeP2PSignal,
+		SessionID: "local/demo",
+		StreamID:  "stream-1",
+		Payload:   unsupported,
+	})
+
 	var fallback protocol.P2PSignal
 	select {
 	case env := <-control.send:
@@ -1561,7 +1594,7 @@ func TestControlOpenP2PPreferredIssuesGrantAndFallsBackToRelay(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("control did not receive p2p fallback signal")
 	}
-	if fallback.Signal != "fallback" || fallback.State != protocol.TerminalChannelP2PFallback || fallback.Reason != "p2p_signaling_not_implemented" {
+	if fallback.Signal != "unsupported" || fallback.State != protocol.TerminalChannelP2PFallback || fallback.Reason != "worker_direct_transport_not_implemented" {
 		t.Fatalf("unexpected fallback signal: %+v", fallback)
 	}
 }
@@ -1607,6 +1640,121 @@ func TestControlDisconnectClosesWorkerStream(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not receive terminal.close")
+	}
+}
+
+func TestTargetedPaneOpenReplacesPriorControlStream(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 8),
+	}
+	server.registerWorker(worker)
+	controlA := &controlConn{id: "ctrl_a", send: make(chan protocol.Envelope, 1), done: make(chan struct{})}
+	controlB := &controlConn{id: "ctrl_b", send: make(chan protocol.Envelope, 1), done: make(chan struct{})}
+	server.addControl(controlA)
+	server.addControl(controlB)
+
+	firstPayload, err := protocol.MarshalPayload(protocol.TerminalOpen{
+		Cols: 100,
+		Rows: 30,
+		Target: &protocol.TerminalTarget{
+			SessionName: "demo",
+			PaneID:      "%1",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleControlMessage(controlA, protocol.Envelope{
+		Type:      protocol.TypeControlOpen,
+		StreamID:  "stream-a",
+		SessionID: "local/demo",
+		Payload:   firstPayload,
+	})
+	select {
+	case env := <-worker.send:
+		if env.Type != protocol.TypeTerminalOpen || env.StreamID != "stream-a" {
+			t.Fatalf("unexpected first open envelope: %+v", env)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive first terminal.open")
+	}
+
+	secondPayload, err := protocol.MarshalPayload(protocol.TerminalOpen{
+		Cols: 120,
+		Rows: 36,
+		Target: &protocol.TerminalTarget{
+			SessionName: "demo",
+			PaneID:      "%1",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleControlMessage(controlB, protocol.Envelope{
+		Type:      protocol.TypeControlOpen,
+		StreamID:  "stream-b",
+		SessionID: "local/demo",
+		Payload:   secondPayload,
+	})
+
+	var openSeen, closeSeen bool
+	deadline := time.After(time.Second)
+	for !(openSeen && closeSeen) {
+		select {
+		case env := <-worker.send:
+			switch {
+			case env.Type == protocol.TypeTerminalClose && env.StreamID == "stream-a":
+				closeSeen = true
+			case env.Type == protocol.TypeTerminalOpen && env.StreamID == "stream-b":
+				openSeen = true
+			default:
+				t.Fatalf("unexpected envelope after second open: %+v", env)
+			}
+		case <-deadline:
+			t.Fatalf("expected open and close, got open=%t close=%t", openSeen, closeSeen)
+		}
+	}
+}
+
+func TestUntargetedSessionOpenDoesNotReplaceOtherControlStream(t *testing.T) {
+	server := New(":0", "secret", nil)
+	worker := &workerConn{
+		id:   "local",
+		send: make(chan protocol.Envelope, 8),
+	}
+	server.registerWorker(worker)
+	controlA := &controlConn{id: "ctrl_a", send: make(chan protocol.Envelope, 1), done: make(chan struct{})}
+	controlB := &controlConn{id: "ctrl_b", send: make(chan protocol.Envelope, 1), done: make(chan struct{})}
+	server.addControl(controlA)
+	server.addControl(controlB)
+
+	payload, err := protocol.MarshalPayload(protocol.TerminalOpen{Cols: 100, Rows: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleControlMessage(controlA, protocol.Envelope{
+		Type:      protocol.TypeControlOpen,
+		StreamID:  "stream-a",
+		SessionID: "local/demo",
+		Payload:   payload,
+	})
+	server.handleControlMessage(controlB, protocol.Envelope{
+		Type:      protocol.TypeControlOpen,
+		StreamID:  "stream-b",
+		SessionID: "local/demo",
+		Payload:   payload,
+	})
+
+	first := <-worker.send
+	second := <-worker.send
+	if first.Type != protocol.TypeTerminalOpen || second.Type != protocol.TypeTerminalOpen {
+		t.Fatalf("expected two terminal.open envelopes, got %+v then %+v", first, second)
+	}
+	if len(worker.send) != 0 {
+		env := <-worker.send
+		t.Fatalf("unexpected extra envelope: %+v", env)
 	}
 }
 

@@ -25,11 +25,14 @@ import (
 	"private/agentmux/internal/sessionbackend"
 	"private/agentmux/internal/terminalview"
 	"private/agentmux/internal/ws"
+
+	"github.com/pion/webrtc/v4"
 )
 
 const (
-	workerPingInterval = 15 * time.Second
-	workerPongWait     = 45 * time.Second
+	workerPingInterval                 = 15 * time.Second
+	workerPongWait                     = 45 * time.Second
+	workerCredentialRefreshCheckPeriod = time.Minute
 
 	terminalHistoryMaxLines     = 2000
 	terminalHistoryDefaultLimit = 200
@@ -116,9 +119,14 @@ type Worker struct {
 	streamStates      map[string]*terminalStateStream
 	streamTargets     map[string]*protocol.TerminalTarget
 	streamCellUpdates map[string]bool
+	streamPeers       map[string]*directTransportPeer
 	generations       map[string]int
 	histories         map[string]*terminalHistoryBuffer
 	terminalSeq       int64
+	outboundConn      *ws.Conn
+	outboundHigh      chan protocol.Envelope
+	outboundLow       chan protocol.Envelope
+	outboundQuit      chan struct{}
 
 	credentialMu    sync.Mutex
 	credentialEntry credentialcache.Entry
@@ -134,6 +142,20 @@ type terminalStateStream struct {
 	lastSnapshot time.Time
 	lastCells    *protocol.TerminalCellSnapshot
 }
+
+type directTransportPeer struct {
+	grantID   string
+	sessionID string
+	streamID  string
+	peer      *webrtc.PeerConnection
+	channel   *webrtc.DataChannel
+	grant     protocol.P2PGrant
+}
+
+const (
+	workerOutboundHighQueueSize = 256
+	workerOutboundLowQueueSize  = 1024
+)
 
 func New(hubURL, token, id, name string, backend sessionbackend.Backend, logger *slog.Logger) *Worker {
 	if logger == nil {
@@ -158,6 +180,7 @@ func New(hubURL, token, id, name string, backend sessionbackend.Backend, logger 
 		streamStates:      map[string]*terminalStateStream{},
 		streamTargets:     map[string]*protocol.TerminalTarget{},
 		streamCellUpdates: map[string]bool{},
+		streamPeers:       map[string]*directTransportPeer{},
 		generations:       map[string]int{},
 		histories:         map[string]*terminalHistoryBuffer{},
 	}
@@ -397,6 +420,8 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 	if err := writeEnvelope(conn, hello); err != nil {
 		return err
 	}
+	writeDone := w.initOutbound(conn)
+	defer w.closeOutbound(conn)
 	w.Logger.Info("worker connected", "hub", target, "id", w.ID, "name", w.Name, "session_backend", w.Backend.Name())
 	if err := w.sendSnapshot(ctx, conn); err != nil {
 		w.Logger.Error("snapshot failed", "error", err)
@@ -410,21 +435,32 @@ func (w *Worker) runOnce(ctx context.Context, target string) error {
 	defer ticker.Stop()
 	pingTicker := time.NewTicker(workerPingInterval)
 	defer pingTicker.Stop()
+	refreshTicker := time.NewTicker(workerCredentialRefreshCheckPeriod)
+	defer refreshTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-done:
 			return err
+		case err := <-writeDone:
+			if err != nil {
+				return err
+			}
+			return ws.ErrClosed
 		case <-ticker.C:
 			heartbeat := protocol.Envelope{Type: protocol.TypeWorkerHeartbeat, WorkerID: w.ID}
-			if err := writeEnvelope(conn, heartbeat); err != nil {
+			if err := w.writeControlEnvelope(conn, heartbeat); err != nil {
 				return err
 			}
 			_ = w.sendSnapshot(ctx, conn)
 		case <-pingTicker.C:
 			if err := conn.WritePing([]byte("agentmux")); err != nil {
 				return err
+			}
+		case <-refreshTicker.C:
+			if err := w.EnsureFreshCredential(ctx); err != nil {
+				w.Logger.Warn("worker credential refresh failed during active connection", "error", err)
 			}
 		}
 	}
@@ -465,7 +501,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			reply.ID = env.ID
 			reply.WorkerID = w.ID
 			reply.SessionID = sessionID
-			_ = writeEnvelope(conn, reply)
+			_ = w.writeControlEnvelope(conn, reply)
 			_ = w.sendSnapshot(ctx, conn)
 		case protocol.TypeSessionKill:
 			name := payloadName(env)
@@ -510,7 +546,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			reply.ID = env.ID
 			reply.WorkerID = w.ID
 			reply.SessionID = env.SessionID
-			_ = writeEnvelope(conn, reply)
+			_ = w.writeControlEnvelope(conn, reply)
 		case protocol.TypeSessionTargets:
 			_, name, ok := protocol.SplitSessionID(env.SessionID)
 			if !ok {
@@ -532,7 +568,7 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 			reply.WorkerID = w.ID
 			reply.SessionID = env.SessionID
 			w.Logger.Debug("targets request complete", "session_id", env.SessionID, "name", name, "request_id", env.ID, "targets", len(targets))
-			_ = writeEnvelope(conn, reply)
+			_ = w.writeControlEnvelope(conn, reply)
 		case protocol.TypeTerminalInput:
 			_, name, ok := protocol.SplitSessionID(env.SessionID)
 			if !ok {
@@ -601,13 +637,17 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 				w.sendStreamError(conn, env.StreamID, env.SessionID, err.Error())
 			}
 		case protocol.TypeTerminalHistoryReq:
+			_, name, ok := protocol.SplitSessionID(env.SessionID)
+			if !ok {
+				name = payloadName(env)
+			}
 			var req protocol.TerminalHistoryRequest
 			_ = env.DecodePayload(&req)
-			reply, _ := protocol.NewEnvelope(protocol.TypeTerminalHistoryPage, w.historyPage(w.stateKeyForStream(env.StreamID, env.SessionID), req))
+			reply, _ := protocol.NewEnvelope(protocol.TypeTerminalHistoryPage, w.historyPageForStream(ctx, env.StreamID, env.SessionID, name, req))
 			reply.WorkerID = w.ID
 			reply.SessionID = env.SessionID
 			reply.StreamID = env.StreamID
-			_ = writeEnvelope(conn, reply)
+			_ = w.writeControlEnvelope(conn, reply)
 		case protocol.TypeTerminalMouse:
 			var mouse protocol.TerminalMouse
 			if err := env.DecodePayload(&mouse); err != nil {
@@ -620,10 +660,253 @@ func (w *Worker) readLoop(ctx context.Context, conn *ws.Conn) error {
 		case protocol.TypeTerminalClose:
 			w.Logger.Debug("terminal close received", "session_id", env.SessionID, "stream_id", env.StreamID)
 			w.stopStream(env.StreamID)
+		case protocol.TypeP2PSignal:
+			w.handleP2PSignal(conn, env)
 		case protocol.TypeWorkerUpdateApply:
 			w.handleUpdateApply(conn, env)
 		}
 	}
+}
+
+func (w *Worker) handleP2PSignal(conn *ws.Conn, env protocol.Envelope) {
+	var signal protocol.P2PSignal
+	if err := env.DecodePayload(&signal); err != nil {
+		w.sendStreamError(conn, env.StreamID, env.SessionID, err.Error())
+		return
+	}
+	w.Logger.Debug("p2p signal received", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	switch signal.Signal {
+	case "offer":
+		if err := w.handleP2POffer(conn, env, signal); err != nil {
+			w.Logger.Debug("p2p offer failed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "error", err)
+			w.sendP2PFallback(conn, env, signal, "worker_webrtc_offer_failed", err.Error())
+		}
+	case "offer_placeholder":
+		w.sendP2PFallback(conn, env, signal, "worker_direct_transport_not_ready", "Worker direct transport requires a WebRTC offer; continuing over Hub relay.")
+	case "candidate":
+		if err := w.handleP2PCandidate(env.StreamID, signal); err != nil {
+			w.Logger.Debug("p2p candidate failed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "error", err)
+		}
+	case "fallback", "close":
+		w.closeDirectTransport(env.StreamID)
+		return
+	default:
+		w.sendP2PFallback(conn, env, signal, "unsupported_p2p_signal", fmt.Sprintf("Unsupported P2P signal %q; continuing over Hub relay.", signal.Signal))
+	}
+}
+
+func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal protocol.P2PSignal) error {
+	if strings.TrimSpace(signal.SDP) == "" {
+		return fmt.Errorf("p2p offer is missing SDP")
+	}
+	w.closeDirectTransport(env.StreamID)
+	config := webrtc.Configuration{ICEServers: protocolICEServersToWebRTC(signal.ICEServers)}
+	peer, err := webrtc.NewPeerConnection(config)
+	if err != nil {
+		return err
+	}
+	direct := &directTransportPeer{
+		grantID: signal.GrantID, sessionID: env.SessionID, streamID: env.StreamID, peer: peer,
+		grant: protocol.P2PGrant{GrantID: signal.GrantID, ICEServers: append([]protocol.P2PICEServer(nil), signal.ICEServers...)},
+	}
+	w.mu.Lock()
+	w.streamPeers[env.StreamID] = direct
+	w.mu.Unlock()
+	peer.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		w.Logger.Debug("p2p ice connection state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
+	})
+	peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		w.Logger.Debug("p2p peer connection state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
+	})
+	peer.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
+		w.Logger.Debug("p2p ice gathering state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
+	})
+	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		init := candidate.ToJSON()
+		reply := protocol.P2PSignal{
+			GrantID:       signal.GrantID,
+			From:          "worker",
+			To:            "control",
+			Signal:        "candidate",
+			State:         "negotiating",
+			Candidate:     init.Candidate,
+			SDPMid:        stringValue(init.SDPMid),
+			SDPMLineIndex: init.SDPMLineIndex,
+			ICEServers:    append([]protocol.P2PICEServer(nil), signal.ICEServers...),
+		}
+		w.sendP2PSignal(conn, env, reply)
+	})
+	peer.OnDataChannel(func(channel *webrtc.DataChannel) {
+		w.Logger.Debug("p2p data channel received", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "label", channel.Label())
+		w.mu.Lock()
+		if current := w.streamPeers[env.StreamID]; current != nil {
+			current.channel = channel
+		}
+		w.mu.Unlock()
+		channel.OnOpen(func() {
+			w.Logger.Debug("p2p data channel open", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
+			w.sendP2PSignal(conn, env, protocol.P2PSignal{
+				GrantID:    signal.GrantID,
+				From:       "worker",
+				To:         "control",
+				Signal:     "direct",
+				State:      protocol.TerminalChannelP2PDirect,
+				Message:    "Worker WebRTC data channel opened.",
+				ICEServers: append([]protocol.P2PICEServer(nil), signal.ICEServers...),
+			})
+		})
+		channel.OnMessage(func(message webrtc.DataChannelMessage) {
+			if len(message.Data) == 0 {
+				return
+			}
+			if !w.writeTerminal(env.StreamID, string(message.Data)) {
+				w.Logger.Debug("p2p data channel input missed stream", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "bytes", len(message.Data))
+			}
+		})
+		channel.OnClose(func() {
+			w.Logger.Debug("p2p data channel closed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
+			w.mu.Lock()
+			if current := w.streamPeers[env.StreamID]; current == direct {
+				current.channel = nil
+			}
+			w.mu.Unlock()
+			w.sendP2PFallback(conn, env, signal, "datachannel_closed", "Worker WebRTC data channel closed; continuing over Hub relay.")
+		})
+	})
+	if err := peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: signal.SDP}); err != nil {
+		w.closeDirectTransport(env.StreamID)
+		return err
+	}
+	answer, err := peer.CreateAnswer(nil)
+	if err != nil {
+		w.closeDirectTransport(env.StreamID)
+		return err
+	}
+	if err := peer.SetLocalDescription(answer); err != nil {
+		w.closeDirectTransport(env.StreamID)
+		return err
+	}
+	w.sendP2PSignal(conn, env, protocol.P2PSignal{
+		GrantID:    signal.GrantID,
+		From:       "worker",
+		To:         "control",
+		Signal:     "answer",
+		State:      "negotiating",
+		SDPType:    "answer",
+		SDP:        answer.SDP,
+		Message:    "Worker WebRTC answer.",
+		ICEServers: append([]protocol.P2PICEServer(nil), signal.ICEServers...),
+	})
+	return nil
+}
+
+func (w *Worker) handleP2PCandidate(streamID string, signal protocol.P2PSignal) error {
+	w.mu.Lock()
+	direct := w.streamPeers[streamID]
+	w.mu.Unlock()
+	if direct == nil || direct.peer == nil || signal.Candidate == "" {
+		return nil
+	}
+	return direct.peer.AddICECandidate(webrtc.ICECandidateInit{
+		Candidate:     signal.Candidate,
+		SDPMid:        emptyStringAsNil(signal.SDPMid),
+		SDPMLineIndex: signal.SDPMLineIndex,
+	})
+}
+
+func (w *Worker) sendP2PSignal(conn *ws.Conn, source protocol.Envelope, signal protocol.P2PSignal) {
+	out, _ := protocol.NewEnvelope(protocol.TypeP2PSignal, signal)
+	out.WorkerID = w.ID
+	out.SessionID = source.SessionID
+	out.StreamID = source.StreamID
+	if err := w.writeControlEnvelope(conn, out); err != nil {
+		w.Logger.Debug("p2p signal send failed", "session_id", source.SessionID, "stream_id", source.StreamID, "grant_id", signal.GrantID, "signal", signal.Signal, "error", err)
+	}
+}
+
+func (w *Worker) sendP2PFallback(conn *ws.Conn, env protocol.Envelope, signal protocol.P2PSignal, reason, message string) {
+	w.sendP2PSignal(conn, env, protocol.P2PSignal{
+		GrantID: signal.GrantID,
+		From:    "worker",
+		To:      "control",
+		Signal:  "fallback",
+		State:   protocol.TerminalChannelP2PFallback,
+		Reason:  reason,
+		Message: message,
+	})
+}
+
+func (w *Worker) closeDirectTransport(streamID string) {
+	w.mu.Lock()
+	direct := w.streamPeers[streamID]
+	delete(w.streamPeers, streamID)
+	w.mu.Unlock()
+	if direct == nil {
+		return
+	}
+	if direct.channel != nil {
+		_ = direct.channel.Close()
+	}
+	if direct.peer != nil {
+		_ = direct.peer.Close()
+	}
+}
+
+func (w *Worker) writeDirectTerminalOutput(streamID string, data []byte) bool {
+	w.mu.Lock()
+	direct := w.streamPeers[streamID]
+	w.mu.Unlock()
+	if direct == nil || direct.channel == nil || direct.channel.ReadyState() != webrtc.DataChannelStateOpen {
+		return false
+	}
+	if err := direct.channel.Send(data); err != nil {
+		w.Logger.Debug("p2p data channel output failed", "session_id", direct.sessionID, "stream_id", streamID, "grant_id", direct.grantID, "bytes", len(data), "error", err)
+		return false
+	}
+	w.Logger.Debug("p2p data channel output sent", "session_id", direct.sessionID, "stream_id", streamID, "grant_id", direct.grantID, "bytes", len(data))
+	return true
+}
+
+func emptyStringAsNil(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func protocolICEServersToWebRTC(servers []protocol.P2PICEServer) []webrtc.ICEServer {
+	if len(servers) == 0 {
+		return nil
+	}
+	result := make([]webrtc.ICEServer, 0, len(servers))
+	for _, server := range servers {
+		urls := make([]string, 0, len(server.URLs))
+		for _, raw := range server.URLs {
+			raw = strings.TrimSpace(raw)
+			if raw != "" {
+				urls = append(urls, raw)
+			}
+		}
+		if len(urls) == 0 {
+			continue
+		}
+		result = append(result, webrtc.ICEServer{
+			URLs:       urls,
+			Username:   strings.TrimSpace(server.Username),
+			Credential: strings.TrimSpace(server.Credential),
+		})
+	}
+	return result
 }
 
 func (w *Worker) handleUpdateApply(conn *ws.Conn, env protocol.Envelope) {
@@ -725,7 +1008,7 @@ func (w *Worker) sendUpdateResult(conn *ws.Conn, requestID string, result protoc
 	reply, _ := protocol.NewEnvelope(protocol.TypeWorkerUpdateResult, result)
 	reply.ID = requestID
 	reply.WorkerID = w.ID
-	_ = writeEnvelope(conn, reply)
+	_ = w.writeControlEnvelope(conn, reply)
 }
 
 func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
@@ -745,7 +1028,7 @@ func (w *Worker) sendSnapshot(ctx context.Context, conn *ws.Conn) error {
 	}
 	env.WorkerID = w.ID
 	w.Logger.Debug("session snapshot sent", "sessions", len(payload.Sessions))
-	return writeEnvelope(conn, env)
+	return w.writeControlEnvelope(conn, env)
 }
 
 func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, sessionID, name string, size protocol.TerminalSize, open protocol.TerminalOpen) {
@@ -762,14 +1045,22 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 		Mode: mode, RenderMode: renderMode, Capabilities: w.terminalModeCapabilities(mode, renderMode, sendCells), ResizePolicy: w.resizePolicyForMode(mode),
 		RemoteSize: remoteSize, ViewportSize: size, DefaultSize: w.defaultStateSize(),
 	}, open))
+	hadState := mode != "attach" && w.hasTerminalState(sessionID, open.Target)
+	if mode != "attach" {
+		w.ensureTerminalStateStream(streamID, sessionID, open.Target, remoteSize)
+	}
 	if mode != "attach" && terminalOpenRequestsCapability(open, "terminal.snapshot.v1") {
-		w.sendTerminalSnapshot(ctx, conn, streamID, sessionID, name, remoteSize, open.Target)
+		w.sendTerminalSnapshot(ctx, conn, streamID, sessionID, name, remoteSize, open.Target, hadState)
+		if sendCells {
+			w.maybeSendTerminalCellSnapshot(conn, streamID, sessionID, "snapshot")
+		}
 	}
 	w.Logger.Debug("terminal backend open start", "session_id", sessionID, "stream_id", streamID, "name", name, "mode", mode, "cols", remoteSize.Cols, "rows", remoteSize.Rows, "pane_id", protocolTargetPane(open.Target))
 	terminal, err := w.openTerminalTarget(ctx, name, remoteSize, open.Target)
 	if err != nil {
 		w.Logger.Debug("terminal backend open failed", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
 		w.sendStreamError(conn, streamID, sessionID, err.Error())
+		w.removeStream(streamID)
 		cancel()
 		return
 	}
@@ -780,11 +1071,7 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 	w.streamRenderModes[streamID] = renderMode
 	w.streamCellUpdates[streamID] = sendCells
 	if mode != "attach" {
-		stateKey := terminalStateKey(sessionID, open.Target)
-		w.streamStateKeys[streamID] = stateKey
-		if state := w.streamStates[stateKey]; state == nil || state.view == nil {
-			w.streamStates[stateKey] = &terminalStateStream{view: terminalview.New(remoteSize.Cols, remoteSize.Rows), size: remoteSize}
-		}
+		w.ensureTerminalStateStreamLocked(streamID, sessionID, open.Target, remoteSize)
 	}
 	w.streamTargets[streamID] = cloneTerminalTarget(open.Target)
 	activeStreams := len(w.streams)
@@ -801,6 +1088,10 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 			if n > 0 {
 				w.recordTerminalOutput(w.stateKeyForStream(streamID, sessionID), buffer[:n])
 				w.recordTerminalState(streamID, buffer[:n])
+				if w.writeDirectTerminalOutput(streamID, buffer[:n]) {
+					w.maybeSendTerminalCellSnapshot(conn, streamID, sessionID, "live")
+					continue
+				}
 				env, _ := protocol.NewEnvelope(protocol.TypeTerminalOutput, protocol.TerminalOutput{
 					Data:     base64.StdEncoding.EncodeToString(buffer[:n]),
 					Encoding: "base64",
@@ -808,11 +1099,11 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 				env.WorkerID = w.ID
 				env.SessionID = sessionID
 				env.StreamID = streamID
-				if writeErr := writeEnvelope(conn, env); writeErr != nil {
-					w.Logger.Debug("terminal output write failed", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", n, "error", writeErr)
-					return
+				if !w.tryWriteStreamEnvelope(conn, env) {
+					w.Logger.Debug("terminal output dropped", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", n)
+				} else {
+					w.Logger.Debug("terminal output sent", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", n)
 				}
-				w.Logger.Debug("terminal output sent", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", n)
 				w.maybeSendTerminalCellSnapshot(conn, streamID, sessionID, "live")
 			}
 			if err != nil {
@@ -826,22 +1117,24 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 	}()
 }
 
-func (w *Worker) sendTerminalSnapshot(ctx context.Context, conn *ws.Conn, streamID, sessionID, name string, size protocol.TerminalSize, target *protocol.TerminalTarget) {
-	if data, cells, ok := w.stateANSIForTarget(sessionID, target); ok {
-		generation := w.currentGeneration(terminalStateKey(sessionID, target))
-		snapshot, _ := protocol.NewEnvelope(protocol.TypeTerminalSnapshot, protocol.TerminalSnapshot{
-			Generation: generation, Seq: time.Now().UnixNano(), Cols: cells.Cols, Rows: cells.Rows,
-			Encoding: "ansi-screen-v1", Data: data, Scope: "state", GeneratedAt: time.Now().UTC(),
-		})
-		snapshot.WorkerID = w.ID
-		snapshot.SessionID = sessionID
-		snapshot.StreamID = streamID
-		if err := writeEnvelope(conn, snapshot); err != nil {
-			w.Logger.Debug("terminal state snapshot write failed", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
+func (w *Worker) sendTerminalSnapshot(ctx context.Context, conn *ws.Conn, streamID, sessionID, name string, size protocol.TerminalSize, target *protocol.TerminalTarget, useState bool) {
+	if useState {
+		if data, cells, ok := w.stateANSIForTarget(sessionID, target); ok {
+			generation := w.currentGeneration(terminalStateKey(sessionID, target))
+			snapshot, _ := protocol.NewEnvelope(protocol.TypeTerminalSnapshot, protocol.TerminalSnapshot{
+				Generation: generation, Seq: time.Now().UnixNano(), Cols: cells.Cols, Rows: cells.Rows,
+				Encoding: "ansi-screen-v1", Data: data, Scope: "state", GeneratedAt: time.Now().UTC(),
+			})
+			snapshot.WorkerID = w.ID
+			snapshot.SessionID = sessionID
+			snapshot.StreamID = streamID
+			if err := w.writeControlEnvelope(conn, snapshot); err != nil {
+				w.Logger.Debug("terminal state snapshot write failed", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
+				return
+			}
+			w.Logger.Debug("terminal state snapshot sent", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", len(data), "cols", cells.Cols, "rows", cells.Rows)
 			return
 		}
-		w.Logger.Debug("terminal state snapshot sent", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", len(data), "cols", cells.Cols, "rows", cells.Rows)
-		return
 	}
 
 	lines := size.Rows
@@ -873,6 +1166,7 @@ func (w *Worker) sendTerminalSnapshot(ctx context.Context, conn *ws.Conn, stream
 		w.sendTerminalMode(conn, streamID, sessionID, protocol.TerminalMode{Mode: "raw-pty"})
 		return
 	}
+	w.seedTerminalState(streamID, data, size, "ansi-lines-v1")
 	generation := w.currentGeneration(terminalStateKey(sessionID, target))
 	snapshot, _ := protocol.NewEnvelope(protocol.TypeTerminalSnapshot, protocol.TerminalSnapshot{
 		Generation:  generation,
@@ -887,11 +1181,75 @@ func (w *Worker) sendTerminalSnapshot(ctx context.Context, conn *ws.Conn, stream
 	snapshot.WorkerID = w.ID
 	snapshot.SessionID = sessionID
 	snapshot.StreamID = streamID
-	if err := writeEnvelope(conn, snapshot); err != nil {
+	if err := w.writeControlEnvelope(conn, snapshot); err != nil {
 		w.Logger.Debug("terminal snapshot write failed", "session_id", sessionID, "stream_id", streamID, "name", name, "error", err)
 		return
 	}
 	w.Logger.Debug("terminal snapshot sent", "session_id", sessionID, "stream_id", streamID, "name", name, "bytes", len(data))
+}
+
+func (w *Worker) hasTerminalState(sessionID string, target *protocol.TerminalTarget) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	state := w.streamStates[terminalStateKey(sessionID, target)]
+	return state != nil && state.view != nil
+}
+
+func (w *Worker) ensureTerminalStateStream(streamID, sessionID string, target *protocol.TerminalTarget, size protocol.TerminalSize) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.ensureTerminalStateStreamLocked(streamID, sessionID, target, size)
+}
+
+func (w *Worker) ensureTerminalStateStreamLocked(streamID, sessionID string, target *protocol.TerminalTarget, size protocol.TerminalSize) {
+	stateKey := terminalStateKey(sessionID, target)
+	w.streamStateKeys[streamID] = stateKey
+	state := w.streamStates[stateKey]
+	if state == nil || state.view == nil {
+		w.streamStates[stateKey] = &terminalStateStream{view: terminalview.New(size.Cols, size.Rows), size: size}
+		return
+	}
+	state.view.Resize(size.Cols, size.Rows)
+	state.size = size
+}
+
+func (w *Worker) seedTerminalState(streamID, data string, size protocol.TerminalSize, encoding string) {
+	if data == "" || size.Cols <= 0 || size.Rows <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	state := w.stateForStreamLocked(streamID)
+	if state == nil {
+		return
+	}
+	if state.view == nil {
+		state.view = terminalview.New(size.Cols, size.Rows)
+	}
+	state.view.Resize(size.Cols, size.Rows)
+	payload := data
+	if encoding == "ansi-lines-v1" {
+		payload = "\x1b[2J\x1b[H" + snapshotLinesForTerminalState(data, size.Rows)
+	}
+	state.view.Write([]byte(payload))
+	state.size = size
+	state.lastSnapshot = time.Time{}
+	state.lastCells = nil
+}
+
+func snapshotLinesForTerminalState(value string, rows int) string {
+	normalized := strings.ReplaceAll(value, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	screen := strings.TrimSuffix(normalized, "\n")
+	lines := []string{}
+	if screen != "" {
+		lines = strings.Split(screen, "\n")
+	}
+	padTop := 0
+	if rows > len(lines) {
+		padTop = rows - len(lines)
+	}
+	return strings.Repeat("\r\n", padTop) + strings.Join(lines, "\r\n")
 }
 
 func (w *Worker) stateANSIForTarget(sessionID string, target *protocol.TerminalTarget) (string, terminalview.CellSnapshot, bool) {
@@ -1020,8 +1378,8 @@ func (w *Worker) sendTerminalDiff(conn *ws.Conn, streamID, sessionID string, dif
 	env.WorkerID = w.ID
 	env.SessionID = sessionID
 	env.StreamID = streamID
-	if err := writeEnvelope(conn, env); err != nil {
-		w.Logger.Debug("terminal diff write failed", "session_id", sessionID, "stream_id", streamID, "error", err)
+	if !w.tryWriteStreamEnvelope(conn, env) {
+		w.Logger.Debug("terminal diff dropped", "session_id", sessionID, "stream_id", streamID, "ops", len(diff.Ops))
 		return
 	}
 	w.Logger.Debug("terminal diff sent", "session_id", sessionID, "stream_id", streamID, "ops", len(diff.Ops))
@@ -1041,8 +1399,8 @@ func (w *Worker) sendTerminalCellSnapshot(conn *ws.Conn, streamID, sessionID str
 	env.WorkerID = w.ID
 	env.SessionID = sessionID
 	env.StreamID = streamID
-	if err := writeEnvelope(conn, env); err != nil {
-		w.Logger.Debug("terminal cell snapshot write failed", "session_id", sessionID, "stream_id", streamID, "error", err)
+	if !w.tryWriteStreamEnvelope(conn, env) {
+		w.Logger.Debug("terminal cell snapshot dropped", "session_id", sessionID, "stream_id", streamID, "cols", cells.Cols, "rows", cells.Rows)
 		return
 	}
 	w.Logger.Debug("terminal cell snapshot sent", "session_id", sessionID, "stream_id", streamID, "cols", cells.Cols, "rows", cells.Rows)
@@ -1102,7 +1460,7 @@ func (w *Worker) applyTerminalRemoteSize(ctx context.Context, conn *ws.Conn, str
 	reset.WorkerID = w.ID
 	reset.SessionID = sessionID
 	reset.StreamID = streamID
-	if err := writeEnvelope(conn, reset); err != nil {
+	if err := w.writeControlEnvelope(conn, reset); err != nil {
 		return err
 	}
 	renderMode := w.streamRenderMode(streamID)
@@ -1111,7 +1469,7 @@ func (w *Worker) applyTerminalRemoteSize(ctx context.Context, conn *ws.Conn, str
 		Mode: "state-bridge", RenderMode: renderMode, Capabilities: w.terminalModeCapabilities("state-bridge", renderMode, sendCells), ResizePolicy: "worker_state",
 		RemoteSize: size, DefaultSize: w.defaultStateSize(),
 	})
-	w.sendTerminalSnapshot(ctx, conn, streamID, sessionID, name, size, w.streamTarget(streamID))
+	w.sendTerminalSnapshot(ctx, conn, streamID, sessionID, name, size, w.streamTarget(streamID), true)
 	if sendCells {
 		if cells, ok := w.streamCellSnapshot(streamID); ok {
 			w.sendTerminalCellSnapshot(conn, streamID, sessionID, generation, cells, "resize")
@@ -1196,6 +1554,61 @@ func (w *Worker) historyPage(sessionID string, req protocol.TerminalHistoryReque
 		page.EndSeq = lines[len(lines)-1].SeqEnd
 	}
 	return page
+}
+
+func (w *Worker) historyPageForStream(ctx context.Context, streamID, sessionID, name string, req protocol.TerminalHistoryRequest) protocol.TerminalHistoryPage {
+	stateKey := w.stateKeyForStream(streamID, sessionID)
+	page := w.historyPage(stateKey, req)
+	if len(page.Lines) > 0 || req.BeforeSeq != 0 {
+		return page
+	}
+	limit := req.LimitLines
+	if limit <= 0 {
+		limit = terminalHistoryDefaultLimit
+	}
+	if limit > terminalHistoryMaxLimit {
+		limit = terminalHistoryMaxLimit
+	}
+	target := w.streamTarget(streamID)
+	var (
+		data string
+		err  error
+	)
+	if target != nil && target.PaneID != "" {
+		if backend, ok := w.Backend.(sessionbackend.TargetCaptureBackend); ok {
+			data, err = backend.CaptureTarget(ctx, sessionBackendTarget(name, target), limit)
+		}
+	} else {
+		data, err = w.Backend.Capture(ctx, name, limit)
+	}
+	if err != nil || data == "" {
+		return page
+	}
+	lines := terminalCaptureHistoryLines(data)
+	if len(lines) == 0 {
+		return page
+	}
+	startSeq := int64(-len(lines))
+	historyLines := make([]protocol.TerminalHistoryLine, 0, len(lines))
+	for index, line := range lines {
+		seq := startSeq + int64(index)
+		historyLines = append(historyLines, protocol.TerminalHistoryLine{SeqStart: seq, SeqEnd: seq, Text: line})
+	}
+	return protocol.TerminalHistoryPage{
+		StartSeq: historyLines[0].SeqStart,
+		EndSeq:   historyLines[len(historyLines)-1].SeqEnd,
+		Lines:    historyLines,
+	}
+}
+
+func terminalCaptureHistoryLines(data string) []string {
+	normalized := strings.ReplaceAll(data, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	normalized = strings.TrimSuffix(normalized, "\n")
+	if normalized == "" {
+		return nil
+	}
+	return strings.Split(normalized, "\n")
 }
 
 func (w *Worker) historyForLocked(sessionID string) *terminalHistoryBuffer {
@@ -1385,7 +1798,7 @@ func (w *Worker) sendTerminalMode(conn *ws.Conn, streamID, sessionID string, mod
 	env.WorkerID = w.ID
 	env.SessionID = sessionID
 	env.StreamID = streamID
-	if err := writeEnvelope(conn, env); err != nil {
+	if err := w.writeControlEnvelope(conn, env); err != nil {
 		w.Logger.Debug("terminal mode write failed", "session_id", sessionID, "stream_id", streamID, "mode", mode.Mode, "error", err)
 	}
 }
@@ -1468,6 +1881,15 @@ func (w *Worker) removeStream(streamID string) {
 	delete(w.streamStateKeys, streamID)
 	delete(w.streamTargets, streamID)
 	delete(w.streamCellUpdates, streamID)
+	if peer := w.streamPeers[streamID]; peer != nil {
+		if peer.channel != nil {
+			_ = peer.channel.Close()
+		}
+		if peer.peer != nil {
+			_ = peer.peer.Close()
+		}
+		delete(w.streamPeers, streamID)
+	}
 	activeStreams := len(w.streams)
 	w.mu.Unlock()
 	w.Logger.Debug("terminal stream removed", "stream_id", streamID, "streams", activeStreams, "had_terminal", terminal != nil)
@@ -1630,7 +2052,7 @@ func (w *Worker) sendError(conn *ws.Conn, sessionID, message string) {
 	env, _ := protocol.NewEnvelope(protocol.TypeError, protocol.ErrorPayload{Message: message})
 	env.WorkerID = w.ID
 	env.SessionID = sessionID
-	_ = writeEnvelope(conn, env)
+	_ = w.writeControlEnvelope(conn, env)
 }
 
 func (w *Worker) sendRequestError(conn *ws.Conn, requestID, sessionID, message string) {
@@ -1638,7 +2060,7 @@ func (w *Worker) sendRequestError(conn *ws.Conn, requestID, sessionID, message s
 	env.ID = requestID
 	env.WorkerID = w.ID
 	env.SessionID = sessionID
-	_ = writeEnvelope(conn, env)
+	_ = w.writeControlEnvelope(conn, env)
 }
 
 func (w *Worker) sendStreamError(conn *ws.Conn, streamID, sessionID, message string) {
@@ -1646,7 +2068,7 @@ func (w *Worker) sendStreamError(conn *ws.Conn, streamID, sessionID, message str
 	env.WorkerID = w.ID
 	env.StreamID = streamID
 	env.SessionID = sessionID
-	_ = writeEnvelope(conn, env)
+	_ = w.writeControlEnvelope(conn, env)
 }
 
 func ExchangeSignal(ctx context.Context, hubURL, signal, deviceID, deviceName string) (string, string, error) {
@@ -1852,6 +2274,134 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (w *Worker) initOutbound(conn *ws.Conn) <-chan error {
+	done := make(chan error, 1)
+	w.mu.Lock()
+	w.outboundConn = conn
+	w.outboundHigh = make(chan protocol.Envelope, workerOutboundHighQueueSize)
+	w.outboundLow = make(chan protocol.Envelope, workerOutboundLowQueueSize)
+	w.outboundQuit = make(chan struct{})
+	high := w.outboundHigh
+	low := w.outboundLow
+	quit := w.outboundQuit
+	w.mu.Unlock()
+	go func() {
+		for {
+			select {
+			case <-quit:
+				return
+			case env := <-high:
+				if err := writeEnvelope(conn, env); err != nil {
+					done <- err
+					return
+				}
+				continue
+			default:
+			}
+			select {
+			case <-quit:
+				return
+			case env := <-high:
+				if err := writeEnvelope(conn, env); err != nil {
+					done <- err
+					return
+				}
+			case env := <-low:
+				if err := writeEnvelope(conn, env); err != nil {
+					done <- err
+					return
+				}
+			}
+		}
+	}()
+	return done
+}
+
+func (w *Worker) closeOutbound(conn *ws.Conn) {
+	w.mu.Lock()
+	if w.outboundConn != conn {
+		w.mu.Unlock()
+		return
+	}
+	quit := w.outboundQuit
+	w.outboundConn = nil
+	w.outboundHigh = nil
+	w.outboundLow = nil
+	w.outboundQuit = nil
+	w.mu.Unlock()
+	if quit != nil {
+		close(quit)
+	}
+}
+
+func (w *Worker) writeControlEnvelope(conn *ws.Conn, env protocol.Envelope) error {
+	return w.enqueueOutboundEnvelope(conn, env, true)
+}
+
+func (w *Worker) writeStreamEnvelope(conn *ws.Conn, env protocol.Envelope) error {
+	return w.enqueueOutboundEnvelope(conn, env, false)
+}
+
+func (w *Worker) tryWriteStreamEnvelope(conn *ws.Conn, env protocol.Envelope) bool {
+	return w.tryEnqueueOutboundEnvelope(conn, env, false)
+}
+
+func (w *Worker) enqueueOutboundEnvelope(conn *ws.Conn, env protocol.Envelope, highPriority bool) error {
+	w.mu.Lock()
+	activeConn := w.outboundConn
+	high := w.outboundHigh
+	low := w.outboundLow
+	quit := w.outboundQuit
+	w.mu.Unlock()
+	if activeConn != conn || quit == nil {
+		return writeEnvelope(conn, env)
+	}
+	if highPriority {
+		select {
+		case <-quit:
+			return ws.ErrClosed
+		case high <- env:
+			return nil
+		}
+	}
+	select {
+	case <-quit:
+		return ws.ErrClosed
+	case low <- env:
+		return nil
+	}
+}
+
+func (w *Worker) tryEnqueueOutboundEnvelope(conn *ws.Conn, env protocol.Envelope, highPriority bool) bool {
+	w.mu.Lock()
+	activeConn := w.outboundConn
+	high := w.outboundHigh
+	low := w.outboundLow
+	quit := w.outboundQuit
+	w.mu.Unlock()
+	if activeConn != conn || quit == nil {
+		return writeEnvelope(conn, env) == nil
+	}
+	if highPriority {
+		select {
+		case <-quit:
+			return false
+		case high <- env:
+			return true
+		default:
+			return false
+		}
+	}
+	select {
+	case <-quit:
+		return false
+	case low <- env:
+		return true
+	default:
+		return false
+	}
 }
 
 func readEnvelope(conn *ws.Conn) (protocol.Envelope, error) {

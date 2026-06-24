@@ -305,6 +305,30 @@ func TestTerminalCellDiffReplacesChangedRowsAndCursor(t *testing.T) {
 	}
 }
 
+func TestSnapshotLinesForTerminalStateBottomAlignsContent(t *testing.T) {
+	got := snapshotLinesForTerminalState("top\nbottom", 4)
+	want := "\r\n\r\ntop\r\nbottom"
+	if got != want {
+		t.Fatalf("unexpected bottom aligned snapshot:\nwant %q\n got %q", want, got)
+	}
+}
+
+func TestHistoryPageForStreamFallsBackToTargetCapture(t *testing.T) {
+	backend := &captureHistoryBackend{data: "old-1\nold-2\n"}
+	w := New("https://hub.test", "token", "worker", "worker", backend, nil)
+	streamID := "stream-1"
+	sessionID := protocol.SessionID("worker", "demo")
+	w.streamTargets[streamID] = &protocol.TerminalTarget{SessionName: "demo", PaneID: "%1"}
+
+	page := w.historyPageForStream(context.Background(), streamID, sessionID, "demo", protocol.TerminalHistoryRequest{LimitLines: 20})
+	if len(page.Lines) != 2 || page.Lines[0].Text != "old-1" || page.Lines[1].Text != "old-2" {
+		t.Fatalf("unexpected fallback history page: %+v", page)
+	}
+	if backend.captureTargetCalls != 1 {
+		t.Fatalf("expected target capture to be used, got %d", backend.captureTargetCalls)
+	}
+}
+
 func TestTerminalMouseOnlyWritesWhenRemoteMouseModeEnabled(t *testing.T) {
 	stream := &recordingStream{}
 	w := New("https://hub.test", "token", "worker", "worker", nilBackend{}, nil)
@@ -512,6 +536,17 @@ func (nilBackend) SendTerminalInput(context.Context, string, string) error { ret
 func (nilBackend) Capture(context.Context, string, int) (string, error)    { return "", nil }
 func (nilBackend) Open(context.Context, string, int, int) (sessionbackend.Stream, error) {
 	return nil, nil
+}
+
+type captureHistoryBackend struct {
+	nilBackend
+	data               string
+	captureTargetCalls int
+}
+
+func (b *captureHistoryBackend) CaptureTarget(context.Context, sessionbackend.TerminalTarget, int) (string, error) {
+	b.captureTargetCalls++
+	return b.data, nil
 }
 
 type recordingStream struct {

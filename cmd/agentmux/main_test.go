@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
 	"testing"
@@ -112,6 +113,35 @@ func TestDefaultWorkerIDSanitizesEmptyName(t *testing.T) {
 		t.Fatalf("unexpected fallback worker id: %q", got)
 	}
 }
+
+func TestParseP2PICEServersCommaSeparated(t *testing.T) {
+	servers, err := parseP2PICEServers("stun:stun1.example.net:3478, turn:turn.example.net:3478?transport=udp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || len(servers[0].URLs) != 2 {
+		t.Fatalf("unexpected parsed servers: %+v", servers)
+	}
+}
+
+func TestParseP2PICEServersJSON(t *testing.T) {
+	raw, err := json.Marshal([]map[string]any{{
+		"urls":       []string{"turns:turn.example.net:5349"},
+		"username":   "user1",
+		"credential": "secret1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, err := parseP2PICEServers(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || len(servers[0].URLs) != 1 || servers[0].Username != "user1" || servers[0].Credential != "secret1" {
+		t.Fatalf("unexpected parsed JSON servers: %+v", servers)
+	}
+}
+
 func TestAddRuntimeDebugPprofAddrDefaultsDisabled(t *testing.T) {
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	debug := addRuntimeDebug(fs, "worker")

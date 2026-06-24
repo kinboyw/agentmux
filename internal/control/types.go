@@ -10,17 +10,18 @@ import (
 )
 
 type Client struct {
-	HubURL           string
-	Token            string
-	CredentialID     string
-	TenantID         string
-	Role             string
-	DeviceID         string
-	DeviceName       string
-	RefreshToken     string
-	ExpiresAt        time.Time
-	RefreshExpiresAt time.Time
-	HTTP             *http.Client
+	HubURL              string
+	Token               string
+	CredentialID        string
+	TenantID            string
+	Role                string
+	DeviceID            string
+	DeviceName          string
+	RefreshToken        string
+	ExpiresAt           time.Time
+	RefreshExpiresAt    time.Time
+	HTTP                *http.Client
+	TerminalChannelMode string
 }
 
 func New(hubURL, token string) Client {

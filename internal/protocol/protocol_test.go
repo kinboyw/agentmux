@@ -89,6 +89,25 @@ func TestTerminalRenderModePayloadRoundTrip(t *testing.T) {
 	if negotiated.GrantID != "grant_test" {
 		t.Fatalf("unexpected negotiated grant id: %+v", negotiated)
 	}
+	lineIndex := uint16(0)
+	signalEnv, err := NewEnvelope(TypeP2PSignal, P2PSignal{
+		GrantID:       "grant_test",
+		Signal:        "candidate",
+		Candidate:     "candidate:1 1 udp 1 127.0.0.1 9999 typ host",
+		SDPMid:        "0",
+		SDPMLineIndex: &lineIndex,
+		ICEServers:    []P2PICEServer{{URLs: []string{"stun:stun.example.net:3478"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signal P2PSignal
+	if err := signalEnv.DecodePayload(&signal); err != nil {
+		t.Fatal(err)
+	}
+	if signal.Candidate == "" || signal.SDPMid != "0" || signal.SDPMLineIndex == nil || *signal.SDPMLineIndex != 0 || len(signal.ICEServers) != 1 {
+		t.Fatalf("unexpected p2p signal payload: %+v", signal)
+	}
 }
 
 func TestTerminalMousePayloadRoundTrip(t *testing.T) {

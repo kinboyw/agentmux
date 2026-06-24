@@ -18,6 +18,7 @@ type Stream struct {
 	conn      *ws.Conn
 	SessionID string
 	StreamID  string
+	direct    *directTransportController
 }
 
 type StreamEvent struct {
@@ -46,7 +47,9 @@ func (c *Client) OpenTargetStream(ctx context.Context, sessionID string, size pr
 		return nil, err
 	}
 	stream := &Stream{conn: conn, SessionID: sessionID, StreamID: newStreamID(sessionID)}
-	open, err := protocol.NewEnvelope(protocol.TypeControlOpen, protocol.NewTerminalOpen(size, terminalTarget))
+	openReq := protocol.NewTerminalOpen(size, terminalTarget)
+	openReq.ChannelMode = controlChannelMode(c.TerminalChannelMode)
+	open, err := protocol.NewEnvelope(protocol.TypeControlOpen, openReq)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -56,6 +59,9 @@ func (c *Client) OpenTargetStream(ctx context.Context, sessionID string, size pr
 	if err := writeEnvelope(conn, open); err != nil {
 		_ = conn.Close()
 		return nil, err
+	}
+	if openReq.ChannelMode == protocol.TerminalChannelP2PPreferred {
+		stream.direct = newDirectTransportController(conn, sessionID, stream.StreamID)
 	}
 	return stream, nil
 }
@@ -81,6 +87,24 @@ func (s *Stream) ReadEvent() (StreamEvent, error) {
 		var payload protocol.ErrorPayload
 		_ = env.DecodePayload(&payload)
 		return StreamEvent{Type: env.Type, Err: errors.New(payload.Message)}, nil
+	case protocol.TypeP2PGrant:
+		var grant protocol.P2PGrant
+		if err := env.DecodePayload(&grant); err != nil {
+			return StreamEvent{}, err
+		}
+		if s.direct != nil {
+			s.direct.Start(grant)
+		}
+		return StreamEvent{Type: env.Type}, nil
+	case protocol.TypeP2PSignal:
+		var signal protocol.P2PSignal
+		if err := env.DecodePayload(&signal); err != nil {
+			return StreamEvent{}, err
+		}
+		if s.direct != nil {
+			s.direct.AcceptSignal(signal)
+		}
+		return StreamEvent{Type: env.Type}, nil
 	default:
 		return StreamEvent{Type: env.Type}, nil
 	}
@@ -107,9 +131,23 @@ func (s *Stream) Resize(size protocol.TerminalSize) error {
 }
 
 func (s *Stream) Close() error {
+	if s.direct != nil {
+		s.direct.Close()
+	}
 	closeEnv := protocol.Envelope{Type: protocol.TypeTerminalClose, SessionID: s.SessionID, StreamID: s.StreamID}
 	_ = writeEnvelope(s.conn, closeEnv)
 	return s.conn.Close()
+}
+
+func controlChannelMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "p2p", protocol.TerminalChannelP2PPreferred:
+		return protocol.TerminalChannelP2PPreferred
+	case protocol.TerminalChannelRelay:
+		return protocol.TerminalChannelRelay
+	default:
+		return protocol.TerminalChannelP2PPreferred
+	}
 }
 
 func newStreamID(sessionID string) string {

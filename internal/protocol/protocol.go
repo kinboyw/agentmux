@@ -258,20 +258,33 @@ type P2PGrant struct {
 	StreamID         string          `json:"stream_id"`
 	Target           *TerminalTarget `json:"target,omitempty"`
 	AllowedTransport string          `json:"allowed_transport"`
+	ICEServers       []P2PICEServer  `json:"ice_servers,omitempty"`
 	ExpiresAt        time.Time       `json:"expires_at"`
 	FallbackAfterMs  int             `json:"fallback_after_ms,omitempty"`
 	State            string          `json:"state,omitempty"`
 }
 
+type P2PICEServer struct {
+	URLs       []string `json:"urls,omitempty"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
 type P2PSignal struct {
-	GrantID   string `json:"grant_id"`
-	From      string `json:"from,omitempty"`
-	To        string `json:"to,omitempty"`
-	Signal    string `json:"signal"`
-	State     string `json:"state,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-	Message   string `json:"message,omitempty"`
-	ExpiresAt string `json:"expires_at,omitempty"`
+	GrantID       string         `json:"grant_id"`
+	From          string         `json:"from,omitempty"`
+	To            string         `json:"to,omitempty"`
+	Signal        string         `json:"signal"`
+	State         string         `json:"state,omitempty"`
+	Reason        string         `json:"reason,omitempty"`
+	Message       string         `json:"message,omitempty"`
+	SDPType       string         `json:"sdp_type,omitempty"`
+	SDP           string         `json:"sdp,omitempty"`
+	Candidate     string         `json:"candidate,omitempty"`
+	SDPMLineIndex *uint16        `json:"sdp_mline_index,omitempty"`
+	SDPMid        string         `json:"sdp_mid,omitempty"`
+	ICEServers    []P2PICEServer `json:"ice_servers,omitempty"`
+	ExpiresAt     string         `json:"expires_at,omitempty"`
 }
 
 type TerminalSnapshot struct {

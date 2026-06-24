@@ -33,7 +33,7 @@ const (
 	sessionAuxRequestWait    = 8 * time.Second
 	sessionCreateRequestWait = 5 * time.Second
 	p2pGrantTTL              = 30 * time.Second
-	p2pFallbackAfter         = 1500 * time.Millisecond
+	p2pFallbackAfter         = 10 * time.Second
 )
 
 //go:embed webdist docassets
@@ -44,6 +44,7 @@ type Server struct {
 	token       string
 	publicURL   string
 	releaseRepo string
+	iceServers  []protocol.P2PICEServer
 	logger      *slog.Logger
 
 	mu          sync.RWMutex
@@ -53,6 +54,7 @@ type Server struct {
 	subscribers map[string]*controlConn
 	streams     map[string]streamSubscription
 	controls    map[string]*controlConn
+	p2pGrants   map[string]protocol.P2PGrant
 	previews    map[string]chan protocol.Envelope
 	targets     map[string]chan protocol.Envelope
 	creates     map[string]chan protocol.Envelope
@@ -213,6 +215,7 @@ type ServerOptions struct {
 	Token        string
 	PublicURL    string
 	ReleaseRepo  string
+	ICEServers   []protocol.P2PICEServer
 	Logger       *slog.Logger
 	AuthStore    AuthStore
 	RuntimeStore RuntimeStore
@@ -231,6 +234,7 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		token:       options.Token,
 		publicURL:   strings.TrimRight(options.PublicURL, "/"),
 		releaseRepo: defaultReleaseRepo(options.ReleaseRepo),
+		iceServers:  append([]protocol.P2PICEServer(nil), options.ICEServers...),
 		logger:      logger,
 		workers:     map[string]*workerConn{},
 		workerViews: map[string]workerRecord{},
@@ -238,6 +242,7 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 		subscribers: map[string]*controlConn{},
 		streams:     map[string]streamSubscription{},
 		controls:    map[string]*controlConn{},
+		p2pGrants:   map[string]protocol.P2PGrant{},
 		previews:    map[string]chan protocol.Envelope{},
 		targets:     map[string]chan protocol.Envelope{},
 		creates:     map[string]chan protocol.Envelope{},
@@ -475,6 +480,10 @@ func (s *Server) reapExpiredAnonymousWorkers(now time.Time) (int, error) {
 		if s.auth.HasActiveControlCredential(tenantID, now) {
 			continue
 		}
+		if s.anonymousTenantHasConnectedWorkers(tenantID) {
+			s.logger.Debug("anonymous tenant expired but worker still connected; deferring reap", "tenant", tenantID)
+			continue
+		}
 		removed := s.interruptAnonymousTenant(tenantID)
 		if s.runtime != nil {
 			if err := s.runtime.DeleteTenantRuntime(tenantID); err != nil {
@@ -487,6 +496,17 @@ func (s *Server) reapExpiredAnonymousWorkers(now time.Time) (int, error) {
 		}
 	}
 	return reaped, nil
+}
+
+func (s *Server) anonymousTenantHasConnectedWorkers(tenantID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, record := range s.workerViews {
+		if record.tenantID == tenantID && record.connected {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) interruptAnonymousTenant(tenantID string) int {
@@ -1845,6 +1865,7 @@ func (s *Server) registerWorker(worker *workerConn) {
 		s.logger.Warn("worker connection replaced", "worker", worker.id)
 	}
 	staleStreams := s.removeWorkerStreamsLocked(worker.id)
+	revokedGrants := s.removeP2PGrantsByWorkerLocked(worker.id, "worker_replaced")
 	s.workers[worker.id] = worker
 	previous := s.workerViews[worker.id]
 	if worker.instanceID == "" {
@@ -1859,8 +1880,8 @@ func (s *Server) registerWorker(worker *workerConn) {
 	record := s.workerViews[worker.id]
 	s.completeWorkerUpdateOnReconnectLocked(worker.id, software)
 	s.mu.Unlock()
-	if old != nil && len(staleStreams) > 0 {
-		s.logger.Debug("worker replacement removed streams", "worker", worker.id, "streams", len(staleStreams))
+	if old != nil && (len(staleStreams) > 0 || len(revokedGrants) > 0) {
+		s.logger.Debug("worker replacement removed streams", "worker", worker.id, "streams", len(staleStreams), "p2p_grants", len(revokedGrants))
 	}
 	s.persistWorkerRecord(record)
 	s.logger.Info("worker connected", "worker", worker.id)
@@ -1903,9 +1924,10 @@ func (s *Server) unregisterWorker(worker *workerConn) {
 	record.software = mergeWorkerSoftware(record.software, worker.software)
 	s.workerViews[worker.id] = record
 	staleStreams := s.removeWorkerStreamsLocked(worker.id)
+	revokedGrants := s.removeP2PGrantsByWorkerLocked(worker.id, "worker_disconnected")
 	s.mu.Unlock()
-	if len(staleStreams) > 0 {
-		s.logger.Debug("worker disconnect removed streams", "worker", worker.id, "streams", len(staleStreams))
+	if len(staleStreams) > 0 || len(revokedGrants) > 0 {
+		s.logger.Debug("worker disconnect removed streams", "worker", worker.id, "streams", len(staleStreams), "p2p_grants", len(revokedGrants))
 	}
 	s.persistWorkerRecord(record)
 	s.logger.Info("worker disconnected", "worker", worker.id)
@@ -1940,6 +1962,10 @@ func (s *Server) handleWorkerMessage(worker *workerConn, env protocol.Envelope) 
 	case protocol.TypeTerminalMode, protocol.TypeTerminalSnapshot, protocol.TypeTerminalStateReset, protocol.TypeTerminalDiff, protocol.TypeTerminalHistoryPage:
 		s.logger.Debug("terminal state message from worker", "worker", worker.id, "type", env.Type, "session_id", env.SessionID, "stream_id", env.StreamID, "payload_bytes", len(env.Payload))
 		s.publish(env.StreamID, env)
+	case protocol.TypeP2PSignal:
+		if err := s.forwardP2PSignalFromWorker(worker, env); err != nil {
+			s.logger.Debug("worker p2p signal rejected", "worker", worker.id, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
+		}
 	case protocol.TypeSessionPreview:
 		s.completePreview(env)
 	case protocol.TypeSessionTargets:
@@ -2246,11 +2272,14 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 		s.closeStreams(staleStreams, "control stream replaced")
 		if err := s.sendToWorker(workerID, protocol.TypeTerminalOpen, open, name, env.SessionID, env.StreamID); err != nil {
 			s.logger.Debug("control open forward failed", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
+			if grant != nil {
+				s.revokeP2PGrant(grant.GrantID, "terminal_open_forward_failed")
+			}
 			sendError(control.send, env.SessionID, err.Error())
 			return
 		}
 		if grant != nil {
-			s.emitP2PSignalingPlaceholder(control, *grant)
+			s.emitP2PGrantIssued(control, *grant)
 		}
 	case protocol.TypeControlInput:
 		workerID, name, ok := protocol.SplitSessionID(env.SessionID)
@@ -2375,10 +2404,16 @@ func (s *Server) handleControlMessage(control *controlConn, env protocol.Envelop
 		}
 		s.logger.Debug("control close forward", "control", control.id, "worker", workerID, "session_id", env.SessionID, "stream_id", env.StreamID)
 		staleStreams := s.removeSubscriberStream(env.StreamID)
+		s.revokeP2PGrantByStream(env.StreamID, "control_close")
 		if len(staleStreams) == 0 {
 			staleStreams = []streamCloseRequest{{streamID: env.StreamID, subscription: streamSubscription{workerID: workerID, sessionID: env.SessionID, name: name}}}
 		}
 		s.closeStreams(staleStreams, "control close")
+	case protocol.TypeP2PSignal:
+		if err := s.forwardP2PSignalFromControl(control, env); err != nil {
+			s.logger.Debug("control p2p signal rejected", "control", control.id, "session_id", env.SessionID, "stream_id", env.StreamID, "error", err)
+			sendError(control.send, env.SessionID, err.Error())
+		}
 	}
 }
 
@@ -2395,18 +2430,36 @@ func (s *Server) addSubscriber(streamID string, control *controlConn, subscripti
 		if id == streamID {
 			continue
 		}
-		if existing.controlID == control.id && existing.workerID == subscription.workerID && existing.sessionID == subscription.sessionID && existing.name == subscription.name && existing.targetKey == subscription.targetKey {
-			delete(s.subscribers, id)
-			delete(s.streams, id)
-			staleStreams = append(staleStreams, streamCloseRequest{streamID: id, subscription: existing})
-			s.logger.Debug("subscriber replaced", "control", control.id, "old_stream_id", id, "new_stream_id", streamID, "session_id", existing.sessionID)
+		if !shouldReplaceStreamSubscription(control, existing, subscription) {
+			continue
 		}
+		delete(s.subscribers, id)
+		delete(s.streams, id)
+		staleStreams = append(staleStreams, streamCloseRequest{streamID: id, subscription: existing})
+		s.logger.Debug("subscriber replaced", "control", control.id, "old_stream_id", id, "new_stream_id", streamID, "session_id", existing.sessionID, "target_key", existing.targetKey)
 	}
 	s.subscribers[streamID] = control
 	s.streams[streamID] = subscription
 	s.mu.Unlock()
 	s.logger.Debug("subscriber added", "control", control.id, "stream_id", streamID)
 	return staleStreams
+}
+
+func shouldReplaceStreamSubscription(control *controlConn, existing, next streamSubscription) bool {
+	if existing.workerID != next.workerID || existing.sessionID != next.sessionID || existing.name != next.name {
+		return false
+	}
+	if existing.controlID == control.id && existing.targetKey == next.targetKey {
+		return true
+	}
+	return exclusiveTargetSubscriptionKey(existing.targetKey) != "" && existing.targetKey == next.targetKey
+}
+
+func exclusiveTargetSubscriptionKey(targetKey string) string {
+	if strings.HasPrefix(targetKey, "pane_id:") {
+		return targetKey
+	}
+	return ""
 }
 
 func (s *Server) removeControl(control *controlConn) {
@@ -2425,13 +2478,14 @@ func (s *Server) removeControl(control *controlConn) {
 			s.logger.Debug("subscriber removed", "control", control.id, "stream_id", id)
 		}
 	}
+	revokedGrants := s.removeP2PGrantsByControlLocked(control.id, "control_disconnected")
 	delete(s.controls, control.id)
 	s.mu.Unlock()
 	s.closeStreams(staleStreams, "control disconnected")
 	if control.conn != nil {
 		_ = control.conn.Close()
 	}
-	s.logger.Debug("control websocket disconnected", "control", control.id)
+	s.logger.Debug("control websocket disconnected", "control", control.id, "streams", len(staleStreams), "p2p_grants", len(revokedGrants))
 }
 
 func (s *Server) removeSubscriberStream(streamID string) []streamCloseRequest {
@@ -2443,6 +2497,14 @@ func (s *Server) removeSubscriberStream(streamID string) []streamCloseRequest {
 	subscription, ok := s.streams[streamID]
 	delete(s.subscribers, streamID)
 	delete(s.streams, streamID)
+	for grantID, grant := range s.p2pGrants {
+		if grant.StreamID == streamID {
+			grant.State = "revoked"
+			s.p2pGrants[grantID] = grant
+			delete(s.p2pGrants, grantID)
+			s.logger.Debug("p2p grant revoked", "grant_id", grantID, "stream_id", streamID, "reason", "stream_removed")
+		}
+	}
 	if !ok {
 		return nil
 	}
@@ -2999,10 +3061,14 @@ func (s *Server) issueP2PGrantIfRequested(control *controlConn, workerID, sessio
 		StreamID:         streamID,
 		Target:           open.Target,
 		AllowedTransport: protocol.TerminalChannelP2PPreferred,
+		ICEServers:       append([]protocol.P2PICEServer(nil), s.iceServers...),
 		ExpiresAt:        now.Add(p2pGrantTTL),
 		FallbackAfterMs:  int(p2pFallbackAfter / time.Millisecond),
 		State:            "issued",
 	}
+	s.mu.Lock()
+	s.p2pGrants[grant.GrantID] = grant
+	s.mu.Unlock()
 	env, err := protocol.NewEnvelope(protocol.TypeP2PGrant, grant)
 	if err == nil {
 		env.SessionID = sessionID
@@ -3017,40 +3083,215 @@ func (s *Server) issueP2PGrantIfRequested(control *controlConn, workerID, sessio
 	return &grant
 }
 
-func (s *Server) emitP2PSignalingPlaceholder(control *controlConn, grant protocol.P2PGrant) {
-	signals := []protocol.P2PSignal{
-		{
-			GrantID: grant.GrantID,
-			From:    "hub",
-			To:      "control",
-			Signal:  "grant_issued",
-			State:   "signaling",
-			Message: "P2P attach grant issued; direct signaling channel is not implemented yet.",
-		},
-		{
-			GrantID: grant.GrantID,
-			From:    "hub",
-			To:      "control",
-			Signal:  "fallback",
-			State:   protocol.TerminalChannelP2PFallback,
-			Reason:  "p2p_signaling_not_implemented",
-			Message: "Using Hub relay while P2P signaling is staged.",
-		},
+func (s *Server) emitP2PGrantIssued(control *controlConn, grant protocol.P2PGrant) {
+	signal := protocol.P2PSignal{
+		GrantID: grant.GrantID,
+		From:    "hub",
+		To:      "control",
+		Signal:  "grant_issued",
+		State:   "signaling",
+		Message: "P2P attach grant issued; waiting for direct signaling.",
 	}
-	for _, signal := range signals {
-		env, err := protocol.NewEnvelope(protocol.TypeP2PSignal, signal)
-		if err != nil {
+	env, err := protocol.NewEnvelope(protocol.TypeP2PSignal, signal)
+	if err != nil {
+		return
+	}
+	env.SessionID = grant.SessionID
+	env.StreamID = grant.StreamID
+	select {
+	case control.send <- env:
+	default:
+		s.logger.Debug("p2p signal dropped; control send queue full", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal)
+		return
+	}
+	s.logger.Debug("p2p signal emitted", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+}
+
+func (s *Server) forwardP2PSignalFromControl(control *controlConn, env protocol.Envelope) error {
+	var signal protocol.P2PSignal
+	if err := env.DecodePayload(&signal); err != nil {
+		return err
+	}
+	grant, err := s.p2pGrantForSignal(signal.GrantID)
+	if err != nil {
+		return err
+	}
+	if grant.ControlID != control.id {
+		return fmt.Errorf("p2p grant does not belong to control")
+	}
+	if env.SessionID != "" && env.SessionID != grant.SessionID {
+		return fmt.Errorf("p2p signal session mismatch")
+	}
+	if env.StreamID != "" && env.StreamID != grant.StreamID {
+		return fmt.Errorf("p2p signal stream mismatch")
+	}
+	signal.From = firstNonEmptyString(signal.From, "control")
+	signal.To = "worker"
+	if len(signal.ICEServers) == 0 && len(grant.ICEServers) > 0 {
+		signal.ICEServers = append([]protocol.P2PICEServer(nil), grant.ICEServers...)
+	}
+	grant = s.updateP2PGrantState(grant.GrantID, p2pSignalState(signal, "negotiating"))
+	if err := s.sendToWorker(grant.WorkerID, protocol.TypeP2PSignal, signal, "", grant.SessionID, grant.StreamID); err != nil {
+		s.updateP2PGrantState(grant.GrantID, protocol.TerminalChannelP2PFallback)
+		return err
+	}
+	s.logger.Debug("p2p signal forwarded", "from", "control", "to", "worker", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	return nil
+}
+
+func (s *Server) forwardP2PSignalFromWorker(worker *workerConn, env protocol.Envelope) error {
+	var signal protocol.P2PSignal
+	if err := env.DecodePayload(&signal); err != nil {
+		return err
+	}
+	grant, err := s.p2pGrantForSignal(signal.GrantID)
+	if err != nil {
+		return err
+	}
+	if grant.WorkerID != worker.id {
+		return fmt.Errorf("p2p grant does not belong to worker")
+	}
+	if env.SessionID != "" && env.SessionID != grant.SessionID {
+		return fmt.Errorf("p2p signal session mismatch")
+	}
+	if env.StreamID != "" && env.StreamID != grant.StreamID {
+		return fmt.Errorf("p2p signal stream mismatch")
+	}
+	signal.From = firstNonEmptyString(signal.From, "worker")
+	signal.To = "control"
+	if len(signal.ICEServers) == 0 && len(grant.ICEServers) > 0 {
+		signal.ICEServers = append([]protocol.P2PICEServer(nil), grant.ICEServers...)
+	}
+	state := p2pSignalState(signal, grant.State)
+	grant = s.updateP2PGrantState(grant.GrantID, state)
+	control := s.controlForP2PGrant(grant)
+	if control == nil {
+		return fmt.Errorf("control not connected for p2p grant")
+	}
+	out, err := protocol.NewEnvelope(protocol.TypeP2PSignal, signal)
+	if err != nil {
+		return err
+	}
+	out.SessionID = grant.SessionID
+	out.StreamID = grant.StreamID
+	select {
+	case control.send <- out:
+	default:
+		return fmt.Errorf("control send queue full: %s", grant.ControlID)
+	}
+	s.logger.Debug("p2p signal forwarded", "from", "worker", "to", "control", "control", grant.ControlID, "worker", worker.id, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	return nil
+}
+
+func (s *Server) p2pGrantForSignal(grantID string) (protocol.P2PGrant, error) {
+	grantID = strings.TrimSpace(grantID)
+	if grantID == "" {
+		return protocol.P2PGrant{}, fmt.Errorf("p2p grant_id is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grant, ok := s.p2pGrants[grantID]
+	if !ok {
+		return protocol.P2PGrant{}, fmt.Errorf("p2p grant not found")
+	}
+	if !grant.ExpiresAt.IsZero() && now.After(grant.ExpiresAt) {
+		delete(s.p2pGrants, grantID)
+		s.logger.Debug("p2p grant expired", "grant_id", grantID, "worker", grant.WorkerID, "control", grant.ControlID, "session_id", grant.SessionID, "stream_id", grant.StreamID)
+		return protocol.P2PGrant{}, fmt.Errorf("p2p grant expired")
+	}
+	return grant, nil
+}
+
+func (s *Server) updateP2PGrantState(grantID, state string) protocol.P2PGrant {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grant := s.p2pGrants[grantID]
+	if grant.GrantID == "" {
+		return grant
+	}
+	if state != "" {
+		grant.State = state
+	}
+	s.p2pGrants[grantID] = grant
+	return grant
+}
+
+func (s *Server) controlForP2PGrant(grant protocol.P2PGrant) *controlConn {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if control := s.controls[grant.ControlID]; control != nil {
+		return control
+	}
+	return s.subscribers[grant.StreamID]
+}
+
+func (s *Server) revokeP2PGrant(grantID, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grant, ok := s.p2pGrants[grantID]
+	if !ok {
+		return
+	}
+	delete(s.p2pGrants, grantID)
+	s.logger.Debug("p2p grant revoked", "grant_id", grantID, "worker", grant.WorkerID, "control", grant.ControlID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "reason", reason)
+}
+
+func (s *Server) revokeP2PGrantByStream(streamID, reason string) {
+	if streamID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for grantID, grant := range s.p2pGrants {
+		if grant.StreamID == streamID {
+			delete(s.p2pGrants, grantID)
+			s.logger.Debug("p2p grant revoked", "grant_id", grantID, "worker", grant.WorkerID, "control", grant.ControlID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "reason", reason)
+		}
+	}
+}
+
+func (s *Server) removeP2PGrantsByWorkerLocked(workerID, reason string) []protocol.P2PGrant {
+	removed := make([]protocol.P2PGrant, 0)
+	for grantID, grant := range s.p2pGrants {
+		if grant.WorkerID != workerID {
 			continue
 		}
-		env.SessionID = grant.SessionID
-		env.StreamID = grant.StreamID
-		select {
-		case control.send <- env:
-		default:
-			s.logger.Debug("p2p signal dropped; control send queue full", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal)
-			return
+		delete(s.p2pGrants, grantID)
+		removed = append(removed, grant)
+		s.logger.Debug("p2p grant revoked", "grant_id", grantID, "worker", grant.WorkerID, "control", grant.ControlID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "reason", reason)
+	}
+	return removed
+}
+
+func (s *Server) removeP2PGrantsByControlLocked(controlID, reason string) []protocol.P2PGrant {
+	removed := make([]protocol.P2PGrant, 0)
+	for grantID, grant := range s.p2pGrants {
+		if grant.ControlID != controlID {
+			continue
 		}
-		s.logger.Debug("p2p signal emitted", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+		delete(s.p2pGrants, grantID)
+		removed = append(removed, grant)
+		s.logger.Debug("p2p grant revoked", "grant_id", grantID, "worker", grant.WorkerID, "control", grant.ControlID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "reason", reason)
+	}
+	return removed
+}
+
+func p2pSignalState(signal protocol.P2PSignal, fallback string) string {
+	if signal.State != "" {
+		return signal.State
+	}
+	switch signal.Signal {
+	case "offer", "offer_placeholder", "answer", "answer_placeholder", "candidate":
+		return "negotiating"
+	case "direct":
+		return protocol.TerminalChannelP2PDirect
+	case "fallback", "unsupported":
+		return protocol.TerminalChannelP2PFallback
+	case "close":
+		return "closed"
+	default:
+		return fallback
 	}
 }
 
