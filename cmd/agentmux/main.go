@@ -6,6 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -167,6 +170,8 @@ func runHub(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	closeDebug := configureRuntimeDebug("hub", *debug)
 	defer closeDebug()
+	closePprof := startRuntimePprof(ctx, "hub", debug.pprofAddr)
+	defer closePprof()
 	var authStore hub.AuthStore
 	if *data != "" {
 		store, err := hub.OpenSQLiteAuthStore(*data)
@@ -379,6 +384,8 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	_ = fs.Parse(args)
 	closeDebug := configureRuntimeDebug("worker", *debug)
 	defer closeDebug()
+	closePprof := startRuntimePprof(ctx, "worker", debug.pprofAddr)
+	defer closePprof()
 	cfg, _ := appconfig.Load()
 	if *hubURL == "" && *token == "" && *join == "" {
 		*hubURL = cfg.WorkerHubURL
@@ -1131,8 +1138,9 @@ type controlDebugFlags struct {
 }
 
 type runtimeDebugFlags struct {
-	enabled bool
-	logPath string
+	enabled   bool
+	logPath   string
+	pprofAddr string
 }
 
 func controlFlags(name string, args []string) commonControlFlags {
@@ -1171,6 +1179,7 @@ func addRuntimeDebug(fs *flag.FlagSet, component string) *runtimeDebugFlags {
 	envPrefix := "AGENTMUX_" + strings.ToUpper(component)
 	fs.BoolVar(&debug.enabled, "debug", envBool(envPrefix+"_DEBUG") || envBool("AGENTMUX_DEBUG"), "enable debug logging")
 	fs.StringVar(&debug.logPath, "debug-log", firstNonEmptyEnv(envPrefix+"_DEBUG_LOG", "AGENTMUX_DEBUG_LOG"), "debug log path")
+	fs.StringVar(&debug.pprofAddr, "pprof-addr", firstNonEmptyEnv(envPrefix+"_PPROF_ADDR", "AGENTMUX_PPROF_ADDR"), "pprof listen address, for example 127.0.0.1:6060; disabled when empty")
 	return debug
 }
 
@@ -1197,6 +1206,40 @@ func configureRuntimeDebug(component string, flags runtimeDebugFlags) func() {
 		if output != nil && output != os.Stderr {
 			_ = output.Close()
 		}
+	}
+}
+
+func startRuntimePprof(ctx context.Context, component, addr string) func() {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return func() {}
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		fatal(fmt.Errorf("start %s pprof listener: %w", component, err))
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	server := &http.Server{Handler: mux}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Default().Error("pprof server failed", "component", component, "addr", listener.Addr().String(), "error", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = server.Close()
+	}()
+	slog.Default().Info("pprof server listening", "component", component, "addr", listener.Addr().String(), "url", "http://"+listener.Addr().String()+"/debug/pprof/")
+	return func() {
+		_ = server.Close()
+		<-done
 	}
 }
 

@@ -303,6 +303,21 @@ go run ./cmd/agentmux control app --hub http://127.0.0.1:8081 --token dev-token 
 
 Inside the TUI, press `D` from the session list to append a JSON state snapshot to the debug log. Attached sessions run in the right-side terminal area by default; use `Ctrl-F` to toggle full-screen, `Ctrl-]` to detach, `Ctrl-Q` to quit the TUI, or `Ctrl-G` to write a debug snapshot. Normal keys are sent to the remote terminal. The snapshot records render counters, stream queue sizes, selected session metadata, and terminal view sizes, but not credentials or terminal output.
 
+For runtime profiling, enable the optional pprof endpoint on Hub or Worker. Keep
+the address bound to localhost unless the port is protected by a private
+network.
+
+```bash
+agentmux worker run --pprof-addr 127.0.0.1:6060
+agentmux hub --pprof-addr 127.0.0.1:6061
+
+go tool pprof -http=:0 http://127.0.0.1:6060/debug/pprof/heap
+go tool pprof -http=:0 http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+```
+
+The same setting can be provided with `AGENTMUX_WORKER_PPROF_ADDR`,
+`AGENTMUX_HUB_PPROF_ADDR`, or the shared `AGENTMUX_PPROF_ADDR` fallback.
+
 ## Version And Updates
 
 Check the current binary:

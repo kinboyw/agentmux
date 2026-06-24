@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"testing"
 	"time"
@@ -93,5 +94,42 @@ func TestDefaultWorkerIDSanitizesEmptyName(t *testing.T) {
 	got := defaultWorkerID(" / ", "wins_deadbeef")
 	if got != "worker-deadbeef" {
 		t.Fatalf("unexpected fallback worker id: %q", got)
+	}
+}
+func TestAddRuntimeDebugPprofAddrDefaultsDisabled(t *testing.T) {
+	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
+	debug := addRuntimeDebug(fs, "worker")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if debug.pprofAddr != "" {
+		t.Fatalf("pprof should default disabled, got %q", debug.pprofAddr)
+	}
+}
+
+func TestAddRuntimeDebugPprofAddrUsesComponentEnv(t *testing.T) {
+	t.Setenv("AGENTMUX_PPROF_ADDR", "127.0.0.1:6060")
+	t.Setenv("AGENTMUX_WORKER_PPROF_ADDR", "127.0.0.1:6061")
+
+	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
+	debug := addRuntimeDebug(fs, "worker")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if debug.pprofAddr != "127.0.0.1:6061" {
+		t.Fatalf("component env should win, got %q", debug.pprofAddr)
+	}
+}
+
+func TestAddRuntimeDebugPprofAddrFlagOverridesEnv(t *testing.T) {
+	t.Setenv("AGENTMUX_WORKER_PPROF_ADDR", "127.0.0.1:6061")
+
+	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
+	debug := addRuntimeDebug(fs, "worker")
+	if err := fs.Parse([]string{"--pprof-addr", "127.0.0.1:0"}); err != nil {
+		t.Fatal(err)
+	}
+	if debug.pprofAddr != "127.0.0.1:0" {
+		t.Fatalf("flag should override env, got %q", debug.pprofAddr)
 	}
 }
