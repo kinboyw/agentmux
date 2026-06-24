@@ -56,6 +56,7 @@ const xtermTheme = {
 const terminalFontFamily = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 const terminalFontSize = 14;
 const terminalLineHeight = 1.2;
+const terminalCellsDiagnostics = terminalCellsDiagnosticsEnabled();
 
 type WorkerView = {
   id: string;
@@ -72,6 +73,18 @@ type WorkerView = {
   trace_enabled?: boolean;
   debug_enabled?: boolean;
 };
+
+function terminalCellsDiagnosticsEnabled() {
+  const enabledValues = new Set(["1", "true", "yes", "on", "debug"]);
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const queryValue = params.get("terminalCells") || params.get("terminal_cells");
+    if (queryValue && enabledValues.has(queryValue.toLowerCase())) return true;
+    return enabledValues.has((window.localStorage.getItem("agentmux_terminal_cells") || "").toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
 type WorkerSoftware = {
   version?: string;
@@ -485,7 +498,6 @@ type DropTarget = {
 
 const dragMime = "application/x-agentmux-drag";
 const defaultTmuxPrefix = "\x02";
-const terminalResizeDebounceMs = 450;
 let terminalInputSuppressedUntil = 0;
 let layoutResizeInProgress = false;
 const query = new URLSearchParams(window.location.search);
@@ -4446,10 +4458,8 @@ function TerminalPane({
   const socket = React.useRef<WebSocket | null>(null);
   const streamId = React.useRef("");
   const lastSize = React.useRef({ cols: 0, rows: 0 });
-  const lastSyncedRemoteSize = React.useRef({ cols: 0, rows: 0 });
   const cellMetricsRef = React.useRef<TerminalCellMetrics>({ width: 8, height: 14 });
   const latestXtermSelection = React.useRef("");
-  const resizeSyncTimer = React.useRef<number | null>(null);
   const attachRecoveryTimer = React.useRef<number | null>(null);
   const delayedFitTimers = React.useRef<number[]>([]);
   const directTransport = React.useRef<DirectTransportController | null>(null);
@@ -4567,20 +4577,12 @@ function TerminalPane({
     terminal.current?.focus();
   }
 
-  function sendSizeSync(manual = true, size = currentTerminalSize()) {
+  function sendSizeSync(size = currentTerminalSize()) {
     if (!pane.sessionId || !streamId.current || !socket.current) return;
     if (!size) return;
-    if (!manual && lastSyncedRemoteSize.current.cols === size.cols && lastSyncedRemoteSize.current.rows === size.rows) return;
-    lastSyncedRemoteSize.current = size;
     sendEnvelope(socket.current, "terminal.size.sync", pane.sessionId, streamId.current, { ...size, source: "control_viewport" });
-    if (manual) setStatus({ tone: "warn", title: "Syncing remote size", detail: `${size.cols}x${size.rows}` });
+    setStatus({ tone: "warn", title: "Syncing remote size", detail: `${size.cols}x${size.rows}` });
     terminal.current?.focus();
-  }
-
-  function clearResizeSyncTimer() {
-    if (resizeSyncTimer.current === null) return;
-    window.clearTimeout(resizeSyncTimer.current);
-    resizeSyncTimer.current = null;
   }
 
   function clearAttachRecoveryTimer() {
@@ -4603,24 +4605,8 @@ function TerminalPane({
       const hasRenderedState = Boolean(terminalMode.mode) || Boolean(cellSnapshot) || Boolean(terminal.current?.buffer.active.length);
       if (hasRenderedState) return;
       sendSizeReset();
-      const size = currentTerminalSize();
-      if (size) scheduleRemoteSizeSync(size);
       setStatus({ tone: "warn", title: "Terminal recovery", detail: "Attach stalled; retrying remote size reset." });
     }, 2200);
-  }
-
-  function scheduleRemoteSizeSync(size: { cols: number; rows: number }) {
-    clearResizeSyncTimer();
-    resizeSyncTimer.current = window.setTimeout(() => {
-      resizeSyncTimer.current = null;
-      if (layoutResizeInProgress) {
-        scheduleRemoteSizeSync(size);
-        return;
-      }
-      if (resizePolicy.current !== "worker_state") return;
-      if (!socket.current || socket.current.readyState !== WebSocket.OPEN) return;
-      sendSizeSync(false, size);
-    }, terminalResizeDebounceMs);
   }
 
   function sendSizeReset() {
@@ -4981,8 +4967,6 @@ function TerminalPane({
       if (ws.readyState === WebSocket.OPEN) {
         if (resizePolicy.current === "follow_control") {
           sendEnvelope(ws, "terminal.resize", pane.sessionId!, streamId.current, size);
-        } else if (resizePolicy.current === "worker_state") {
-          scheduleRemoteSizeSync(size);
         }
       }
     };
@@ -5005,10 +4989,12 @@ function TerminalPane({
 
     ws.addEventListener("open", () => {
       const size = fitTerminal();
+      const capabilities = ["terminal.snapshot.v1", "terminal.state_reset.v1", "terminal.size_control.v1", "terminal.history.v1"];
+      if (terminalCellsDiagnostics) capabilities.push("terminal.cells.v1");
       sendEnvelope(ws, "control.open", pane.sessionId!, streamId.current, {
         ...(size || { cols: term.cols, rows: term.rows }),
         target: pane.target,
-        capabilities: ["terminal.snapshot.v1", "terminal.state_reset.v1", "terminal.size_control.v1", "terminal.history.v1", "terminal.cells.v1"],
+        capabilities,
         transport_mode: "auto",
         render_mode: "worker_state_xterm",
         resize_policy: "worker_state",
@@ -5016,7 +5002,6 @@ function TerminalPane({
       });
       if (size) {
         lastSize.current = size;
-        lastSyncedRemoteSize.current = size;
       }
       setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: streamId.current });
       scheduleFit();
@@ -5259,7 +5244,6 @@ function TerminalPane({
       direct.close();
       directTransport.current = null;
       clearAttachRecoveryTimer();
-      clearResizeSyncTimer();
       clearDelayedFitTimers();
       dataDisposable.dispose();
       document.removeEventListener("keydown", onDocumentKeyDown, true);

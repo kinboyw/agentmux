@@ -736,6 +736,12 @@ position. Normal Control layout changes must not resize the remote tmux/PTY in
 worker-state mode; remote size changes require explicit sync/reset operations so
 multiple Controls do not fight over terminal geometry.
 
+This separation is about local view state, not about disabling remote control.
+Control still sends explicit terminal input and tmux operations through Worker.
+Those command-plane operations are allowed to mutate the remote session and are
+then reflected back through Worker-owned snapshots, live updates, history, and
+generation boundaries.
+
 The Go CLI should remain a debug tool. The product-grade control should be web.
 
 ## Initial Implementation Plan

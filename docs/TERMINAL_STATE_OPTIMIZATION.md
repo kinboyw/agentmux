@@ -212,6 +212,17 @@ Control should not force lazy history pages into xterm scrollback. xterm owns
 the current terminal surface. Historical pages can be rendered in a virtual
 history view and aligned to the xterm bottom by sequence numbers.
 
+Worker-state mode has two separate planes:
+
+- **View plane:** Control owns local layout, viewport size, scroll/history
+  anchors, and rendering position. These local view changes must not implicitly
+  mutate tmux/PTY state.
+- **Command plane:** Control can still operate the remote tmux/PTY by sending
+  explicit input or commands through Worker. Raw keystrokes, tmux prefix
+  sequences, target selection, pane/window operations, and explicit size
+  sync/reset are remote mutations and should update Worker canonical state,
+  generation, and history boundaries.
+
 The intended rollback behavior is Control-side viewport rollback, not Worker
 terminal-state rollback. After `control.open`, Worker starts recording output for
 the selected state domain, sends the current snapshot, and streams subsequent
@@ -743,6 +754,13 @@ rotating a Control pane must not mutate the remote terminal size by default. A
 remote size mutation is allowed only through explicit state operations such as
 `terminal.size.sync` or `terminal.size.reset`.
 
+State isolation does not remove remote control. It only prevents accidental
+remote mutations caused by local layout. User intent still flows through the
+command plane: terminal input, tmux prefix shortcuts, pane/window selection,
+copy-mode keys, split/resize commands, and explicit sync/reset are all allowed
+to change the remote session. Worker remains the authority that records the
+resulting screen, transcript, and generation changes.
+
 For the default whole-session attach, the backend may use a real tmux client.
 In that mode the browser viewport can drive the attached tmux client size, and
 the remote session may repaint accordingly. That is the expected compatibility
@@ -920,20 +938,16 @@ Current implementation status:
   `reset` are wired through Hub, Worker, and Web Control.
 - Web Control opens state-capable streams by default and stops sending ordinary
   viewport resize messages once Worker negotiates `worker_state`.
-- Gap: Web Control currently schedules automatic `terminal.size.sync` after local
-  xterm fit/resize in `worker_state`. That is useful as a temporary recovery
-  bridge, but it violates the state-isolation target above because ordinary
-  browser layout changes can still resize the remote tmux/PTY and force a new
-  generation. The production behavior should update only `control_viewport` on
-  normal layout changes; `terminal.size.sync` and `terminal.size.reset` should be
-  explicit user actions or narrowly scoped recovery operations.
+- Web Control updates only `control_viewport` on normal layout changes in
+  `worker_state`; `terminal.size.sync` and `terminal.size.reset` are explicit
+  command-plane actions or narrowly scoped recovery operations.
 - Worker keeps a bounded transcript ring and can answer
   `terminal.history.request` with `terminal.history.page`.
-- Gap: Worker also maintains a `cells-v1` screen snapshot through the terminal
-  parser, and Web Control currently still requests cell snapshots by default.
-  The production path should be `worker_state_xterm`: xterm.js receives ANSI
-  snapshots plus live output, while cell snapshots/diffs remain opt-in
-  diagnostics.
+- Worker also maintains a `cells-v1` screen snapshot through the terminal
+  parser, but Web Control should request cell snapshots only when diagnostics are
+  explicitly enabled. The production path is `worker_state_xterm`: xterm.js
+  receives ANSI snapshots plus live output, while cell snapshots/diffs remain
+  opt-in diagnostics.
 - Web Control can still expose Worker-side cells as an opt-in debug surface in a
   later iteration. It should not subscribe to cell snapshots on every pane by
   default.
