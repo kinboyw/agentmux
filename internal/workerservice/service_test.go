@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -48,9 +49,8 @@ func TestLockOwnerPIDReadsWrittenOwner(t *testing.T) {
 	defer file.Close()
 
 	WriteLockOwner(file, os.Getpid())
-	pid, gotPath, ok := LockOwnerPID("local")
-	if !ok || pid != os.Getpid() || gotPath != path {
-		t.Fatalf("unexpected lock owner: pid=%d path=%s ok=%v", pid, gotPath, ok)
+	if pid, gotPath, ok := LockOwnerPID("local"); ok {
+		t.Fatalf("expected non-worker current process to be ignored, got pid=%d path=%s ok=%v", pid, gotPath, ok)
 	}
 
 	ClearLockOwner(file)
@@ -117,5 +117,32 @@ func TestLaunchdEnvXMLIncludesConfiguredTmux(t *testing.T) {
 	}
 	if strings.Contains(got, "AGENTMUX_TMUX_PATH") {
 		t.Fatalf("empty env should be omitted:\n%s", got)
+	}
+}
+
+func TestWorkerProcessRunningRejectsCurrentNonWorkerProcess(t *testing.T) {
+	if !processRunning(os.Getpid()) {
+		t.Fatal("expected current test process to be running")
+	}
+	if workerProcessRunning(os.Getpid()) {
+		t.Fatal("expected current test process to not be treated as worker process")
+	}
+}
+
+func TestFallbackStatusIgnoresStalePIDFileForNonWorkerProcess(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	pidPath, err := PIDPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, err := fallbackStatus(WorkerIdentity{ID: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "is not running") {
+		t.Fatalf("expected stale non-worker pid to be ignored, got %q", status)
 	}
 }

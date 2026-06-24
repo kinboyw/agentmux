@@ -63,6 +63,22 @@ func TestWorkerCredentialFromCacheRequiresConfiguredHub(t *testing.T) {
 	}
 }
 
+func TestWorkerAuthFromCacheEntryPreservesRefreshToken(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	refreshExpiresAt := time.Now().UTC().Add(24 * time.Hour)
+	auth := workerAuthFromCacheEntry(credentialcache.Entry{
+		HubURL: "https://hub.test", Credential: "amx_cred_worker", CredentialID: "cred_worker",
+		TenantID: "tenant_test", Role: "worker", DeviceID: "worker-1", DeviceName: "Worker One",
+		ExpiresAt: expiresAt, RefreshToken: "amx_ref_worker", RefreshExpiresAt: refreshExpiresAt,
+	})
+	if auth.Source != "cache" || auth.Token != "amx_cred_worker" || auth.RefreshToken != "amx_ref_worker" {
+		t.Fatalf("cached worker auth lost credential fields: %+v", auth)
+	}
+	if !auth.ExpiresAt.Equal(expiresAt) || !auth.RefreshExpiresAt.Equal(refreshExpiresAt) {
+		t.Fatalf("cached worker auth lost expiry fields: %+v", auth)
+	}
+}
+
 func TestMigrateLegacyWorkerCredential(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	cfg := appconfig.Config{

@@ -348,10 +348,10 @@ func LockOwnerPID(workerID string) (int, string, bool) {
 	if err != nil {
 		return 0, "", false
 	}
-	if pid, ok := readPID(path); ok && processRunning(pid) {
+	if pid, ok := readPID(path); ok && workerProcessRunning(pid) {
 		return pid, path, true
 	}
-	if pid, ok := procLockOwnerPID(path); ok && processRunning(pid) {
+	if pid, ok := procLockOwnerPID(path); ok && workerProcessRunning(pid) {
 		return pid, path, true
 	}
 	return 0, path, false
@@ -579,11 +579,11 @@ func startFallback(binary string, identity WorkerIdentity) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if pid, ok := readPID(pidPath); ok && processRunning(pid) {
+	if pid, ok := readPID(pidPath); ok && workerProcessRunning(pid) {
 		return Result{Backend: "process", Detail: fmt.Sprintf("already running pid=%d", pid)}, nil
 	}
 	if identity.ID != "" {
-		if pid, path, ok := LockOwnerPID(identity.ID); ok && processRunning(pid) {
+		if pid, path, ok := LockOwnerPID(identity.ID); ok && workerProcessRunning(pid) {
 			return Result{Backend: "process", Detail: fmt.Sprintf("already running pid=%d lock=%s", pid, path)}, nil
 		}
 	}
@@ -626,7 +626,7 @@ func restartFallback(binary string, identity WorkerIdentity) (Result, error) {
 	stopped := make([]string, 0, 2)
 	stoppedPIDs := map[int]bool{}
 	if pid, ok := readPID(pidPath); ok {
-		if processRunning(pid) {
+		if workerProcessRunning(pid) {
 			result, err := stopFallbackPID(pidPath, pid)
 			if err != nil {
 				return Result{}, err
@@ -637,7 +637,7 @@ func restartFallback(binary string, identity WorkerIdentity) (Result, error) {
 		_ = os.Remove(pidPath)
 	}
 	if identity.ID != "" {
-		if pid, _, ok := LockOwnerPID(identity.ID); ok && processRunning(pid) && !stoppedPIDs[pid] {
+		if pid, _, ok := LockOwnerPID(identity.ID); ok && workerProcessRunning(pid) && !stoppedPIDs[pid] {
 			result, err := stopFallbackPID(pidPath, pid)
 			if err != nil {
 				return Result{}, err
@@ -663,16 +663,16 @@ func stopFallback(identity WorkerIdentity) (Result, error) {
 	pid, ok := readPID(pidPath)
 	if !ok {
 		if identity.ID != "" {
-			if lockPID, _, lockOK := LockOwnerPID(identity.ID); lockOK && processRunning(lockPID) {
+			if lockPID, _, lockOK := LockOwnerPID(identity.ID); lockOK && workerProcessRunning(lockPID) {
 				return stopFallbackPID(pidPath, lockPID)
 			}
 		}
 		return Result{Backend: "process", Detail: "not running"}, nil
 	}
-	if !processRunning(pid) {
+	if !workerProcessRunning(pid) {
 		_ = os.Remove(pidPath)
 		if identity.ID != "" {
-			if lockPID, _, lockOK := LockOwnerPID(identity.ID); lockOK && processRunning(lockPID) {
+			if lockPID, _, lockOK := LockOwnerPID(identity.ID); lockOK && workerProcessRunning(lockPID) {
 				return stopFallbackPID(pidPath, lockPID)
 			}
 		}
@@ -701,9 +701,9 @@ func fallbackStatus(identity WorkerIdentity) (string, error) {
 		return "", err
 	}
 	pid, ok := readPID(pidPath)
-	if !ok || !processRunning(pid) {
+	if !ok || !workerProcessRunning(pid) {
 		if identity.ID != "" {
-			if lockPID, lockPath, lockOK := LockOwnerPID(identity.ID); lockOK && processRunning(lockPID) {
+			if lockPID, lockPath, lockOK := LockOwnerPID(identity.ID); lockOK && workerProcessRunning(lockPID) {
 				logPath, _ := LogPath()
 				return fmt.Sprintf("agentmux worker fallback process is running\npid=%d\nlock=%s\nlog=%s\n", lockPID, lockPath, logPath), nil
 			}
@@ -898,6 +898,47 @@ func minor(dev uint64) uint64 {
 func processRunning(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+func workerProcessRunning(pid int) bool {
+	if !processRunning(pid) {
+		return false
+	}
+	match, known := processMatchesWorker(pid)
+	if known {
+		return match
+	}
+	return true
+}
+
+func processMatchesWorker(pid int) (bool, bool) {
+	if runtime.GOOS != "linux" {
+		return false, false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false, false
+	}
+	fields := strings.Split(string(data), "\x00")
+	args := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field != "" {
+			args = append(args, field)
+		}
+	}
+	if len(args) == 0 {
+		return false, true
+	}
+	if !strings.HasPrefix(filepath.Base(args[0]), "agentmux") {
+		return false, true
+	}
+	for i := 1; i+1 < len(args); i++ {
+		if args[i] == "worker" && args[i+1] == "run" {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 func waitForExit(pid int, timeout time.Duration) bool {

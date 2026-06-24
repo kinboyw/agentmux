@@ -387,6 +387,8 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	closePprof := startRuntimePprof(ctx, "worker", debug.pprofAddr)
 	defer closePprof()
 	cfg, _ := appconfig.Load()
+	var cachedWorkerCredential credentialcache.Entry
+	var hasCachedWorkerCredential bool
 	if *hubURL == "" && *token == "" && *join == "" {
 		*hubURL = cfg.WorkerHubURL
 		if *id == "" {
@@ -396,8 +398,9 @@ func runWorkerForeground(ctx context.Context, args []string) {
 			*name = cfg.WorkerName
 		}
 		if entry, ok := workerCredentialFromCache(*hubURL, *id); ok {
+			cachedWorkerCredential = entry
+			hasCachedWorkerCredential = true
 			*hubURL = entry.HubURL
-			*token = entry.Credential
 			if *id == "" {
 				*id = entry.DeviceID
 			}
@@ -432,14 +435,29 @@ func runWorkerForeground(ctx context.Context, args []string) {
 	} else if workerID == "" && *token != "" {
 		workerID = *name
 	}
-	auth, err := resolveWorkerAuthBestEffort(ctx, worker.AuthOptions{
-		HubURL: *hubURL, Token: *token, Join: *join,
-		DeviceID: workerID, DeviceName: *name, InstanceID: instanceID,
-	})
-	if err != nil {
-		fatal(err)
+	var auth worker.AuthResult
+	var err error
+	if hasCachedWorkerCredential && *join == "" && *token == "" {
+		auth = workerAuthFromCacheEntry(cachedWorkerCredential)
+	} else {
+		auth, err = resolveWorkerAuthBestEffort(ctx, worker.AuthOptions{
+			HubURL: *hubURL, Token: *token, Join: *join,
+			DeviceID: workerID, DeviceName: *name, InstanceID: instanceID,
+		})
+		if err != nil {
+			fatal(err)
+		}
 	}
 	runWorkerWithAuth(ctx, auth, workerIDFromAuth(auth, workerID), workerNameFromAuth(auth, *name), *interval, *backend)
+}
+
+func workerAuthFromCacheEntry(entry credentialcache.Entry) worker.AuthResult {
+	return worker.AuthResult{
+		HubURL: entry.HubURL, Token: entry.Credential, CredentialID: entry.CredentialID,
+		TenantID: entry.TenantID, DeviceID: entry.DeviceID, DeviceName: entry.DeviceName,
+		Role: entry.Role, ExpiresAt: entry.ExpiresAt, RefreshToken: entry.RefreshToken,
+		RefreshExpiresAt: entry.RefreshExpiresAt, Source: "cache",
+	}
 }
 
 func runWorkerJoin(ctx context.Context, args []string) {
