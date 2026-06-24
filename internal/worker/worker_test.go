@@ -154,6 +154,37 @@ func TestTerminalHistoryPageUsesLimitAndBeforeSeq(t *testing.T) {
 	}
 }
 
+func TestTerminalHistoryCombinesChunkedLines(t *testing.T) {
+	w := New("https://hub.test", "token", "worker", "worker", nilBackend{}, nil)
+	sessionID := protocol.SessionID("worker", "demo")
+	w.recordTerminalOutput(sessionID, []byte("hel"))
+	w.recordTerminalOutput(sessionID, []byte("lo\nwo"))
+	w.recordTerminalOutput(sessionID, []byte("rld\n"))
+
+	page := w.historyPage(sessionID, protocol.TerminalHistoryRequest{LimitLines: 10})
+	if len(page.Lines) != 2 {
+		t.Fatalf("expected 2 lines, got %+v", page)
+	}
+	if page.Lines[0].Text != "hello" || page.Lines[1].Text != "world" {
+		t.Fatalf("unexpected chunked history lines: %+v", page.Lines)
+	}
+}
+
+func TestTerminalHistoryFlushesPendingLine(t *testing.T) {
+	w := New("https://hub.test", "token", "worker", "worker", nilBackend{}, nil)
+	sessionID := protocol.SessionID("worker", "demo")
+	w.recordTerminalOutput(sessionID, []byte("prompt> "))
+	if page := w.historyPage(sessionID, protocol.TerminalHistoryRequest{}); len(page.Lines) != 0 {
+		t.Fatalf("expected pending line to stay buffered, got %+v", page)
+	}
+
+	w.flushTerminalHistoryPending(sessionID)
+	page := w.historyPage(sessionID, protocol.TerminalHistoryRequest{})
+	if len(page.Lines) != 1 || page.Lines[0].Text != "prompt> " {
+		t.Fatalf("unexpected flushed pending line: %+v", page)
+	}
+}
+
 func TestTerminalHistoryBoundaryRecordsGeneration(t *testing.T) {
 	w := New("https://hub.test", "token", "worker", "worker", nilBackend{}, nil)
 	sessionID := protocol.SessionID("worker", "demo")

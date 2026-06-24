@@ -37,6 +37,7 @@ const (
 	terminalHistoryMaxLines     = 2000
 	terminalHistoryDefaultLimit = 200
 	terminalHistoryMaxLimit     = 1000
+	terminalHistoryMaxPending   = 16 * 1024
 )
 
 type AuthOptions struct {
@@ -122,6 +123,7 @@ type Worker struct {
 	streamPeers       map[string]*directTransportPeer
 	generations       map[string]int
 	histories         map[string]*terminalHistoryBuffer
+	historyPending    map[string]string
 	terminalSeq       int64
 	outboundConn      *ws.Conn
 	outboundHigh      chan protocol.Envelope
@@ -183,6 +185,7 @@ func New(hubURL, token, id, name string, backend sessionbackend.Backend, logger 
 		streamPeers:       map[string]*directTransportPeer{},
 		generations:       map[string]int{},
 		histories:         map[string]*terminalHistoryBuffer{},
+		historyPending:    map[string]string{},
 	}
 }
 
@@ -1077,16 +1080,18 @@ func (w *Worker) startStream(parent context.Context, conn *ws.Conn, streamID, se
 	activeStreams := len(w.streams)
 	w.mu.Unlock()
 	w.Logger.Debug("terminal backend open complete", "session_id", sessionID, "stream_id", streamID, "name", name, "mode", mode, "render_mode", renderMode, "cells", sendCells, "streams", activeStreams)
+	historyKey := w.stateKeyForStream(streamID, sessionID)
 	go func() {
 		defer func() {
 			w.Logger.Debug("terminal read loop ended", "session_id", sessionID, "stream_id", streamID, "name", name)
+			w.flushTerminalHistoryPending(historyKey)
 			w.removeStream(streamID)
 		}()
 		buffer := make([]byte, 8192)
 		for {
 			n, err := terminal.Read(buffer)
 			if n > 0 {
-				w.recordTerminalOutput(w.stateKeyForStream(streamID, sessionID), buffer[:n])
+				w.recordTerminalOutput(historyKey, buffer[:n])
 				w.recordTerminalState(streamID, buffer[:n])
 				if w.writeDirectTerminalOutput(streamID, buffer[:n]) {
 					w.maybeSendTerminalCellSnapshot(conn, streamID, sessionID, "live")
@@ -1479,12 +1484,27 @@ func (w *Worker) applyTerminalRemoteSize(ctx context.Context, conn *ws.Conn, str
 }
 
 func (w *Worker) recordTerminalOutput(sessionID string, data []byte) {
-	lines := terminalOutputLines(data)
-	if len(lines) == 0 {
+	if len(data) == 0 {
 		return
 	}
 	w.mu.Lock()
+	pending := w.historyPending[sessionID]
+	lines, nextPending := terminalOutputLines(pending, data)
+	if len(lines) == 0 {
+		if nextPending != "" {
+			w.historyPending[sessionID] = nextPending
+		} else {
+			delete(w.historyPending, sessionID)
+		}
+		w.mu.Unlock()
+		return
+	}
 	defer w.mu.Unlock()
+	if nextPending != "" {
+		w.historyPending[sessionID] = nextPending
+	} else {
+		delete(w.historyPending, sessionID)
+	}
 	history := w.historyForLocked(sessionID)
 	generation := w.generations[sessionID]
 	if generation <= 0 {
@@ -1501,6 +1521,31 @@ func (w *Worker) recordTerminalOutput(sessionID string, data []byte) {
 			Text:       line,
 		})
 	}
+	trimTerminalHistory(history)
+}
+
+func (w *Worker) flushTerminalHistoryPending(sessionID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	pending := strings.TrimRight(w.historyPending[sessionID], "\x00")
+	delete(w.historyPending, sessionID)
+	if pending == "" {
+		return
+	}
+	history := w.historyForLocked(sessionID)
+	generation := w.generations[sessionID]
+	if generation <= 0 {
+		generation = 1
+		w.generations[sessionID] = generation
+	}
+	w.terminalSeq++
+	seq := w.terminalSeq
+	history.lines = append(history.lines, protocol.TerminalHistoryLine{
+		SeqStart:   seq,
+		SeqEnd:     seq,
+		Generation: generation,
+		Text:       pending,
+	})
 	trimTerminalHistory(history)
 }
 
@@ -1628,22 +1673,36 @@ func trimTerminalHistory(history *terminalHistoryBuffer) {
 	history.lines = history.lines[:terminalHistoryMaxLines]
 }
 
-func terminalOutputLines(data []byte) []string {
+func terminalOutputLines(pending string, data []byte) ([]string, string) {
 	if len(data) == 0 {
-		return nil
+		return nil, pending
 	}
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
+	if pending != "" {
+		text = pending + text
+	}
 	parts := strings.Split(text, "\n")
 	lines := make([]string, 0, len(parts))
-	for _, part := range parts {
+	completeParts := parts
+	if !strings.HasSuffix(text, "\n") {
+		completeParts = parts[:len(parts)-1]
+		pending = strings.TrimRight(parts[len(parts)-1], "\x00")
+	} else {
+		pending = ""
+	}
+	for _, part := range completeParts {
 		part = strings.TrimRight(part, "\x00")
 		if part == "" {
 			continue
 		}
 		lines = append(lines, part)
 	}
-	return lines
+	if len(pending) > terminalHistoryMaxPending {
+		lines = append(lines, pending)
+		pending = ""
+	}
+	return lines, pending
 }
 
 func (w *Worker) effectiveTerminalMode(open protocol.TerminalOpen) string {
@@ -2003,10 +2062,16 @@ func (w *Worker) stopSessionStreams(sessionID string) {
 	}
 	w.mu.Lock()
 	delete(w.histories, sessionID)
+	delete(w.historyPending, sessionID)
 	delete(w.generations, sessionID)
 	for key := range w.histories {
 		if terminalStateKeyMatchesSession(key, sessionID) {
 			delete(w.histories, key)
+		}
+	}
+	for key := range w.historyPending {
+		if terminalStateKeyMatchesSession(key, sessionID) {
+			delete(w.historyPending, key)
 		}
 	}
 	for key := range w.generations {

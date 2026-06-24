@@ -914,6 +914,9 @@ rendered as historical content anchored relative to the live screen. Control is
 responsible for preserving the user's scroll position while prepending older
 pages, for avoiding duplicate rows at page boundaries, and for bottom-aligning
 back to the live stream when the user exits rollback/scrollback view.
+Worker records live terminal output as logical transcript lines rather than
+PTY read chunks: incomplete line tails stay buffered per terminal state key and
+are flushed when the stream ends.
 
 ### Initial Implementation Slice
 
