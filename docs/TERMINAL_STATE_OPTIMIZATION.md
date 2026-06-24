@@ -943,6 +943,9 @@ Current implementation status:
   command-plane actions or narrowly scoped recovery operations.
 - Worker keeps a bounded transcript ring and can answer
   `terminal.history.request` with `terminal.history.page`.
+- Web Control renders history as a scrollback overlay with on-demand older-page
+  loading, duplicate suppression, prepend scroll anchoring, and a live-terminal
+  boundary for returning to the current xterm stream.
 - Worker also maintains a `cells-v1` screen snapshot through the terminal
   parser, but Web Control should request cell snapshots only when diagnostics are
   explicitly enabled. The production path is `worker_state_xterm`: xterm.js

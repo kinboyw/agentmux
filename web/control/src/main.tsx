@@ -4469,6 +4469,9 @@ function TerminalPane({
   const historyBeforeSeq = React.useRef<number | undefined>(undefined);
   const helperTextareaRef = React.useRef<HTMLTextAreaElement | null>(null);
   const historyPanelRef = React.useRef<HTMLDivElement | null>(null);
+  const historyScrollRef = React.useRef<HTMLDivElement | null>(null);
+  const pendingHistoryAnchor = React.useRef<{ height: number; top: number } | null>(null);
+  const historyStickToBottom = React.useRef(false);
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
@@ -4566,6 +4569,21 @@ function TerminalPane({
     };
   }, [historyOpen, compactLayout]);
 
+  React.useLayoutEffect(() => {
+    const anchor = pendingHistoryAnchor.current;
+    const node = historyScrollRef.current;
+    if (!node) return;
+    if (anchor) {
+      pendingHistoryAnchor.current = null;
+      node.scrollTop = anchor.top + Math.max(0, node.scrollHeight - anchor.height);
+      return;
+    }
+    if (historyStickToBottom.current) {
+      historyStickToBottom.current = false;
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [historyLines]);
+
   function sendControlInput(data: string) {
     if (!pane.sessionId || !streamId.current || !socket.current) return;
     if (directTransport.current?.sendInput(data)) return;
@@ -4620,6 +4638,11 @@ function TerminalPane({
     if (!pane.sessionId || !streamId.current || !socket.current || socket.current.readyState !== WebSocket.OPEN) return;
     if (resizePolicy.current !== "worker_state" && !manual) return;
     if (historyLoadingRef.current) return;
+    if (historyLines.length > 0 && !historyHasMore) return;
+    const scrollNode = historyScrollRef.current;
+    if (scrollNode) {
+      pendingHistoryAnchor.current = { height: scrollNode.scrollHeight, top: scrollNode.scrollTop };
+    }
     historyLoadingRef.current = true;
     setHistoryLoading(true);
     setHistoryError("");
@@ -4628,6 +4651,13 @@ function TerminalPane({
       before_seq: historyBeforeSeq.current,
       limit_lines: 300,
     });
+  }
+
+  function handleHistoryScroll(event: React.UIEvent<HTMLDivElement>) {
+    const node = event.currentTarget;
+    if (node.scrollTop <= 40 && historyHasMore && !historyLoadingRef.current) {
+      requestHistoryPage(false);
+    }
   }
 
   function applyDirectTransportStatus(status: DirectTransportStatus) {
@@ -4656,6 +4686,7 @@ function TerminalPane({
     }
     setMobileActionsOpen(false);
     setHistoryOpen(true);
+    historyStickToBottom.current = true;
     if (historyLines.length === 0) {
       requestHistoryPage(true);
     }
@@ -5103,7 +5134,7 @@ function TerminalPane({
       if (env.type === "terminal.history.page") {
         const payload = (env.payload || {}) as TerminalHistoryPage;
         const nextLines = payload.lines || [];
-        setHistoryLines((current) => (historyBeforeSeq.current ? [...nextLines, ...current] : nextLines));
+        setHistoryLines((current) => mergeHistoryLines(current, nextLines));
         historyBeforeSeq.current = payload.start_seq || nextLines[0]?.seq_start || historyBeforeSeq.current;
         setHistoryHasMore(Boolean(payload.has_more));
         setHistoryLoading(false);
@@ -5728,9 +5759,9 @@ function TerminalPane({
               >
                 <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
                   <div className="min-w-0">
-                    <div className="truncate text-xs font-semibold">Worker history</div>
+                    <div className="truncate text-xs font-semibold">Terminal scrollback</div>
                     <div className="truncate text-[11px] text-muted-foreground">
-                      {historyLines.length} lines · {historyHasMore ? "more available" : "latest cached page"}
+                      {historyLines.length} lines · {historyHasMore ? "older pages available" : "oldest cached page"} · live below
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
@@ -5740,9 +5771,21 @@ function TerminalPane({
                       loading={historyLoading}
                       disabled={!historyHasMore && historyLines.length > 0}
                       onClick={() => requestHistoryPage(true)}
-                      title="Load older worker-side history"
+                      title="Load older terminal history"
                     >
                       More
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      onClick={() => {
+                        setHistoryOpen(false);
+                        terminal.current?.scrollToBottom();
+                        requestAnimationFrame(() => terminal.current?.focus());
+                      }}
+                      title="Return to live terminal"
+                    >
+                      Live
                     </Button>
                     <Button
                       variant="ghost"
@@ -5757,19 +5800,38 @@ function TerminalPane({
                     </Button>
                   </div>
                 </div>
-                <div className="agentmux-mobile-scroll min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]">
+                <div
+                  ref={historyScrollRef}
+                  className="agentmux-mobile-scroll min-h-0 flex-1 overflow-auto bg-[#050607] p-2 font-mono text-[11px] leading-5 text-[#eef2f3]"
+                  onScroll={handleHistoryScroll}
+                >
+                  {historyHasMore ? (
+                    <button
+                      type="button"
+                      className="mb-2 w-full rounded border border-border bg-card/80 px-2 py-1 text-center text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-70"
+                      disabled={historyLoading}
+                      onClick={() => requestHistoryPage(true)}
+                    >
+                      {historyLoading ? "Loading older history..." : "Load older history"}
+                    </button>
+                  ) : historyLines.length > 0 ? (
+                    <div className="mb-2 border-b border-dashed border-border pb-2 text-center text-[11px] text-muted-foreground">Oldest cached history</div>
+                  ) : null}
                   {historyError ? <div className="mb-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-red-200">{historyError}</div> : null}
-                  {historyLines.length === 0 && !historyLoading ? <div className="text-muted-foreground">No worker-side history page returned yet.</div> : null}
+                  {historyLines.length === 0 && !historyLoading ? <div className="text-muted-foreground">No terminal history page returned yet.</div> : null}
                   {historyLines.map((line, index) => (
                     <div
-                      key={`${line.seq_start || index}:${index}`}
+                      key={terminalHistoryLineKey(line, index)}
                       className={cn("whitespace-pre", line.flags?.includes("resize_boundary") && "my-1 text-amber-300")}
                       title={line.generation ? `generation ${line.generation}` : undefined}
                     >
                       {stripAnsi(line.text)}
                     </div>
                   ))}
-                  {historyLoading ? <div className="text-muted-foreground">Loading history...</div> : null}
+                  {historyLoading && !historyHasMore ? <div className="text-muted-foreground">Loading history...</div> : null}
+                  <div className="mt-2 border-t border-dashed border-border pt-2 text-center text-[11px] text-muted-foreground">
+                    Live terminal continues below. Close or press Live to return.
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -7517,6 +7579,35 @@ function stripAnsi(value: string) {
     .replace(/\x1B[@-_]/g, "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
+}
+
+function mergeHistoryLines(current: TerminalHistoryLine[], incoming: TerminalHistoryLine[]) {
+  if (!incoming.length) return current;
+  if (!current.length) return incoming.slice();
+  const seen = new Set<string>();
+  const merged: TerminalHistoryLine[] = [];
+  for (const line of [...incoming, ...current]) {
+    const key = terminalHistoryLineIdentity(line);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(line);
+  }
+  if (merged.every((line) => typeof line.seq_start === "number")) {
+    merged.sort((a, b) => (a.seq_start || 0) - (b.seq_start || 0));
+  }
+  return merged;
+}
+
+function terminalHistoryLineKey(line: TerminalHistoryLine, index: number) {
+  const key = terminalHistoryLineIdentity(line);
+  return key.startsWith("seq:") ? key : `${key}:${index}`;
+}
+
+function terminalHistoryLineIdentity(line: TerminalHistoryLine) {
+  if (typeof line.seq_start === "number" || typeof line.seq_end === "number") {
+    return `seq:${line.seq_start ?? ""}:${line.seq_end ?? ""}:${line.generation ?? ""}`;
+  }
+  return `text:${line.generation ?? ""}:${line.flags?.join(",") || ""}:${line.text}`;
 }
 
 function formatRelativeTime(value: string) {
