@@ -212,6 +212,16 @@ Control should not force lazy history pages into xterm scrollback. xterm owns
 the current terminal surface. Historical pages can be rendered in a virtual
 history view and aligned to the xterm bottom by sequence numbers.
 
+The intended rollback behavior is Control-side viewport rollback, not Worker
+terminal-state rollback. After `control.open`, Worker starts recording output for
+the selected state domain, sends the current snapshot, and streams subsequent
+terminal updates. If the user scrolls away from the live bottom, Control requests
+older transcript pages with `terminal.history.request` and inserts those pages
+into its history/view layer using `generation` and sequence anchors. Worker keeps
+advancing the canonical current screen and does not rewind its emulator state to
+serve historical pages. Returning to the bottom should realign Control to the
+latest snapshot or buffered live tail.
+
 `cells-v1` currently carries text, width, SGR attributes, foreground/background
 color references, underline color, links, cursor position, and screen size.
 ANSI palette colors are transported as `ansi:<index>` so Web Control can map
@@ -726,6 +736,13 @@ stay equal. The remote program sees the canonical Worker size, for example
 viewing window over that canonical screen. Control should crop, pad, and scroll;
 it should not reflow remote terminal output.
 
+This is the core state-isolation rule: Worker owns canonical terminal state and
+remote size, while each Control owns only its local viewport, scroll anchor,
+history cache, and rendering position. Opening, resizing, splitting, hiding, or
+rotating a Control pane must not mutate the remote terminal size by default. A
+remote size mutation is allowed only through explicit state operations such as
+`terminal.size.sync` or `terminal.size.reset`.
+
 For the default whole-session attach, the backend may use a real tmux client.
 In that mode the browser viewport can drive the attached tmux client size, and
 the remote session may repaint accordingly. That is the expected compatibility
@@ -873,6 +890,13 @@ Older scrollback is requested with `terminal.history.request` and returned as
 flag. Resize events should be represented as history boundary markers instead
 of clearing transcript history.
 
+History pages are transcript pages, not terminal-emulator checkpoints. They may
+cross generation boundaries and contain resize markers, but they should be
+rendered as historical content anchored relative to the live screen. Control is
+responsible for preserving the user's scroll position while prepending older
+pages, for avoiding duplicate rows at page boundaries, and for bottom-aligning
+back to the live stream when the user exits rollback/scrollback view.
+
 ### Initial Implementation Slice
 
 The first PlanB implementation should be a conservative skeleton:
@@ -896,12 +920,20 @@ Current implementation status:
   `reset` are wired through Hub, Worker, and Web Control.
 - Web Control opens state-capable streams by default and stops sending ordinary
   viewport resize messages once Worker negotiates `worker_state`.
+- Gap: Web Control currently schedules automatic `terminal.size.sync` after local
+  xterm fit/resize in `worker_state`. That is useful as a temporary recovery
+  bridge, but it violates the state-isolation target above because ordinary
+  browser layout changes can still resize the remote tmux/PTY and force a new
+  generation. The production behavior should update only `control_viewport` on
+  normal layout changes; `terminal.size.sync` and `terminal.size.reset` should be
+  explicit user actions or narrowly scoped recovery operations.
 - Worker keeps a bounded transcript ring and can answer
   `terminal.history.request` with `terminal.history.page`.
-- Worker also maintains a `cells-v1` screen snapshot through the terminal parser,
-  but Web Control no longer requests cell snapshots by default. The production
-  path is `worker_state_xterm`: xterm.js receives ANSI snapshots plus live
-  output, while cell snapshots/diffs remain diagnostics.
+- Gap: Worker also maintains a `cells-v1` screen snapshot through the terminal
+  parser, and Web Control currently still requests cell snapshots by default.
+  The production path should be `worker_state_xterm`: xterm.js receives ANSI
+  snapshots plus live output, while cell snapshots/diffs remain opt-in
+  diagnostics.
 - Web Control can still expose Worker-side cells as an opt-in debug surface in a
   later iteration. It should not subscribe to cell snapshots on every pane by
   default.

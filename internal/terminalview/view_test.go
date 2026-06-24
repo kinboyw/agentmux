@@ -30,6 +30,14 @@ func TestViewAppliesCarriageReturnOverwrite(t *testing.T) {
 	}
 }
 
+func TestViewLimitsScrollback(t *testing.T) {
+	view := New(10, 2)
+	view.Write([]byte("one\ntwo\nthree\nfour\nfive\n"))
+	if got := view.term.ScrollbackLen(); got > defaultScrollback {
+		t.Fatalf("scrollback grew to %d, want at most %d", got, defaultScrollback)
+	}
+}
+
 func TestViewPreservesSGR(t *testing.T) {
 	view := New(20, 3)
 	view.Write([]byte("\x1b[31mred\x1b[0m"))

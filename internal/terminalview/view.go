@@ -11,7 +11,7 @@ import (
 	"github.com/charmbracelet/x/vt"
 )
 
-const defaultScrollback = 2000
+const defaultScrollback = 1
 
 type View struct {
 	width      int

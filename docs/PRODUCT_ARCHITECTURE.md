@@ -729,6 +729,13 @@ history pages are rendered on demand outside xterm scrollback. `cells-v1` and
 row diffs are diagnostic/validation tools unless explicitly requested; they
 should not run in parallel with the production xterm path by default.
 
+Worker state and Control view state are intentionally separate. Worker owns the
+canonical terminal state, target identity, generation, and remote terminal size.
+Each Control owns only its local viewport, scroll/history anchors, and rendering
+position. Normal Control layout changes must not resize the remote tmux/PTY in
+worker-state mode; remote size changes require explicit sync/reset operations so
+multiple Controls do not fight over terminal geometry.
+
 The Go CLI should remain a debug tool. The product-grade control should be web.
 
 ## Initial Implementation Plan
