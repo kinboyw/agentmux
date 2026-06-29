@@ -291,6 +291,9 @@ type TerminalModePayload = {
   grant_id?: string;
   fallback?: string;
   fallback_reason?: string;
+  p2p_path?: "direct" | "relay" | "unknown";
+  p2p_local_candidate_type?: string;
+  p2p_remote_candidate_type?: string;
 };
 
 type P2PGrantPayload = {
@@ -336,6 +339,9 @@ type DirectTransportStatus = {
   reason?: string;
   message?: string;
   detail?: string;
+  path?: "direct" | "relay" | "unknown";
+  localCandidateType?: string;
+  remoteCandidateType?: string;
 };
 
 type MobileExitConfirmDialogProps = {
@@ -357,6 +363,27 @@ type TerminalHistoryPage = {
   end_seq?: number;
   has_more?: boolean;
   lines?: TerminalHistoryLine[];
+};
+
+type TerminalTouchGesture = {
+  x: number;
+  y: number;
+  moved: boolean;
+  scrollTop: number;
+  lastY: number;
+  lastAt: number;
+  velocityY: number;
+};
+
+type StateTouchGesture = {
+  x: number;
+  y: number;
+  carryX: number;
+  carryY: number;
+  axis?: "x" | "y";
+  lastY: number;
+  lastAt: number;
+  velocityY: number;
 };
 
 type TerminalCursor = {
@@ -4472,13 +4499,19 @@ function TerminalPane({
   const historyScrollRef = React.useRef<HTMLDivElement | null>(null);
   const pendingHistoryAnchor = React.useRef<{ height: number; top: number } | null>(null);
   const historyStickToBottom = React.useRef(false);
+  const inlineHistoryRequest = React.useRef(false);
+  const historyOpenRef = React.useRef(false);
+  const historyLineIDs = React.useRef<Set<string>>(new Set());
+  const liveFollow = React.useRef(true);
   const composing = React.useRef(false);
   const compositionText = React.useRef("");
   const suppressNextText = React.useRef("");
   const activeRef = React.useRef(interactive);
   const mouseDownButton = React.useRef("");
-  const touchFocusGesture = React.useRef<{ x: number; y: number; moved: boolean; scrollTop: number } | null>(null);
-  const stateTouch = React.useRef<{ x: number; y: number; carryX: number; carryY: number; axis?: "x" | "y" } | null>(null);
+  const touchFocusGesture = React.useRef<TerminalTouchGesture | null>(null);
+  const terminalMomentumFrame = React.useRef<number | null>(null);
+  const stateTouch = React.useRef<StateTouchGesture | null>(null);
+  const stateMomentumFrame = React.useRef<number | null>(null);
   const statePanYRef = React.useRef(0);
   const statePanMaxYRef = React.useRef(0);
   const mobileActionsRef = React.useRef<HTMLDivElement | null>(null);
@@ -4518,6 +4551,10 @@ function TerminalPane({
   React.useEffect(() => {
     activeRef.current = interactive;
   }, [interactive]);
+
+  React.useEffect(() => {
+    historyOpenRef.current = historyOpen;
+  }, [historyOpen]);
 
   React.useEffect(() => {
     const nodes = [inlineStateScreenRef.current, modalStateScreenRef.current].filter((node): node is HTMLDivElement => Boolean(node));
@@ -4615,6 +4652,18 @@ function TerminalPane({
     delayedFitTimers.current = [];
   }
 
+  function cancelTerminalMomentum() {
+    if (terminalMomentumFrame.current === null) return;
+    window.cancelAnimationFrame(terminalMomentumFrame.current);
+    terminalMomentumFrame.current = null;
+  }
+
+  function cancelStateMomentum() {
+    if (stateMomentumFrame.current === null) return;
+    window.cancelAnimationFrame(stateMomentumFrame.current);
+    stateMomentumFrame.current = null;
+  }
+
   function scheduleAttachRecovery() {
     clearAttachRecoveryTimer();
     attachRecoveryTimer.current = window.setTimeout(() => {
@@ -4646,6 +4695,7 @@ function TerminalPane({
     historyLoadingRef.current = true;
     setHistoryLoading(true);
     setHistoryError("");
+    inlineHistoryRequest.current = !manual;
     if (manual) setHistoryOpen(true);
     sendEnvelope(socket.current, "terminal.history.request", pane.sessionId, streamId.current, {
       before_seq: historyBeforeSeq.current,
@@ -4660,7 +4710,68 @@ function TerminalPane({
     }
   }
 
+  function maybeRequestTouchHistory(viewport?: HTMLElement | null) {
+    if (!viewport) return;
+    if (viewport.scrollTop <= 4) {
+      cancelTerminalMomentum();
+      requestHistoryPage(false);
+    }
+  }
+
+  function terminalViewportAtBottom(viewport?: HTMLElement | null) {
+    if (!viewport) return true;
+    return viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 4;
+  }
+
+  function terminalViewportScrolledBack() {
+    const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+    return Boolean(viewport && !terminalViewportAtBottom(viewport));
+  }
+
+  function followLiveTerminal() {
+    liveFollow.current = true;
+    cancelTerminalMomentum();
+    scrollTerminalToBottom();
+  }
+
+  function writeTerminalOutput(data: string | Uint8Array) {
+    const shouldFollow = compactLayout && liveFollow.current;
+    terminal.current?.write(data, () => {
+      if (shouldFollow) scrollTerminalToBottom();
+    });
+  }
+
+  function appendHistoryToTerminalScrollback(lines: TerminalHistoryLine[]) {
+    const term = terminal.current;
+    if (!term || lines.length === 0) return;
+    const newLines = lines.filter((line) => {
+      const id = terminalHistoryLineIdentity(line);
+      if (historyLineIDs.current.has(id)) return false;
+      historyLineIDs.current.add(id);
+      return true;
+    });
+    if (newLines.length === 0) return;
+    const buffer = term.buffer.active;
+    if (buffer.type !== "normal") return;
+    const viewportLine = buffer.viewportY;
+    const existingLines: string[] = [];
+    for (let index = 0; index < buffer.length; index++) {
+      existingLines.push(buffer.getLine(index)?.translateToString(true) || "");
+    }
+    const olderText = terminalLinesToCRLF(newLines.map((line) => line.text));
+    const existingText = terminalLinesToCRLF(existingLines);
+    const nextText = existingText ? `${olderText}\r\n${existingText}` : olderText;
+    term.reset();
+    term.write(nextText, () => {
+      const targetLine = Math.min(term.buffer.active.baseY, viewportLine + newLines.length);
+      term.scrollToLine(targetLine);
+      term.refresh(0, Math.max(0, term.rows - 1));
+    });
+  }
+
   function applyDirectTransportStatus(status: DirectTransportStatus) {
+    const peer = terminalPeerLabel(session, worker);
+    const peerDetail = peer ? ` · peer ${peer}` : "";
     setTerminalMode((current) => ({
       ...current,
       channel_mode: current.channel_mode || "p2p_preferred",
@@ -4668,15 +4779,19 @@ function TerminalPane({
       grant_id: status.grantId || current.grant_id,
       fallback: status.state === "relay_fallback" ? status.message || current.fallback : current.fallback,
       fallback_reason: status.reason || current.fallback_reason,
+      p2p_path: status.path || current.p2p_path,
+      p2p_local_candidate_type: status.localCandidateType || current.p2p_local_candidate_type,
+      p2p_remote_candidate_type: status.remoteCandidateType || current.p2p_remote_candidate_type,
     }));
     if (status.state === "negotiating") {
-      setStatus({ tone: "warn", title: "P2P negotiating", detail: status.detail || (status.grantId ? `grant ${shortID(status.grantId)}` : "waiting for worker") });
+      setStatus({ tone: "warn", title: "P2P negotiating", detail: `${status.detail || (status.grantId ? `grant ${shortID(status.grantId)}` : "waiting for worker")}${peerDetail}` });
     }
     if (status.state === "relay_fallback") {
-      setStatus({ tone: "warn", title: "P2P relay fallback", detail: status.detail || status.message || status.reason || "using Hub relay" });
+      setStatus({ tone: "warn", title: "P2P relay fallback", detail: `${status.detail || status.message || status.reason || "using Hub relay"}${peerDetail}` });
     }
     if (status.state === "direct") {
-      setStatus({ tone: "ok", title: "P2P direct", detail: status.detail || (status.grantId ? `grant ${shortID(status.grantId)}` : "connected") });
+      const title = status.path === "relay" ? "P2P relay" : "P2P direct";
+      setStatus({ tone: status.path === "relay" ? "warn" : "ok", title, detail: `${status.detail || (status.grantId ? `grant ${shortID(status.grantId)}` : "connected")}${peerDetail}` });
     }
   }
 
@@ -4703,11 +4818,31 @@ function TerminalPane({
     requestAnimationFrame(() => terminal.current?.focus());
   }
 
+  function scrollTerminalToBottom() {
+    requestAnimationFrame(() => {
+      terminal.current?.scrollToBottom();
+      const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+      if (viewport) viewport.scrollTop = viewport.scrollHeight;
+    });
+  }
+
+  function preserveTerminalViewportScroll(action: () => void) {
+    const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+    const scrollTop = viewport?.scrollTop ?? 0;
+    action();
+    requestAnimationFrame(() => {
+      const nextViewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+      if (nextViewport) nextViewport.scrollTop = scrollTop;
+    });
+  }
+
   function handleTerminalTouchStart(event: React.TouchEvent<HTMLDivElement>) {
     const touch = event.touches[0];
     if (!touch) return;
+    cancelTerminalMomentum();
     const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
-    touchFocusGesture.current = { x: touch.clientX, y: touch.clientY, moved: false, scrollTop: viewport?.scrollTop || 0 };
+    const now = performance.now();
+    touchFocusGesture.current = { x: touch.clientX, y: touch.clientY, moved: false, scrollTop: viewport?.scrollTop || 0, lastY: touch.clientY, lastAt: now, velocityY: 0 };
     onFocus();
   }
 
@@ -4719,18 +4854,61 @@ function TerminalPane({
     const deltaY = touch.clientY - gesture.y;
     if (Math.abs(deltaX) > 8 || Math.abs(deltaY) > 8) {
       gesture.moved = true;
+      liveFollow.current = false;
       blurTerminalInput();
     }
     const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
     if (!viewport) return;
+    const now = performance.now();
+    const frameMs = Math.max(8, now - gesture.lastAt);
+    const frameDeltaY = touch.clientY - gesture.lastY;
+    gesture.velocityY = frameDeltaY / frameMs;
+    gesture.lastY = touch.clientY;
+    gesture.lastAt = now;
     viewport.scrollTop = gesture.scrollTop - deltaY;
+    if (terminalViewportAtBottom(viewport)) liveFollow.current = true;
+    maybeRequestTouchHistory(viewport);
   }
 
   function handleTerminalTouchEnd() {
     const gesture = touchFocusGesture.current;
     touchFocusGesture.current = null;
-    if (!gesture || gesture.moved) return;
-    focusTerminalInput();
+    if (!gesture) return;
+    if (!gesture.moved) {
+      if (compactLayout && terminalViewportScrolledBack()) return;
+      focusTerminalInput();
+      return;
+    }
+    startTerminalMomentum(gesture.velocityY);
+  }
+
+  function startTerminalMomentum(initialVelocityY: number) {
+    const viewport = terminalRef.current?.querySelector<HTMLElement>(".xterm-viewport");
+    if (!viewport || Math.abs(initialVelocityY) < 0.03) return;
+    let velocity = Math.sign(initialVelocityY || 1) * 0.58;
+    let lastAt = performance.now();
+    let carry = 0;
+    const step = (now: number) => {
+      const elapsed = Math.min(32, now - lastAt);
+      lastAt = now;
+      carry += velocity * elapsed;
+      if (Math.abs(carry) >= 1) {
+        const delta = Math.trunc(carry);
+        viewport.scrollTop -= delta;
+        carry -= delta;
+      }
+      maybeRequestTouchHistory(viewport);
+      velocity *= Math.pow(0.94, elapsed / 16);
+      const atTop = viewport.scrollTop <= 0 && velocity > 0;
+      const atBottom = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 1 && velocity < 0;
+      if (atBottom) liveFollow.current = true;
+      if (Math.abs(velocity) < 0.025 || atTop || atBottom) {
+        terminalMomentumFrame.current = null;
+        return;
+      }
+      terminalMomentumFrame.current = window.requestAnimationFrame(step);
+    };
+    terminalMomentumFrame.current = window.requestAnimationFrame(step);
   }
 
   function nudgeStatePan(delta: number, focusTerminal = true) {
@@ -4739,7 +4917,11 @@ function TerminalPane({
   }
 
   function nudgeStatePanY(delta: number, focusTerminal = true) {
-    setStatePanY((value) => clampNumber(value + delta, 0, statePanMaxY));
+    setStatePanY((value) => {
+      const next = clampNumber(value + delta, 0, statePanMaxY);
+      statePanYRef.current = next;
+      return next;
+    });
     if (focusTerminal) terminal.current?.focus();
   }
 
@@ -4828,7 +5010,9 @@ function TerminalPane({
   function handleStateTouchStart(event: React.TouchEvent<HTMLDivElement>) {
     const touch = event.touches[0];
     if (!touch) return;
-    stateTouch.current = { x: touch.clientX, y: touch.clientY, carryX: 0, carryY: 0 };
+    cancelStateMomentum();
+    const now = performance.now();
+    stateTouch.current = { x: touch.clientX, y: touch.clientY, carryX: 0, carryY: 0, lastY: touch.clientY, lastAt: now, velocityY: 0 };
   }
 
   function handleStateTouchMove(event: React.TouchEvent<HTMLDivElement>) {
@@ -4840,6 +5024,12 @@ function TerminalPane({
     if (Math.abs(deltaX) < 2 && Math.abs(deltaY) < 2) return;
     event.preventDefault();
     event.stopPropagation();
+    const now = performance.now();
+    const frameMs = Math.max(8, now - gesture.lastAt);
+    const frameDeltaY = touch.clientY - gesture.lastY;
+    gesture.velocityY = frameDeltaY / frameMs;
+    gesture.lastY = touch.clientY;
+    gesture.lastAt = now;
     gesture.x = touch.clientX;
     gesture.y = touch.clientY;
     gesture.carryX += deltaX;
@@ -4875,7 +5065,40 @@ function TerminalPane({
   }
 
   function handleStateTouchEnd() {
+    const gesture = stateTouch.current;
     stateTouch.current = null;
+    if (!gesture || gesture.axis === "x") return;
+    startStateMomentum(gesture.velocityY);
+  }
+
+  function startStateMomentum(initialVelocityY: number) {
+    if (Math.abs(initialVelocityY) < 0.03) return;
+    let velocity = Math.sign(initialVelocityY || 1) * 0.48;
+    let carryY = 0;
+    let lastAt = performance.now();
+    const step = (now: number) => {
+      const elapsed = Math.min(32, now - lastAt);
+      lastAt = now;
+      const rowPx = Math.max(10, cellMetricsRef.current.height * 0.7);
+      carryY += velocity * elapsed;
+      const rows = Math.trunc(carryY / rowPx);
+      if (rows !== 0) {
+        if (rows > 0 && statePanYRef.current >= statePanMaxYRef.current) {
+          requestHistoryPage(false);
+          stateMomentumFrame.current = null;
+          return;
+        }
+        nudgeStatePanY(rows, false);
+        carryY -= rows * rowPx;
+      }
+      velocity *= Math.pow(0.94, elapsed / 16);
+      if (Math.abs(velocity) < 0.025) {
+        stateMomentumFrame.current = null;
+        return;
+      }
+      stateMomentumFrame.current = window.requestAnimationFrame(step);
+    };
+    stateMomentumFrame.current = window.requestAnimationFrame(step);
   }
 
   function syncSelectionToClipboard(term: Terminal) {
@@ -4933,6 +5156,8 @@ function TerminalPane({
     viewportSizeRef.current = {};
     historyBeforeSeq.current = undefined;
     historyLoadingRef.current = false;
+    inlineHistoryRequest.current = false;
+    historyLineIDs.current.clear();
     setTerminalMode({});
     setViewportSize({});
     setHistoryLines([]);
@@ -4949,10 +5174,11 @@ function TerminalPane({
     streamId.current = makeStreamId(pane.sessionId);
     const ws = new WebSocket(`${wsBaseFromLocation()}/ws/control?token=${encodeURIComponent(token)}`);
     socket.current = ws;
-    const direct = new DirectTransportController(ws, pane.sessionId, streamId.current, applyDirectTransportStatus, (data) => term.write(data));
+    const direct = new DirectTransportController(ws, pane.sessionId, streamId.current, applyDirectTransportStatus, writeTerminalOutput);
     directTransport.current = direct;
     const sendTerminalInput = (data: string) => {
       if (!data) return;
+      if (compactLayout) followLiveTerminal();
       if (direct.sendInput(data)) return;
       sendEnvelope(ws, "control.input", pane.sessionId!, streamId.current, { data });
     };
@@ -4962,6 +5188,10 @@ function TerminalPane({
       const rect = terminalRef.current.getBoundingClientRect();
       if (rect.width < 20 || rect.height < 20) return;
       fitAddon.fit();
+      if (compactLayout && term.cols < 40 && rect.width >= 260) {
+        requestAnimationFrame(() => fitAddon.fit());
+        return;
+      }
       const xterm = terminalRef.current.querySelector<HTMLElement>(".xterm");
       const screen = terminalRef.current.querySelector<HTMLElement>(".xterm-screen");
       const viewport = terminalRef.current.querySelector<HTMLElement>(".xterm-viewport");
@@ -5043,8 +5273,8 @@ function TerminalPane({
       if (env.type === "terminal.output") {
         clearAttachRecoveryTimer();
         const payload = env.payload || {};
-        if (payload.encoding === "base64") term.write(base64ToBytes(payload.data || ""));
-        else term.write(payload.data || "");
+        if (payload.encoding === "base64") writeTerminalOutput(base64ToBytes(payload.data || ""));
+        else writeTerminalOutput(payload.data || "");
       }
       if (env.type === "terminal.snapshot") {
         clearAttachRecoveryTimer();
@@ -5096,7 +5326,7 @@ function TerminalPane({
         const payload = (env.payload || {}) as TerminalModePayload;
         resizePolicy.current = payload.resize_policy || (payload.mode === "attach" ? "follow_control" : "worker_state");
         setTerminalMode((current) => ({ ...current, ...payload }));
-        if (payload.mode) setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: terminalModeDetail(payload) });
+        if (payload.mode) setStatus({ tone: "ok", title: `Attached ${attachedLabel}`, detail: terminalModeDetail(payload, session, worker) });
         scheduleFit();
       }
       if (env.type === "p2p.grant") {
@@ -5134,11 +5364,14 @@ function TerminalPane({
       if (env.type === "terminal.history.page") {
         const payload = (env.payload || {}) as TerminalHistoryPage;
         const nextLines = payload.lines || [];
+        const shouldInlineHistory = inlineHistoryRequest.current && !historyOpenRef.current;
         setHistoryLines((current) => mergeHistoryLines(current, nextLines));
+        if (shouldInlineHistory) appendHistoryToTerminalScrollback(nextLines);
         historyBeforeSeq.current = payload.start_seq || nextLines[0]?.seq_start || historyBeforeSeq.current;
         setHistoryHasMore(Boolean(payload.has_more));
         setHistoryLoading(false);
         historyLoadingRef.current = false;
+        inlineHistoryRequest.current = false;
         setHistoryError("");
       }
       if (env.type === "error") {
@@ -5164,8 +5397,12 @@ function TerminalPane({
       const data = event.data || compositionText.current;
       composing.current = false;
       compositionText.current = "";
-      suppressNextText.current = data;
-      if (data && activeRef.current) sendTerminalInput(data);
+      if (!compactLayout && data && activeRef.current) {
+        suppressNextText.current = data;
+        sendTerminalInput(data);
+      } else {
+        suppressNextText.current = "";
+      }
       if (helperTextarea) helperTextarea.value = "";
     };
     helperTextarea?.addEventListener("compositionstart", onCompositionStart);
@@ -5191,6 +5428,18 @@ function TerminalPane({
     helperTextarea?.addEventListener("beforeinput", onHelperBeforeInput);
     helperTextarea?.addEventListener("keydown", onHelperKeyDown, true);
     const terminalElement = terminalRef.current;
+    const stopMobileTerminalPointerFocus = (event: PointerEvent) => {
+      if (!compactLayout || event.pointerType !== "touch") return;
+      if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+      onFocus();
+      event.stopImmediatePropagation();
+    };
+    const stopMobileTerminalMouseFocus = (event: MouseEvent) => {
+      if (!compactLayout) return;
+      if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
     const requestShortcutLock = () => {
       void lockTerminalShortcutKeys();
     };
@@ -5198,6 +5447,8 @@ function TerminalPane({
       unlockTerminalShortcutKeys();
     };
     terminalElement.addEventListener("pointerdown", requestShortcutLock);
+    terminalElement.addEventListener("pointerdown", stopMobileTerminalPointerFocus, true);
+    terminalElement.addEventListener("mousedown", stopMobileTerminalMouseFocus, true);
     helperTextarea?.addEventListener("focus", requestShortcutLock);
     helperTextarea?.addEventListener("blur", releaseShortcutLock);
     const dataDisposable = term.onData((data) => {
@@ -5264,7 +5515,18 @@ function TerminalPane({
     });
     observer.observe(terminalRef.current);
     const visualViewport = window.visualViewport;
-    const onVisualViewportResize = () => scheduleFit();
+    let lastVisualViewportHeight = Math.round(visualViewport?.height || window.innerHeight || 0);
+    const onVisualViewportResize = () => {
+      const nextHeight = Math.round(visualViewport?.height || window.innerHeight || 0);
+      const keyboardLikelyHidden = compactLayout && lastVisualViewportHeight > 0 && nextHeight - lastVisualViewportHeight > 40;
+      lastVisualViewportHeight = nextHeight;
+      if (compactLayout && !liveFollow.current) {
+        preserveTerminalViewportScroll(scheduleFit);
+        return;
+      }
+      scheduleFit();
+      if (keyboardLikelyHidden && liveFollow.current) scrollTerminalToBottom();
+    };
     const onWindowResize = () => scheduleFit();
     visualViewport?.addEventListener("resize", onVisualViewportResize);
     visualViewport?.addEventListener("scroll", onVisualViewportResize);
@@ -5276,6 +5538,8 @@ function TerminalPane({
       directTransport.current = null;
       clearAttachRecoveryTimer();
       clearDelayedFitTimers();
+      cancelTerminalMomentum();
+      cancelStateMomentum();
       dataDisposable.dispose();
       document.removeEventListener("keydown", onDocumentKeyDown, true);
       helperTextarea?.removeEventListener("compositionstart", onCompositionStart);
@@ -5284,6 +5548,8 @@ function TerminalPane({
       helperTextarea?.removeEventListener("beforeinput", onHelperBeforeInput);
       helperTextarea?.removeEventListener("keydown", onHelperKeyDown, true);
       terminalElement.removeEventListener("pointerdown", requestShortcutLock);
+      terminalElement.removeEventListener("pointerdown", stopMobileTerminalPointerFocus, true);
+      terminalElement.removeEventListener("mousedown", stopMobileTerminalMouseFocus, true);
       terminalElement.removeEventListener("mouseup", onMouseUpCopySelection);
       terminalElement.removeEventListener("pointerup", onMouseUpCopySelection);
       helperTextarea?.removeEventListener("focus", requestShortcutLock);
@@ -5311,11 +5577,16 @@ function TerminalPane({
       className={cn("agentmux-session-window relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden border-l border-transparent bg-[#050607]", active && "border-l-primary")}
       onPointerDown={(event) => {
         if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        if (event.pointerType === "touch") {
+          onFocus();
+          return;
+        }
         onFocus();
         requestAnimationFrame(() => terminal.current?.focus());
       }}
       onMouseDown={(event) => {
         if (event.target instanceof Element && event.target.closest("[data-terminal-chrome]")) return;
+        if (compactLayout) return;
         onFocus();
         requestAnimationFrame(() => terminal.current?.focus());
       }}
@@ -5333,6 +5604,7 @@ function TerminalPane({
       }}
       onTouchCancel={() => {
         touchFocusGesture.current = null;
+        cancelTerminalMomentum();
       }}
       onDragOver={(event) => {
         if (simple) return;
@@ -5365,6 +5637,11 @@ function TerminalPane({
 	          {pane.sessionId ? <BackendBadge value={backend} /> : null}
 	          {pane.sessionId && terminalMode.mode ? <StatusBadge tone={workerStateMode ? "ok" : undefined}>{terminalMode.render_mode || terminalMode.mode}</StatusBadge> : null}
 	          {pane.sessionId ? <StatusBadge tone={terminalChannel.tone}>{terminalChannel.label}</StatusBadge> : null}
+	          {pane.sessionId && worker && terminalMode.channel_state === "p2p_direct" ? (
+	            <span title={worker.addr ? `${workerDisplayLabel(worker)} · ${worker.addr}` : workerDisplayLabel(worker)}>
+	              <StatusBadge tone="ok">peer {workerDisplayLabel(worker)}</StatusBadge>
+	            </span>
+	          ) : null}
 	          {workerStateMode ? (
 	            <span className="hidden min-w-0 truncate text-[11px] font-normal text-muted-foreground/80 xl:inline">
 	              remote {formatTerminalSize(terminalMode.remote_size)} · viewport {formatTerminalSize(viewportSize)}
@@ -5712,7 +5989,10 @@ function TerminalPane({
                 onTouchStart={handleStateTouchStart}
                 onTouchMove={handleStateTouchMove}
                 onTouchEnd={handleStateTouchEnd}
-                onTouchCancel={handleStateTouchEnd}
+                onTouchCancel={() => {
+                  stateTouch.current = null;
+                  cancelStateMomentum();
+                }}
               >
                 {renderCellViewport(cellSnapshot!, viewportSize, statePanX, statePanY)}
                 {statePanMaxX > 0 || statePanMaxY > 0 ? (
@@ -6253,6 +6533,7 @@ function normalizeRTCIceServers(servers?: P2PICEServerPayload[]): RTCIceServer[]
 class DirectTransportController {
   private activeGrantId = "";
   private fallbackTimer: number | null = null;
+  private statsTimer: number | null = null;
   private peer: RTCPeerConnection | null = null;
   private channel: RTCDataChannel | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
@@ -6336,6 +6617,7 @@ class DirectTransportController {
 
   close() {
     this.clearFallbackTimer();
+    this.clearStatsTimer();
     this.activeGrantId = "";
     this.channel?.close();
     this.peer?.close();
@@ -6360,12 +6642,19 @@ class DirectTransportController {
     this.fallbackTimer = null;
   }
 
+  private clearStatsTimer() {
+    if (this.statsTimer === null) return;
+    window.clearTimeout(this.statsTimer);
+    this.statsTimer = null;
+  }
+
   private reportState(grantId: string, detail: string, state: DirectTransportState = "negotiating") {
     this.onStatus({ state, grantId, detail });
   }
 
   private async createOffer(grantId: string, grant: DirectTransportGrant) {
     this.peer?.close();
+    this.clearStatsTimer();
     const peer = new RTCPeerConnection({ iceServers: normalizeRTCIceServers(grant.ice_servers) });
     this.peer = peer;
     this.pendingRemoteCandidates = [];
@@ -6388,6 +6677,7 @@ class DirectTransportController {
     this.channel = channel;
     channel.addEventListener("open", () => {
       this.clearFallbackTimer();
+      this.scheduleStatsPolling(grantId);
       this.onStatus({ state: "direct", grantId, message: "WebRTC data channel opened.", detail: "data channel open" });
       sendEnvelope(this.ws, "p2p.signal", this.sessionId, this.streamId, {
         grant_id: grantId,
@@ -6399,6 +6689,7 @@ class DirectTransportController {
       });
     });
     channel.addEventListener("close", () => {
+      this.clearStatsTimer();
       this.onStatus({ state: "closed", grantId, reason: "datachannel_closed", message: "WebRTC data channel closed.", detail: "data channel closed" });
     });
     channel.addEventListener("message", (event) => {
@@ -6429,6 +6720,7 @@ class DirectTransportController {
     peer.addEventListener("iceconnectionstatechange", () => {
       const state = peer.iceConnectionState;
       if (state === "failed" || state === "disconnected" || state === "closed") {
+        if (state === "closed") this.clearStatsTimer();
         this.onStatus({ state: state === "closed" ? "closed" : "relay_fallback", grantId, reason: `ice_${state}`, message: `ICE ${state}.`, detail: `ice ${state}` });
         return;
       }
@@ -6437,10 +6729,12 @@ class DirectTransportController {
     peer.addEventListener("connectionstatechange", () => {
       const state = peer.connectionState;
       if (state === "failed") {
+        this.clearStatsTimer();
         this.onStatus({ state: "relay_fallback", grantId, reason: "peer_failed", message: "Peer connection failed.", detail: "peer failed" });
         return;
       }
       if (state === "closed") {
+        this.clearStatsTimer();
         this.onStatus({ state: "closed", grantId, reason: "peer_closed", message: "Peer connection closed.", detail: "peer closed" });
         return;
       }
@@ -6460,6 +6754,65 @@ class DirectTransportController {
     });
     offerSent = true;
     for (const candidate of pendingLocalCandidates.splice(0)) sendCandidate(candidate);
+  }
+
+  private scheduleStatsPolling(grantId: string) {
+    this.clearStatsTimer();
+    const poll = async () => {
+      if (this.activeGrantId !== grantId || this.ws.readyState !== WebSocket.OPEN || !this.peer) {
+        this.clearStatsTimer();
+        return;
+      }
+      try {
+        const summary = await this.inspectSelectedCandidatePair(this.peer.getStats());
+        if (summary) {
+          const detail = summary.remoteCandidateType ? `path ${summary.path} (${summary.localCandidateType} -> ${summary.remoteCandidateType})` : `path ${summary.path}`;
+          this.onStatus({
+            state: "direct",
+            grantId,
+            detail,
+            path: summary.path,
+            localCandidateType: summary.localCandidateType,
+            remoteCandidateType: summary.remoteCandidateType,
+          });
+        }
+      } catch {
+        // Ignore transient stats fetch errors.
+      }
+      this.statsTimer = window.setTimeout(poll, 2000);
+    };
+    void poll();
+  }
+
+  private async inspectSelectedCandidatePair(statsPromise: Promise<RTCStatsReport>): Promise<{ path: "direct" | "relay" | "unknown"; localCandidateType: string; remoteCandidateType: string } | null> {
+    const stats = await statsPromise;
+    const candidatePairs = new Map<string, RTCIceCandidatePairStats>();
+    const candidates = new Map<string, { candidateType?: string }>();
+    let selectedPairId = "";
+
+    stats.forEach((report) => {
+      if (report.type === "transport" && "selectedCandidatePairId" in report && report.selectedCandidatePairId) {
+        selectedPairId = report.selectedCandidatePairId;
+        return;
+      }
+      if (report.type === "candidate-pair") {
+        candidatePairs.set(report.id, report as RTCIceCandidatePairStats);
+        if (!selectedPairId && report.nominated && report.state === "succeeded") {
+          selectedPairId = report.id;
+        }
+        return;
+      }
+      if (report.type === "local-candidate" || report.type === "remote-candidate") {
+        candidates.set(report.id, report as { candidateType?: string });
+      }
+    });
+
+    const pair = (selectedPairId && candidatePairs.get(selectedPairId)) || [...candidatePairs.values()].find((report) => report.nominated && report.state === "succeeded");
+    if (!pair) return null;
+    const localType = candidates.get(pair.localCandidateId || "")?.candidateType || "";
+    const remoteType = candidates.get(pair.remoteCandidateId || "")?.candidateType || "";
+    const path = localType === "relay" || remoteType === "relay" ? "relay" : "direct";
+    return { path, localCandidateType: localType || "unknown", remoteCandidateType: remoteType || "unknown" };
   }
 
   private async acceptAnswer(grantId: string, signal: P2PSignalPayload) {
@@ -7168,6 +7521,14 @@ function workerDisplayLabel(worker: WorkerView) {
   return worker.name && worker.name !== worker.id ? `${worker.name} (${worker.id})` : worker.id;
 }
 
+function terminalPeerLabel(session?: SessionView | null, worker?: WorkerView | null) {
+  if (worker) {
+    const label = workerDisplayLabel(worker);
+    return worker.addr ? `${label} · ${worker.addr}` : label;
+  }
+  return session?.worker_id || "";
+}
+
 function shortID(value: string) {
   const trimmed = value.trim();
   if (trimmed.length <= 14) return trimmed;
@@ -7292,11 +7653,20 @@ function terminalViewportHint(remote?: TerminalSize | null, viewport?: TerminalS
   return "";
 }
 
-function terminalModeDetail(mode: TerminalModePayload) {
+function terminalModeDetail(mode: TerminalModePayload, session?: SessionView | null, worker?: WorkerView | null) {
   const parts = [`terminal mode ${mode.mode}`];
   if (mode.render_mode) parts.push(mode.render_mode);
   if (mode.channel_mode || mode.channel_state) parts.push(`channel ${terminalChannelLabel(mode.channel_mode, mode.channel_state)}`);
+  if (mode.p2p_path) {
+    const path = mode.p2p_path === "relay" ? "relay" : mode.p2p_path === "direct" ? "direct" : "unknown";
+    const candidateTypes = [mode.p2p_local_candidate_type, mode.p2p_remote_candidate_type].filter(Boolean).join(" -> ");
+    parts.push(candidateTypes ? `path ${path} (${candidateTypes})` : `path ${path}`);
+  }
   if (mode.grant_id) parts.push(`grant ${shortID(mode.grant_id)}`);
+  const peer = terminalPeerLabel(session, worker);
+  if (peer && (mode.channel_state === "p2p_direct" || mode.channel_state === "negotiating" || mode.channel_state === "relay_fallback" || mode.channel_mode === "p2p_preferred")) {
+    parts.push(`peer ${peer}`);
+  }
   if (mode.remote_size?.cols && mode.remote_size?.rows) parts.push(`remote ${formatTerminalSize(mode.remote_size)}`);
   if (mode.default_size?.cols && mode.default_size?.rows) parts.push(`default ${formatTerminalSize(mode.default_size)}`);
   if (mode.resize_policy) parts.push(mode.resize_policy);
@@ -7307,7 +7677,11 @@ function terminalModeDetail(mode: TerminalModePayload) {
 function terminalChannelStatus(mode: TerminalModePayload, preference: TerminalChannelPreference): { label: string; tone?: "ok" | "warn" | "err" } {
   const channelMode = mode.channel_mode || preference;
   const channelState = mode.channel_state || (preference === "p2p_preferred" ? "pending" : "relay");
-  if (channelState === "p2p_direct" || channelMode === "p2p_direct") return { label: "p2p", tone: "ok" };
+  if (channelState === "p2p_direct" || channelMode === "p2p_direct") {
+    if (mode.p2p_path === "relay") return { label: "p2p relay", tone: "warn" };
+    if (mode.p2p_path === "direct") return { label: "p2p direct", tone: "ok" };
+    return { label: "p2p direct", tone: "ok" };
+  }
   if (channelState === "relay_fallback") return { label: "p2p fallback", tone: "warn" };
   if (channelState === "negotiating") return { label: "p2p negotiating", tone: "warn" };
   if (channelMode === "p2p_preferred") return { label: "p2p pending", tone: "warn" };
@@ -7315,7 +7689,7 @@ function terminalChannelStatus(mode: TerminalModePayload, preference: TerminalCh
 }
 
 function terminalChannelLabel(channelMode?: string, channelState?: string) {
-  if (channelState === "p2p_direct" || channelMode === "p2p_direct") return "p2p";
+  if (channelState === "p2p_direct" || channelMode === "p2p_direct") return "p2p direct";
   if (channelState === "relay_fallback") return "p2p fallback";
   if (channelState === "negotiating") return "p2p negotiating";
   if (channelMode === "p2p_preferred") return "p2p preferred";
@@ -7579,6 +7953,10 @@ function stripAnsi(value: string) {
     .replace(/\x1B[@-_]/g, "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
+}
+
+function terminalLinesToCRLF(lines: string[]) {
+  return lines.map((line) => line.replace(/\r\n/g, "\n").replace(/\r/g, "\n")).join("\r\n");
 }
 
 function mergeHistoryLines(current: TerminalHistoryLine[], incoming: TerminalHistoryLine[]) {

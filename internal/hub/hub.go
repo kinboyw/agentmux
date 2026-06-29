@@ -3079,7 +3079,7 @@ func (s *Server) issueP2PGrantIfRequested(control *controlConn, workerID, sessio
 			s.logger.Debug("p2p grant dropped; control send queue full", "control", control.id, "worker", workerID, "session_id", sessionID, "stream_id", streamID, "grant_id", grant.GrantID)
 		}
 	}
-	s.logger.Debug("p2p grant issued", "control", control.id, "worker", workerID, "session_id", sessionID, "stream_id", streamID, "grant_id", grant.GrantID, "expires_at", grant.ExpiresAt)
+	s.logger.Info("p2p grant issued", "control", control.id, "worker", workerID, "session_id", sessionID, "stream_id", streamID, "grant_id", grant.GrantID, "allowed_transport", grant.AllowedTransport, "ice_servers", len(grant.ICEServers), "expires_at", grant.ExpiresAt, "fallback_after_ms", grant.FallbackAfterMs)
 	return &grant
 }
 
@@ -3104,7 +3104,7 @@ func (s *Server) emitP2PGrantIssued(control *controlConn, grant protocol.P2PGran
 		s.logger.Debug("p2p signal dropped; control send queue full", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal)
 		return
 	}
-	s.logger.Debug("p2p signal emitted", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	s.logger.Info("p2p signal emitted", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
 }
 
 func (s *Server) forwardP2PSignalFromControl(control *controlConn, env protocol.Envelope) error {
@@ -3135,7 +3135,7 @@ func (s *Server) forwardP2PSignalFromControl(control *controlConn, env protocol.
 		s.updateP2PGrantState(grant.GrantID, protocol.TerminalChannelP2PFallback)
 		return err
 	}
-	s.logger.Debug("p2p signal forwarded", "from", "control", "to", "worker", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	s.logger.Info("p2p signal forwarded", "from", "control", "to", "worker", "control", control.id, "worker", grant.WorkerID, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
 	return nil
 }
 
@@ -3179,7 +3179,7 @@ func (s *Server) forwardP2PSignalFromWorker(worker *workerConn, env protocol.Env
 	default:
 		return fmt.Errorf("control send queue full: %s", grant.ControlID)
 	}
-	s.logger.Debug("p2p signal forwarded", "from", "worker", "to", "control", "control", grant.ControlID, "worker", worker.id, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	s.logger.Info("p2p signal forwarded", "from", "worker", "to", "control", "control", grant.ControlID, "worker", worker.id, "session_id", grant.SessionID, "stream_id", grant.StreamID, "grant_id", grant.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
 	return nil
 }
 
@@ -3510,6 +3510,7 @@ ADDR="${AGENTMUX_ADDR:-127.0.0.1:8081}"
 DATA="${AGENTMUX_DATA:-/var/lib/agentmux/agentmux.db}"
 DATA_DIR="$(dirname "$DATA")"
 TOKEN="${AGENTMUX_TOKEN:-}"
+P2P_ICE_SERVERS="${AGENTMUX_P2P_ICE_SERVERS:-}"
 USER="${AGENTMUX_USER:-agentmux}"
 GROUP="${AGENTMUX_GROUP:-$USER}"
 BIN="${AGENTMUX_HUB_BIN:-/usr/local/bin/agentmux-hub}"
@@ -3604,12 +3605,17 @@ token_line=""
 if [ -n "$TOKEN" ]; then
   token_line="AGENTMUX_TOKEN=$TOKEN"
 fi
+ice_servers_line=""
+if [ -n "$P2P_ICE_SERVERS" ]; then
+  ice_servers_line="AGENTMUX_P2P_ICE_SERVERS=$P2P_ICE_SERVERS"
+fi
 sudo sh -c "cat > '$ENV_FILE'" <<EOF
 AGENTMUX_ADDR=$ADDR
 AGENTMUX_PUBLIC_URL=$PUBLIC_URL
 AGENTMUX_DATA=$DATA
 AGENTMUX_RELEASE_REPO=$REPO
 $token_line
+$ice_servers_line
 EOF
 sudo chmod 0640 "$ENV_FILE"
 sudo chown "root:$GROUP" "$ENV_FILE" || true

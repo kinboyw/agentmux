@@ -31,6 +31,7 @@ AGENTMUX_ADDR=127.0.0.1:8080
 AGENTMUX_PUBLIC_URL=https://hub.example.com
 AGENTMUX_DATA=/var/lib/agentmux/agentmux.db
 AGENTMUX_RELEASE_REPO=kinboyw/agentmux
+AGENTMUX_P2P_ICE_SERVERS=
 AGENTMUX_OAUTH_GITHUB_CLIENT_ID=
 AGENTMUX_OAUTH_GITHUB_CLIENT_SECRET=
 AGENTMUX_OAUTH_GOOGLE_CLIENT_ID=
@@ -65,6 +66,46 @@ agentmux hub \
 
 `--public-url` is what makes generated worker commands use
 `wss://hub.example.com`.
+
+## WebRTC ICE
+
+Web Control and Worker use the Hub for signaling. A separate STUN/TURN service
+is only needed to discover or relay the direct WebRTC data path. On public cloud
+hosts, deploy coturn close to the Hub and expose:
+
+- TCP/UDP `3478`
+- UDP relay range, for example `49160-49191`
+- TCP `5349` only if you also configure `turns:`
+
+Docker example:
+
+```bash
+PUBLIC_IP=203.0.113.10 \
+PRIVATE_IP=10.0.0.5 \
+REALM=turn.example.com \
+USERNAME=agentmux \
+PASSWORD='change-me-long-random-turn-password' \
+sh deploy/coturn/run.sh.example
+```
+
+For ECS/EIP-style hosts, set `PUBLIC_IP` to the public address and
+`PRIVATE_IP` to the primary private address. For a server with a public address
+directly on the interface, leave `PRIVATE_IP` empty. The example pins coturn to
+that single listener and relay address with `--listening-ip`, `--relay-ip`, and
+`--external-ip` so it does not advertise Docker bridge or overlay network
+addresses as TURN relay candidates.
+
+Expose the ICE hints to Hub with a single-line JSON value. This value must stay
+on one line in `/etc/agentmux/agentmux.env`; systemd EnvironmentFile does not
+parse multi-line shell strings.
+
+```text
+AGENTMUX_P2P_ICE_SERVERS=[{"urls":["stun:turn.example.com:3478"]},{"urls":["turn:turn.example.com:3478?transport=udp","turn:turn.example.com:3478?transport=tcp"],"username":"agentmux","credential":"change-me-long-random-turn-password"}]
+```
+
+The same value can be passed as `--ice-servers` when starting Hub manually.
+If you run coturn from `deploy/coturn/run.sh.example`, the example enables `--verbose`
+so `docker logs` shows the relay and allocation lifecycle instead of only startup errors.
 
 For a temporary quick tunnel, the public URL is not known until `cloudflared`
 prints it:
@@ -160,11 +201,11 @@ curl -fsSL https://hub.example.com/deploy-hub.sh | sh
 The script installs `agentmux-hub`, writes `/etc/agentmux/agentmux.env`,
 creates `agentmux.service`, enables it, and starts the Hub. It supports
 `AGENTMUX_REPO`, `AGENTMUX_VERSION`, `AGENTMUX_PUBLIC_URL`, `AGENTMUX_ADDR`,
-`AGENTMUX_DATA`, `AGENTMUX_TOKEN`, `AGENTMUX_HUB_BIN`, and
-`AGENTMUX_SERVICE`. `AGENTMUX_HEALTH_URL` can override the post-start health
-check URL. The script also creates the configured system user/group, fixes
-ownership for the data directory and env file, and runs a local `/health` check
-after systemd starts the service.
+`AGENTMUX_DATA`, `AGENTMUX_TOKEN`, `AGENTMUX_P2P_ICE_SERVERS`,
+`AGENTMUX_HUB_BIN`, and `AGENTMUX_SERVICE`. `AGENTMUX_HEALTH_URL` can override
+the post-start health check URL. The script also creates the configured system
+user/group, fixes ownership for the data directory and env file, and runs a
+local `/health` check after systemd starts the service.
 
 By default the script downloads release assets from:
 

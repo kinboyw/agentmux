@@ -33,6 +33,7 @@ func (d *directTransportController) Start(grant protocol.P2PGrant) {
 	if grantID == "" {
 		return
 	}
+	slog.Default().Info("tui p2p start", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "ice_servers", len(grant.ICEServers), "fallback_after_ms", grant.FallbackAfterMs)
 	d.mu.Lock()
 	if d.grantID == grantID {
 		d.mu.Unlock()
@@ -41,6 +42,7 @@ func (d *directTransportController) Start(grant protocol.P2PGrant) {
 	d.grantID = grantID
 	d.mu.Unlock()
 	if err := d.createOffer(grantID); err != nil {
+		slog.Default().Warn("tui p2p offer failed", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "error", err)
 		d.send(protocol.P2PSignal{
 			GrantID: grantID,
 			From:    "control",
@@ -64,6 +66,7 @@ func (d *directTransportController) Start(grant protocol.P2PGrant) {
 		d.fallback.Stop()
 	}
 	d.fallback = time.AfterFunc(fallbackAfter, func() {
+		slog.Default().Info("tui p2p fallback timeout", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "fallback_after_ms", fallbackAfter.Milliseconds())
 		d.send(protocol.P2PSignal{
 			GrantID: grantID,
 			From:    "control",
@@ -78,6 +81,7 @@ func (d *directTransportController) Start(grant protocol.P2PGrant) {
 }
 
 func (d *directTransportController) AcceptSignal(signal protocol.P2PSignal) {
+	slog.Default().Debug("tui p2p signal received", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", signal.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
 	switch signal.Signal {
 	case "answer":
 		d.acceptAnswer(signal)
@@ -114,6 +118,7 @@ func (d *directTransportController) createOffer(grantID string) error {
 	if err != nil {
 		return err
 	}
+	slog.Default().Info("tui p2p peer connection created", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID)
 	channel, err := peer.CreateDataChannel("agentmux-terminal", nil)
 	if err != nil {
 		_ = peer.Close()
@@ -128,6 +133,7 @@ func (d *directTransportController) createOffer(grantID string) error {
 			return
 		}
 		init := candidate.ToJSON()
+		slog.Default().Debug("tui p2p local candidate gathered", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "candidate", init.Candidate, "sdp_mid", stringValue(init.SDPMid), "sdp_mline_index", init.SDPMLineIndex)
 		d.send(protocol.P2PSignal{
 			GrantID:       grantID,
 			From:          "control",
@@ -139,8 +145,18 @@ func (d *directTransportController) createOffer(grantID string) error {
 			SDPMLineIndex: init.SDPMLineIndex,
 		})
 	})
+	peer.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
+		slog.Default().Info("tui p2p ice gathering state", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "state", state.String())
+	})
+	peer.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		slog.Default().Info("tui p2p ice connection state", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "state", state.String())
+	})
+	peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		slog.Default().Info("tui p2p peer connection state", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "state", state.String())
+	})
 	channel.OnOpen(func() {
 		d.stopFallback()
+		slog.Default().Info("tui p2p data channel open", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID)
 		d.send(protocol.P2PSignal{
 			GrantID: grantID,
 			From:    "control",
@@ -151,7 +167,7 @@ func (d *directTransportController) createOffer(grantID string) error {
 		})
 	})
 	channel.OnClose(func() {
-		slog.Default().Debug("tui p2p data channel closed", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID)
+		slog.Default().Info("tui p2p data channel closed", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID)
 	})
 	offer, err := peer.CreateOffer(nil)
 	if err != nil {
@@ -160,6 +176,7 @@ func (d *directTransportController) createOffer(grantID string) error {
 	if err := peer.SetLocalDescription(offer); err != nil {
 		return err
 	}
+	slog.Default().Info("tui p2p offer created", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", grantID, "sdp_type", offer.Type.String(), "sdp_len", len(offer.SDP))
 	d.send(protocol.P2PSignal{
 		GrantID: grantID,
 		From:    "control",
@@ -182,7 +199,9 @@ func (d *directTransportController) acceptAnswer(signal protocol.P2PSignal) {
 	}
 	if err := peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: signal.SDP}); err != nil {
 		slog.Default().Debug("tui p2p answer failed", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", signal.GrantID, "error", err)
+		return
 	}
+	slog.Default().Info("tui p2p answer applied", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", signal.GrantID, "sdp_len", len(signal.SDP))
 }
 
 func (d *directTransportController) acceptCandidate(signal protocol.P2PSignal) {
@@ -198,7 +217,9 @@ func (d *directTransportController) acceptCandidate(signal protocol.P2PSignal) {
 		SDPMLineIndex: signal.SDPMLineIndex,
 	}); err != nil {
 		slog.Default().Debug("tui p2p candidate failed", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", signal.GrantID, "error", err)
+		return
 	}
+	slog.Default().Debug("tui p2p candidate applied", "session_id", d.sessionID, "stream_id", d.streamID, "grant_id", signal.GrantID)
 }
 
 func (d *directTransportController) stopFallback() {

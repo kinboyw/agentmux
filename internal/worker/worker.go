@@ -677,13 +677,15 @@ func (w *Worker) handleP2PSignal(conn *ws.Conn, env protocol.Envelope) {
 		w.sendStreamError(conn, env.StreamID, env.SessionID, err.Error())
 		return
 	}
-	w.Logger.Debug("p2p signal received", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
+	w.Logger.Info("p2p signal received", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason, "ice_servers", len(signal.ICEServers))
 	switch signal.Signal {
 	case "offer":
 		if err := w.handleP2POffer(conn, env, signal); err != nil {
 			w.Logger.Debug("p2p offer failed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "error", err)
 			w.sendP2PFallback(conn, env, signal, "worker_webrtc_offer_failed", err.Error())
 		}
+	case "direct":
+		w.Logger.Info("p2p direct confirmed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
 	case "offer_placeholder":
 		w.sendP2PFallback(conn, env, signal, "worker_direct_transport_not_ready", "Worker direct transport requires a WebRTC offer; continuing over Hub relay.")
 	case "candidate":
@@ -708,6 +710,7 @@ func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal pro
 	if err != nil {
 		return err
 	}
+	w.Logger.Info("p2p peer connection created", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "ice_servers", len(signal.ICEServers))
 	direct := &directTransportPeer{
 		grantID: signal.GrantID, sessionID: env.SessionID, streamID: env.StreamID, peer: peer,
 		grant: protocol.P2PGrant{GrantID: signal.GrantID, ICEServers: append([]protocol.P2PICEServer(nil), signal.ICEServers...)},
@@ -716,19 +719,21 @@ func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal pro
 	w.streamPeers[env.StreamID] = direct
 	w.mu.Unlock()
 	peer.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		w.Logger.Debug("p2p ice connection state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
+		w.Logger.Info("p2p ice connection state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
 	})
 	peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		w.Logger.Debug("p2p peer connection state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
+		w.Logger.Info("p2p peer connection state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
 	})
 	peer.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
-		w.Logger.Debug("p2p ice gathering state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
+		w.Logger.Info("p2p ice gathering state", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "state", state.String())
 	})
 	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
 			return
 		}
 		init := candidate.ToJSON()
+		kind, address, port, network := p2pCandidateSummary(init.Candidate)
+		w.Logger.Debug("p2p local candidate gathered", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "type", kind, "address", address, "port", port, "network", network)
 		reply := protocol.P2PSignal{
 			GrantID:       signal.GrantID,
 			From:          "worker",
@@ -743,14 +748,14 @@ func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal pro
 		w.sendP2PSignal(conn, env, reply)
 	})
 	peer.OnDataChannel(func(channel *webrtc.DataChannel) {
-		w.Logger.Debug("p2p data channel received", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "label", channel.Label())
+		w.Logger.Info("p2p data channel received", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "label", channel.Label())
 		w.mu.Lock()
 		if current := w.streamPeers[env.StreamID]; current != nil {
 			current.channel = channel
 		}
 		w.mu.Unlock()
 		channel.OnOpen(func() {
-			w.Logger.Debug("p2p data channel open", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
+			w.Logger.Info("p2p data channel open", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
 			w.sendP2PSignal(conn, env, protocol.P2PSignal{
 				GrantID:    signal.GrantID,
 				From:       "worker",
@@ -770,7 +775,7 @@ func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal pro
 			}
 		})
 		channel.OnClose(func() {
-			w.Logger.Debug("p2p data channel closed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
+			w.Logger.Info("p2p data channel closed", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID)
 			w.mu.Lock()
 			if current := w.streamPeers[env.StreamID]; current == direct {
 				current.channel = nil
@@ -783,6 +788,7 @@ func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal pro
 		w.closeDirectTransport(env.StreamID)
 		return err
 	}
+	w.Logger.Info("p2p remote offer applied", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "sdp_len", len(signal.SDP))
 	answer, err := peer.CreateAnswer(nil)
 	if err != nil {
 		w.closeDirectTransport(env.StreamID)
@@ -792,6 +798,7 @@ func (w *Worker) handleP2POffer(conn *ws.Conn, env protocol.Envelope, signal pro
 		w.closeDirectTransport(env.StreamID)
 		return err
 	}
+	w.Logger.Info("p2p answer created", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "sdp_len", len(answer.SDP))
 	w.sendP2PSignal(conn, env, protocol.P2PSignal{
 		GrantID:    signal.GrantID,
 		From:       "worker",
@@ -813,11 +820,17 @@ func (w *Worker) handleP2PCandidate(streamID string, signal protocol.P2PSignal) 
 	if direct == nil || direct.peer == nil || signal.Candidate == "" {
 		return nil
 	}
-	return direct.peer.AddICECandidate(webrtc.ICECandidateInit{
+	kind, address, port, network := p2pCandidateSummary(signal.Candidate)
+	w.Logger.Debug("p2p remote candidate received", "stream_id", streamID, "grant_id", signal.GrantID, "type", kind, "address", address, "port", port, "network", network)
+	if err := direct.peer.AddICECandidate(webrtc.ICECandidateInit{
 		Candidate:     signal.Candidate,
 		SDPMid:        emptyStringAsNil(signal.SDPMid),
 		SDPMLineIndex: signal.SDPMLineIndex,
-	})
+	}); err != nil {
+		return err
+	}
+	w.Logger.Debug("p2p remote candidate applied", "stream_id", streamID, "grant_id", signal.GrantID, "type", kind, "address", address, "port", port, "network", network)
+	return nil
 }
 
 func (w *Worker) sendP2PSignal(conn *ws.Conn, source protocol.Envelope, signal protocol.P2PSignal) {
@@ -827,10 +840,13 @@ func (w *Worker) sendP2PSignal(conn *ws.Conn, source protocol.Envelope, signal p
 	out.StreamID = source.StreamID
 	if err := w.writeControlEnvelope(conn, out); err != nil {
 		w.Logger.Debug("p2p signal send failed", "session_id", source.SessionID, "stream_id", source.StreamID, "grant_id", signal.GrantID, "signal", signal.Signal, "error", err)
+		return
 	}
+	w.Logger.Debug("p2p signal sent", "session_id", source.SessionID, "stream_id", source.StreamID, "grant_id", signal.GrantID, "signal", signal.Signal, "state", signal.State, "reason", signal.Reason)
 }
 
 func (w *Worker) sendP2PFallback(conn *ws.Conn, env protocol.Envelope, signal protocol.P2PSignal, reason, message string) {
+	w.Logger.Info("p2p fallback sent", "session_id", env.SessionID, "stream_id", env.StreamID, "grant_id", signal.GrantID, "reason", reason, "message", message)
 	w.sendP2PSignal(conn, env, protocol.P2PSignal{
 		GrantID: signal.GrantID,
 		From:    "worker",
@@ -2487,4 +2503,23 @@ func writeEnvelope(conn *ws.Conn, env protocol.Envelope) error {
 		return err
 	}
 	return conn.WriteText(string(raw))
+}
+
+func p2pCandidateSummary(candidate string) (kind, address string, port int, network string) {
+	kind = "unknown"
+	fields := strings.Fields(candidate)
+	if len(fields) >= 6 {
+		network = strings.ToLower(fields[2])
+		address = fields[4]
+		if parsed, err := strconv.Atoi(fields[5]); err == nil {
+			port = parsed
+		}
+	}
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "typ" {
+			kind = fields[i+1]
+			break
+		}
+	}
+	return kind, address, port, network
 }

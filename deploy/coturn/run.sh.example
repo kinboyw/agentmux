@@ -1,0 +1,45 @@
+#!/usr/bin/env sh
+set -eu
+
+NAME="${NAME:-agentmux-coturn}"
+IMAGE="${IMAGE:-coturn/coturn:latest}"
+REALM="${REALM:-turn.example.com}"
+USERNAME="${USERNAME:-agentmux}"
+PASSWORD="${PASSWORD:?set PASSWORD to the TURN long-term credential}"
+PUBLIC_IP="${PUBLIC_IP:?set PUBLIC_IP to the server public IPv4 address}"
+PRIVATE_IP="${PRIVATE_IP:-}"
+MIN_PORT="${MIN_PORT:-49160}"
+MAX_PORT="${MAX_PORT:-49191}"
+
+EXTERNAL_IP="$PUBLIC_IP"
+if [ -n "$PRIVATE_IP" ]; then
+  EXTERNAL_IP="$PUBLIC_IP/$PRIVATE_IP"
+fi
+LISTENING_IP="${PRIVATE_IP:-$PUBLIC_IP}"
+RELAY_IP="${PRIVATE_IP:-$PUBLIC_IP}"
+
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+exec docker run -d \
+  --name "$NAME" \
+  --restart unless-stopped \
+  --network host \
+  "$IMAGE" \
+  -n \
+  --verbose \
+  --log-file=stdout \
+  --listening-port=3478 \
+  --listening-ip="$LISTENING_IP" \
+  --relay-ip="$RELAY_IP" \
+  --external-ip="$EXTERNAL_IP" \
+  --fingerprint \
+  --lt-cred-mech \
+  --realm="$REALM" \
+  --server-name="$REALM" \
+  --user="$USERNAME:$PASSWORD" \
+  --min-port="$MIN_PORT" \
+  --max-port="$MAX_PORT" \
+  --no-tls \
+  --no-dtls \
+  --no-cli \
+  --no-multicast-peers
