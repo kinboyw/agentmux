@@ -4237,6 +4237,31 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     .command-actions { display: flex; align-items: center; gap: 7px; }
     .command-actions a, .command-actions button { min-height: 27px; border-radius: 6px; padding: 0 8px; font-size: 12px; }
     pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #d7e5df; font-size: 13px; line-height: 1.55; }
+    .step-indicator { display: flex; align-items: center; justify-content: space-between; gap: 0; margin-bottom: 22px; position: relative; }
+    .step-indicator::before { content: ''; position: absolute; top: 18px; left: 48px; right: 48px; height: 2px; background: var(--line); z-index: 0; }
+    .step-item { display: flex; flex-direction: column; align-items: center; gap: 8px; position: relative; z-index: 1; flex: 1; }
+    .step-num { width: 36px; height: 36px; border-radius: 999px; border: 2px solid var(--line); background: rgba(10, 14, 14, .8); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; color: var(--muted); transition: all .2s ease; }
+    .step-item.active .step-num { border-color: var(--accent); background: rgba(54, 214, 147, .15); color: var(--accent); box-shadow: 0 0 16px rgba(54, 214, 147, .25); }
+    .step-item.done .step-num { border-color: var(--accent); background: var(--accent); color: #06130e; }
+    .step-label { font-size: 12px; color: var(--muted); text-align: center; max-width: 140px; }
+    .step-item.active .step-label { color: var(--text); font-weight: 600; }
+    .step-card { border: 1px solid var(--line); border-radius: 8px; background: rgba(3, 5, 5, .6); padding: 18px; margin-bottom: 14px; animation: fadeIn .3s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .step-card h3 { margin: 0 0 6px; font-size: 15px; }
+    .step-card p { margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .step-card .command { margin: 0; }
+        .step-cta-button { display: inline-block; padding: 10px 28px; background: var(--accent); color: #fff; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 600; transition: opacity .15s; }
+        .step-cta-button:hover { opacity: .85; }
+    .advanced-toggle { display: flex; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--muted); font-size: 13px; cursor: pointer; padding: 8px 0; margin-top: 8px; }
+    .advanced-toggle:hover { color: var(--text); }
+    .advanced-toggle .arrow { transition: transform .2s ease; display: inline-block; }
+    .advanced-toggle.open .arrow { transform: rotate(90deg); }
+    .advanced-section { display: none; margin-top: 8px; }
+    .advanced-section.open { display: block; }
+    .countdown { color: var(--warn); font-size: 12px; margin-top: 6px; }
+        .signal-bar { display: none; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; margin: 12px 0 16px; border-radius: 8px; background: rgba(234, 179, 8, .08); border: 1px solid rgba(234, 179, 8, .2); }
+        .signal-bar-text { color: var(--warn); font-size: 13px; }
+        .signal-bar-time { color: var(--warn); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
     .footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; padding: 18px 0 34px; display: flex; justify-content: space-between; gap: 16px; }
     .lightbox { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center; padding: 26px; background: rgba(0, 0, 0, .76); backdrop-filter: blur(16px); }
     .lightbox.open { display: flex; }
@@ -4300,7 +4325,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
           <h1 data-i18n="heroTitle">Bring every agent session back to one hub.</h1>
           <p class="lead" data-i18n="heroLead">AgentMux keeps Codex, Claude, Gemini, OpenCode, and plain shells unaware of remote access. Workers own local tmux or PTY sessions, Hub routes identity and WebSockets, Control gives you browser and TUI access from anywhere.</p>
           <div class="actions">
-            <button id="mint" class="primary" data-i18n="generateSignal">Generate join signal</button>
+            <a href="#quickstart" class="button primary" data-i18n="generateSignal">Generate join signal</a>
             <a class="button" href="/control" data-i18n="openControl">Open Web Control</a>
             <a class="button with-icon" href="{{.GitHubURL}}" rel="noreferrer">
               <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.82 1.31 3.51 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5Z"/></svg>
@@ -4356,27 +4381,20 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         <div class="panel-head">
           <div>
             <h2 data-i18n="quickTitle">Quick Start</h2>
-            <p data-i18n="quickLead">This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your sessions, then open the Web Control share URL or copy the Direct Token into TUI.</p>
-          </div>
-          <button id="mint2" data-i18n="generate">Generate</button>
-        </div>
-        <div id="result" class="grid">
-          <div class="command">
-            <div class="command-title"><span data-i18n="currentHub">Current Hub</span></div>
-            <pre>{{.BaseURL}}</pre>
-          </div>
-          <div class="command">
-            <div class="command-title"><span data-i18n="workerStep">Worker side</span></div>
-            <pre data-i18n="workerStepBody">Click Generate to create a short-lived command for the machine running agents.</pre>
-          </div>
-          <div class="command">
-            <div class="command-title"><span data-i18n="controlStep">Control side</span></div>
-            <pre data-i18n="controlStepBody">After the Worker is connected, open the share URL for simple Direct Token access, or sign in for the full management workspace.</pre>
+            <p data-i18n="quickLead">This Hub is already running. Follow the steps below to connect your first machine.</p>
           </div>
         </div>
+        <div class="step-indicator">
+          <div class="step-item active" id="step-ind-1"><div class="step-num">1</div><div class="step-label" data-i18n="step1Label">Generate signal</div></div>
+          <div class="step-item" id="step-ind-2"><div class="step-num">2</div><div class="step-label" data-i18n="step2Label">Run Worker</div></div>
+          <div class="step-item" id="step-ind-3"><div class="step-num">3</div><div class="step-label" data-i18n="step3Label">Open Control</div></div>
+        </div>
+        <div id="signal-bar" class="signal-bar" style="display:none;"></div>
+        <div id="steps-container"></div>
+        <div style="text-align:center;margin-top:18px;"><button id="mint2" class="primary" data-i18n="generate">Generate</button></div>
       </section>
 
-      <section class="panel">
+      <section class="panel" style="margin-top:52px;border-top:2px solid var(--line);padding-top:28px;">
         <div class="panel-head">
           <div>
             <h2 data-i18n="selfHostTitle">Self-host Hub</h2>
@@ -4426,9 +4444,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     const baseStatus = 'Hub {{.BaseURL}} · Worker {{.WSURL}}';
     const latestReleaseAPI = '{{.LatestReleaseAPI}}';
     const fallbackReleaseURL = '{{.ReleasesURL}}';
+    const stepsContainer = document.getElementById('steps-container');
     const result = document.getElementById('result');
     const status = document.getElementById('status');
-    const mintButtons = [document.getElementById('mint'), document.getElementById('mint2')].filter(Boolean);
+    const mintButtons = [document.getElementById('mint2')].filter(Boolean);
     const quickStart = document.getElementById('quickstart');
     let latestRelease = null;
     let minting = false;
@@ -4460,7 +4479,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: 'Multi-pane Web Control',
         workspaceBody: 'Operate multiple long-lived terminal sessions from a compact browser workspace.',
         quickTitle: 'Quick Start',
-        quickLead: 'This Hub is already running. Generate a join signal, run the Worker command on the machine that owns your sessions, then open the Web Control share URL or copy the Direct Token into TUI.',
+        quickLead: 'This Hub is already running. Follow the steps below to connect your first machine.',
         generate: 'Generate',
         currentHub: 'Current Hub',
         workerStep: 'Worker side',
@@ -4492,7 +4511,21 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         controlCommand: 'TUI Control command',
         open: 'Open',
         copy: 'Copy',
-        copied: 'Copied'
+        copied: 'Copied',
+        nextStep: 'Next Step',
+        openWebControl: 'Open Web Control',
+        step1Label: 'Generate signal',
+        step2Label: 'Run Worker',
+        step3Label: 'Open Control',
+        step1Title: 'Join Signal Generated',
+        step1Desc: 'This signal is short-lived. Run the Worker command below before it expires.',
+        step2Title: 'Install & Connect Worker',
+        step2Desc: 'Copy and run this command on the machine where your agent sessions live.',
+        step3Title: 'Open Web Control',
+        step3Desc: 'Access your sessions from any browser. Direct Token and TUI commands are in Advanced.',
+        advancedOptions: 'Advanced options',
+        expiresIn: 'Expires in ',
+        signalExpired: 'Signal expired'
       },
       zh: {
         navControl: '网页控制台',
@@ -4521,7 +4554,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         workspaceTitle: '多窗格网页控制台',
         workspaceBody: '在紧凑的浏览器工作区里操作多个长期运行的 tmux agent 会话。',
         quickTitle: '快速开始',
-        quickLead: '当前 Hub 已经在运行。生成接入信令，在拥有会话的机器上运行 Worker 命令，然后打开 Web Control 分享链接，或把 Direct Token 复制到 TUI。',
+        quickLead: '当前 Hub 已在运行。按以下步骤接入你的第一台机器。',
         generate: '生成',
         currentHub: '当前 Hub',
         workerStep: 'Worker 侧',
@@ -4553,12 +4586,25 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         controlCommand: 'TUI Control 命令',
         open: '打开',
         copy: '复制',
-        copied: '已复制'
+        copied: '已复制',
+        nextStep: '下一步',
+        openWebControl: '打开网页控制台',
+        step1Label: '生成信令',
+        step2Label: '运行 Worker',
+        step3Label: '打开控制台',
+        step1Title: '接入信令已生成',
+        step1Desc: '信令限时有效，请在过期前在目标机器上运行下方的 Worker 命令。',
+        step2Title: '安装并连接 Worker',
+        step2Desc: '复制以下命令，在运行 agent 会话的机器上执行。',
+        step3Title: '打开网页控制台',
+        step3Desc: '从任意浏览器访问你的会话。Direct Token 和 TUI 命令在"高级选项"中。',
+        advancedOptions: '高级选项',
+        expiresIn: '剩余 ',
+        signalExpired: '信令已过期'
       }
     };
     let currentLang = localStorage.getItem('agentmux.lang') || ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
     if (!dictionaries[currentLang]) currentLang = 'en';
-    document.getElementById('mint').addEventListener('click', mint);
     document.getElementById('mint2').addEventListener('click', mint);
     document.querySelectorAll('[data-lang]').forEach(button => {
       button.addEventListener('click', () => setLanguage(button.getAttribute('data-lang')));
@@ -4575,8 +4621,12 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
     });
     setLanguage(currentLang);
     loadLatestVersion();
+    let currentStep = 0;
+    let controlShareUrlGlobal = '';
     async function mint() {
       if (minting) return;
+      if (currentStep === 1) { currentStep = 2; setStepActive(3); scrollToStep(3); updateBottomButton(); return; }
+      if (currentStep === 2) { openControlShare(); return; }
       minting = true;
       setMintLoading(true);
       status.textContent = t('generating');
@@ -4589,13 +4639,10 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         const data = await res.json();
         const signal = data.signal || data.token;
         status.textContent = t('signalReady') + new Date(data.expires_at).toLocaleString();
-        result.innerHTML =
-          commandBlock(t('signal'), signal, true) +
-          commandBlock(t('workerCommand'), data.worker_command, true) +
-          commandBlock(t('workerJoinCommand'), data.worker_join_command || '', true) +
-          commandBlock(t('directToken'), data.direct_token || '', true) +
-          linkBlock(t('webControlShare'), data.control_share_url || data.control_url) +
-          commandBlock(t('controlDirectCommand'), data.control_direct_command || data.control_command, true);
+        controlShareUrlGlobal = data.control_share_url || data.control_url || '';
+        renderSteps(data);
+        currentStep = 1;
+        updateBottomButton();
         if (quickStart) quickStart.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (error) {
         status.textContent = t('failed') + (error && error.message ? error.message : String(error));
@@ -4603,6 +4650,82 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
         minting = false;
         setMintLoading(false);
       }
+    }
+    function renderSteps(data) {
+      stepsContainer.innerHTML = '';
+      const signal = data.signal || data.token;
+      const workerCmd = data.worker_command || '';
+      const workerJoinCmd = data.worker_join_command || '';
+      const controlShareUrl = data.control_share_url || data.control_url || '';
+      const directToken = data.direct_token || '';
+      const controlDirectCmd = data.control_direct_command || data.control_command || '';
+      showStep(1, t('step1Title'), t('step1Desc'),
+        commandBlock(t('signal'), signal, true));
+      showStep(2, t('step2Title'), t('step2Desc'),
+        commandBlock(t('workerCommand'), workerCmd, true) +
+        (workerJoinCmd && workerJoinCmd !== workerCmd ? '<button class="advanced-toggle" onclick="toggleAdvanced(this)"><span class="arrow">&#9654;</span> ' + t('advancedOptions') + '</button><div class="advanced-section">' + commandBlock(t('workerJoinCommand'), workerJoinCmd, true) + '</div>' : ''));
+      showStep(3, t('step3Title'), t('step3Desc'),
+        linkBlock(t('webControlShare'), controlShareUrl) +
+        '<button class="advanced-toggle" onclick="toggleAdvanced(this)"><span class="arrow">&#9654;</span> ' + t('advancedOptions') + '</button><div class="advanced-section">' +
+        commandBlock(t('directToken'), directToken, true) +
+        commandBlock(t('controlDirectCommand'), controlDirectCmd, true) +
+        '</div>');
+      setStepActive(2);
+      startCountdown(data.expires_at);
+    }
+    function showStep(num, title, desc, content) {
+      const card = document.createElement('div');
+      card.className = 'step-card';
+      card.id = 'step-card-' + num;
+      card.style.display = 'none';
+      card.innerHTML = '<h3>' + escapeHTML(title) + '</h3><p>' + escapeHTML(desc) + '</p>' + content;
+      stepsContainer.appendChild(card);
+    }
+    function setStepActive(num) {
+      for (let i = 1; i <= 3; i++) {
+        const ind = document.getElementById('step-ind-' + i);
+        const card = document.getElementById('step-card-' + i);
+        if (!ind || !card) continue;
+        ind.className = 'step-item' + (i < num ? ' done' : i === num ? ' active' : '');
+        card.style.display = i === num ? 'block' : 'none';
+      }
+    }
+    function toggleAdvanced(btn) {
+      btn.classList.toggle('open');
+      var section = btn.nextElementSibling;
+      if (section) section.classList.toggle('open');
+    }
+    function startCountdown(expiresAt) {
+      var bar = document.getElementById('signal-bar');
+      if (!bar || !expiresAt) return;
+      bar.style.display = 'flex';
+      var target = new Date(expiresAt).getTime();
+      var timer = setInterval(function() {
+        var remaining = target - Date.now();
+        if (remaining <= 0) { clearInterval(timer); bar.innerHTML = '<span class="signal-bar-text">' + escapeHTML(t('signalExpired')) + '</span>'; return; }
+        var mins = Math.floor(remaining / 60000);
+        var secs = Math.floor((remaining % 60000) / 1000);
+        bar.innerHTML = '<span class="signal-bar-text">' + escapeHTML(t('expiresIn')) + '</span><span class="signal-bar-time">' + mins + 'm ' + secs + 's</span>';
+      }, 1000);
+    }
+    function updateBottomButton() {
+      const btn = document.getElementById('mint2');
+      if (!btn) return;
+      if (currentStep === 0) {
+        btn.textContent = t('generate');
+        btn.removeAttribute('data-i18n');
+      } else if (currentStep === 1) {
+        btn.textContent = t('nextStep');
+      } else if (currentStep === 2) {
+        btn.textContent = t('openWebControl');
+      }
+    }
+    function scrollToStep(num) {
+      const card = document.getElementById('step-card-' + num);
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    function openControlShare() {
+      if (controlShareUrlGlobal) window.open(controlShareUrlGlobal, '_blank');
     }
     function setMintLoading(loading) {
       mintButtons.forEach(button => {
@@ -4612,8 +4735,7 @@ var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype htm
           if (!button.dataset.label) button.dataset.label = button.textContent;
           button.innerHTML = '<span class="loading-spinner" aria-hidden="true"></span><span>' + escapeHTML(t('generating')) + '</span>';
         } else {
-          const key = button.id === 'mint' ? 'generateSignal' : 'generate';
-          button.textContent = t(key);
+          updateBottomButton();
         }
       });
     }
