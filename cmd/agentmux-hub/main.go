@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"private/agentmux/internal/hub"
+	"private/agentmux/internal/protocol"
 	"private/agentmux/internal/updater"
 	buildversion "private/agentmux/internal/version"
 )
@@ -42,6 +43,7 @@ func runHub(ctx context.Context, args []string) {
 	data := fs.String("data", os.Getenv("AGENTMUX_DATA"), "SQLite database path for persistent hub state")
 	publicURL := fs.String("public-url", os.Getenv("AGENTMUX_PUBLIC_URL"), "external hub URL used for generated HTTPS/WSS commands")
 	releaseRepo := fs.String("release-repo", getenv("AGENTMUX_RELEASE_REPO", "kinboyw/agentmux"), "GitHub owner/repo used by generated install.sh")
+	iceServersValue := fs.String("ice-servers", os.Getenv("AGENTMUX_P2P_ICE_SERVERS"), "JSON or comma-separated ICE server URLs for WebRTC direct transport")
 	_ = fs.Parse(args)
 
 	var authStore hub.AuthStore
@@ -58,9 +60,13 @@ func runHub(ctx context.Context, args []string) {
 		authStore = store
 		slog.Default().Info("hub persistence enabled", "data", *data)
 	}
+	iceServers, err := parseP2PICEServers(*iceServersValue)
+	if err != nil {
+		fatal(fmt.Errorf("parse p2p ice servers: %w", err))
+	}
 	server, err := hub.NewWithOptions(hub.ServerOptions{
 		Addr: *addr, Token: *token, PublicURL: *publicURL,
-		ReleaseRepo: *releaseRepo, Logger: slog.Default(), AuthStore: authStore,
+		ReleaseRepo: *releaseRepo, ICEServers: iceServers, Logger: slog.Default(), AuthStore: authStore,
 	})
 	if err != nil {
 		fatal(err)
@@ -68,6 +74,60 @@ func runHub(ctx context.Context, args []string) {
 	if err := server.ListenAndServe(ctx); err != nil {
 		fatal(err)
 	}
+}
+
+func parseP2PICEServers(raw string) ([]protocol.P2PICEServer, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(raw, "[") {
+		var servers []protocol.P2PICEServer
+		if err := json.Unmarshal([]byte(raw), &servers); err != nil {
+			return nil, err
+		}
+		return normalizeP2PICEServers(servers), nil
+	}
+	if strings.HasPrefix(raw, "{") {
+		var server protocol.P2PICEServer
+		if err := json.Unmarshal([]byte(raw), &server); err != nil {
+			return nil, err
+		}
+		return normalizeP2PICEServers([]protocol.P2PICEServer{server}), nil
+	}
+	urls := make([]string, 0, 4)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			urls = append(urls, part)
+		}
+	}
+	if len(urls) == 0 {
+		return nil, nil
+	}
+	return []protocol.P2PICEServer{{URLs: urls}}, nil
+}
+
+func normalizeP2PICEServers(servers []protocol.P2PICEServer) []protocol.P2PICEServer {
+	normalized := make([]protocol.P2PICEServer, 0, len(servers))
+	for _, server := range servers {
+		urls := make([]string, 0, len(server.URLs))
+		for _, value := range server.URLs {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				urls = append(urls, value)
+			}
+		}
+		if len(urls) == 0 {
+			continue
+		}
+		normalized = append(normalized, protocol.P2PICEServer{
+			URLs:       urls,
+			Username:   strings.TrimSpace(server.Username),
+			Credential: strings.TrimSpace(server.Credential),
+		})
+	}
+	return normalized
 }
 
 func runVersion(args []string) {

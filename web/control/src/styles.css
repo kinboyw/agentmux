@@ -103,8 +103,7 @@ body {
 
 .xterm .xterm-viewport,
 .xterm .xterm-screen,
-.xterm .xterm-helpers,
-.xterm .xterm-helper-textarea {
+.xterm .xterm-helpers {
   max-height: 100%;
   max-width: 100%;
   width: 100%;
@@ -201,14 +200,27 @@ body {
   }
 
   .xterm .xterm-helper-textarea {
+    height: 0 !important;
     font-size: 16px !important;
+    max-height: none;
+    max-width: none;
+    min-height: 0;
+    min-width: 0;
+    width: 0 !important;
   }
 
   .xterm .composition-view {
     background: transparent !important;
     color: hsl(var(--foreground));
-    left: 0 !important;
+    display: none;
+    line-height: normal;
+    max-width: calc(100vw - 16px);
+    min-width: 1ch;
     right: auto;
     text-shadow: 0 0 0 currentColor;
+  }
+
+  .xterm .composition-view.active {
+    display: block;
   }
 }
