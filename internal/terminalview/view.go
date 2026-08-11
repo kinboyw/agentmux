@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
@@ -14,9 +15,14 @@ import (
 const defaultScrollback = 1
 
 type View struct {
-	width      int
-	height     int
-	term       *vt.Emulator
+	mu        sync.RWMutex
+	mouseMu   sync.RWMutex
+	width     int
+	height    int
+	term      *vt.SafeEmulator
+	drainDone chan struct{}
+	closed    bool
+
 	mouseModes map[int]bool
 	mouseSGR   bool
 }
@@ -52,26 +58,47 @@ type Cell struct {
 }
 
 func New(width, height int) *View {
-	width, height = normalizeSize(width, height)
-	term := vt.NewEmulator(width, height)
-	term.SetScrollbackSize(defaultScrollback)
-	view := &View{width: width, height: height, term: term, mouseModes: map[int]bool{}}
-	term.SetCallbacks(vt.Callbacks{
-		EnableMode:  view.enableMode,
-		DisableMode: view.disableMode,
-	})
-	go drainTerminalResponses(term)
+	view := &View{}
+	view.initLocked(width, height)
 	return view
 }
 
-func drainTerminalResponses(term *vt.Emulator) {
+func (v *View) initLocked(width, height int) {
+	width, height = normalizeSize(width, height)
+	term := vt.NewSafeEmulator(width, height)
+	term.SetScrollbackSize(defaultScrollback)
+	term.SetCallbacks(vt.Callbacks{
+		EnableMode:  v.enableMode,
+		DisableMode: v.disableMode,
+	})
+	v.width = width
+	v.height = height
+	v.term = term
+	v.closed = false
+	v.mouseMu.Lock()
+	v.mouseModes = map[int]bool{}
+	v.mouseSGR = false
+	v.mouseMu.Unlock()
+	v.drainDone = make(chan struct{})
+	go func() {
+		drainTerminalResponses(term)
+		close(v.drainDone)
+	}()
+}
+
+func drainTerminalResponses(term *vt.SafeEmulator) {
 	_, _ = io.Copy(io.Discard, term)
 }
 
 func (v *View) Resize(width, height int) {
 	width, height = normalizeSize(width, height)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return
+	}
 	if v.term == nil {
-		*v = *New(width, height)
+		v.initLocked(width, height)
 		return
 	}
 	if v.width == width && v.height == height {
@@ -86,28 +113,39 @@ func (v *View) Write(data []byte) {
 	if len(data) == 0 {
 		return
 	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return
+	}
 	if v.term == nil {
-		*v = *New(v.width, v.height)
+		v.initLocked(v.width, v.height)
 	}
 	_, _ = v.term.Write(data)
 }
 
 func (v *View) Render() string {
-	if v.term == nil {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.term == nil || v.closed {
 		return ""
 	}
 	return strings.TrimRight(v.term.Render(), "\n")
 }
 
 func (v *View) Screen() string {
-	if v.term == nil {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.term == nil || v.closed {
 		return ""
 	}
 	return v.term.Render()
 }
 
 func (v *View) Cursor() (int, int, bool) {
-	if v.term == nil {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.term == nil || v.closed {
 		return 0, 0, false
 	}
 	pos := v.term.CursorPosition()
@@ -115,7 +153,9 @@ func (v *View) Cursor() (int, int, bool) {
 }
 
 func (v *View) Cells() CellSnapshot {
-	if v.term == nil {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.term == nil || v.closed {
 		return CellSnapshot{}
 	}
 	lines := make([][]Cell, v.height)
@@ -126,11 +166,11 @@ func (v *View) Cells() CellSnapshot {
 		}
 		lines[y] = line
 	}
-	x, y, visible := v.Cursor()
+	pos := v.term.CursorPosition()
 	return CellSnapshot{
 		Cols:   v.width,
 		Rows:   v.height,
-		Cursor: Cursor{X: x, Y: y, Visible: visible},
+		Cursor: Cursor{X: pos.X, Y: pos.Y, Visible: true},
 		Lines:  lines,
 	}
 }
@@ -140,8 +180,20 @@ func (v *View) ANSI() string {
 }
 
 func (v *View) Close() {
-	if v.term != nil {
-		_ = v.term.Close()
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return
+	}
+	v.closed = true
+	term := v.term
+	drainDone := v.drainDone
+	v.mu.Unlock()
+	if term != nil {
+		_ = term.Close()
+	}
+	if drainDone != nil {
+		<-drainDone
 	}
 }
 
@@ -416,7 +468,16 @@ func (v *View) MouseInput(event MouseEvent) string {
 	if v == nil || event.X < 0 || event.Y < 0 {
 		return ""
 	}
-	mode := v.mouseMode()
+	v.mu.RLock()
+	if v.closed {
+		v.mu.RUnlock()
+		return ""
+	}
+	v.mouseMu.RLock()
+	mode := v.mouseModeLocked()
+	mouseSGR := v.mouseSGR
+	v.mouseMu.RUnlock()
+	v.mu.RUnlock()
 	if mode == 0 || !mouseEventAllowed(mode, event) {
 		return ""
 	}
@@ -424,13 +485,15 @@ func (v *View) MouseInput(event MouseEvent) string {
 	if button == 0xff {
 		return ""
 	}
-	if v.mouseSGR {
+	if mouseSGR {
 		return ansi.MouseSgr(button, event.X, event.Y, event.Release)
 	}
 	return ansi.MouseX10(button, event.X, event.Y)
 }
 
 func (v *View) enableMode(mode ansi.Mode) {
+	v.mouseMu.Lock()
+	defer v.mouseMu.Unlock()
 	switch mode.Mode() {
 	case 9, 1000, 1001, 1002, 1003:
 		if v.mouseModes == nil {
@@ -443,6 +506,8 @@ func (v *View) enableMode(mode ansi.Mode) {
 }
 
 func (v *View) disableMode(mode ansi.Mode) {
+	v.mouseMu.Lock()
+	defer v.mouseMu.Unlock()
 	switch mode.Mode() {
 	case 9, 1000, 1001, 1002, 1003:
 		delete(v.mouseModes, mode.Mode())
@@ -451,10 +516,7 @@ func (v *View) disableMode(mode ansi.Mode) {
 	}
 }
 
-func (v *View) mouseMode() int {
-	if v == nil {
-		return 0
-	}
+func (v *View) mouseModeLocked() int {
 	mode := 0
 	for _, candidate := range []int{9, 1000, 1001, 1002, 1003} {
 		if v.mouseModes[candidate] {

@@ -865,7 +865,8 @@ func tokenHash(token string) string {
 }
 
 func installWorkerCommand(baseURL string, signal string) string {
-	return fmt.Sprintf("curl -fsSL %s/install.sh | sh -s -- worker --join %s --name \"$(hostname)\"", baseURL, shellQuote(signal))
+	installURL := strings.TrimRight(baseURL, "/") + "/install.sh"
+	return fmt.Sprintf("curl -fsSL %s | sh -s -- worker --join %s --name \"$(hostname)\"", shellQuote(installURL), shellQuote(signal))
 }
 
 func workerJoinCommand(baseURL string, signal string) string {
@@ -891,7 +892,10 @@ func websocketBase(baseURL string) string {
 }
 
 func shellQuote(value string) string {
-	return "'" + value + "'"
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func normalizeEmail(email string) string {

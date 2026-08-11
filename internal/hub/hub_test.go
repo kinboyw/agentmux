@@ -3,11 +3,13 @@ package hub
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -384,7 +386,7 @@ func TestSignalIncludesWorkerJoinCommand(t *testing.T) {
 	if !ok || !strings.HasPrefix(signal, "amx_sig_") {
 		t.Fatalf("unexpected signal: %#v", payload["signal"])
 	}
-	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL http://agentmux.test/install.sh") || strings.Contains(got, "go run") {
+	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL 'http://agentmux.test/install.sh'") || strings.Contains(got, "go run") {
 		t.Fatalf("unexpected worker command: %s", got)
 	}
 	if got := payload["worker_join_command"].(string); got != "agentmux worker join --hub 'ws://agentmux.test' --join "+shellQuote(signal)+" --name \"$(hostname)\"" {
@@ -583,6 +585,126 @@ func TestDirectTokenIsLimitedControlAccess(t *testing.T) {
 	}
 }
 
+func TestNormalizePublicURL(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty", raw: "", want: ""},
+		{name: "trailing slash", raw: " https://mux.example.com/ ", want: "https://mux.example.com"},
+		{name: "http with port", raw: "http://127.0.0.1:8080", want: "http://127.0.0.1:8080"},
+		{name: "ipv6", raw: "https://[2001:db8::1]:8443", want: "https://[2001:db8::1]:8443"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := normalizePublicURL(test.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("normalizePublicURL(%q) = %q, want %q", test.raw, got, test.want)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		"ftp://mux.example.com",
+		"https://user@mux.example.com",
+		"https://mux.example.com/control",
+		"https://mux.example.com?next=x",
+		"https://mux.example.com#fragment",
+		"https://mux.example.com:0",
+		"https://mux.example.com:65536",
+		"https://mux.example.com;touch",
+		"https://mux.example.com$evil",
+		"https://mux.example.com\"; touch /tmp/pwn #",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := normalizePublicURL(raw); err == nil {
+				t.Fatalf("normalizePublicURL(%q) unexpectedly succeeded", raw)
+			}
+			if _, err := NewWithOptions(ServerOptions{Addr: ":0", PublicURL: raw}); err == nil {
+				t.Fatalf("NewWithOptions(PublicURL=%q) unexpectedly succeeded", raw)
+			}
+		})
+	}
+}
+
+func TestRequestBaseURLDoesNotTrustForwardedHeaders(t *testing.T) {
+	server := New(":0", "secret", nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "agentmux.test:8443"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "attacker.example\"; touch /tmp/pwn #")
+	if got := server.requestBaseURL(req); got != "http://agentmux.test:8443" {
+		t.Fatalf("requestBaseURL() = %q, want direct request origin", got)
+	}
+
+	req.TLS = &tls.ConnectionState{}
+	if got := server.requestBaseURL(req); got != "https://agentmux.test:8443" {
+		t.Fatalf("requestBaseURL() = %q, want TLS request origin", got)
+	}
+
+	req.TLS = nil
+	req.Host = "agentmux.test$evil"
+	if got := server.requestBaseURL(req); got != "http://localhost" {
+		t.Fatalf("requestBaseURL() = %q, want safe fallback", got)
+	}
+}
+
+func TestShellQuoteAndGeneratedCommandsEscapeApostrophes(t *testing.T) {
+	if got, want := shellQuote("a'b"), "'a'\\''b'"; got != want {
+		t.Fatalf("shellQuote() = %q, want %q", got, want)
+	}
+	if got := installWorkerCommand("https://mux.example.com/a'b", "signal'with quote"); got != "curl -fsSL 'https://mux.example.com/a'\\''b/install.sh' | sh -s -- worker --join 'signal'\\''with quote' --name \"$(hostname)\"" {
+		t.Fatalf("unexpected escaped install command: %s", got)
+	}
+}
+
+func TestGeneratedScriptsQuoteConfiguredDefaults(t *testing.T) {
+	server, err := NewWithOptions(ServerOptions{Addr: ":0", ReleaseRepo: "owner/repo'; touch /tmp/pwn #"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "install", handler: server.handleInstallScript},
+		{name: "deploy hub", handler: server.handleDeployHubScript},
+		{name: "run", handler: server.handleRunScript},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = "agentmux.test"
+			rec := httptest.NewRecorder()
+			test.handler(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unexpected status: %d", rec.Code)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, "DEFAULT_REPO='owner/repo'\\''; touch /tmp/pwn #'") {
+				t.Fatalf("release repo was not safely shell-quoted:\n%s", body)
+			}
+			assertPOSIXShellSyntax(t, body)
+		})
+	}
+}
+
+func assertPOSIXShellSyntax(t *testing.T, script string) {
+	t.Helper()
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX sh is unavailable")
+	}
+	command := exec.Command(sh, "-n")
+	command.Stdin = strings.NewReader(script)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated script is not valid POSIX shell: %v\n%s", err, output)
+	}
+}
+
 func TestSignalUsesConfiguredPublicURL(t *testing.T) {
 	server, err := NewWithOptions(ServerOptions{Addr: ":0", Token: "secret", PublicURL: "https://mux.example.com/"})
 	if err != nil {
@@ -605,7 +727,7 @@ func TestSignalUsesConfiguredPublicURL(t *testing.T) {
 	if got := payload["control_url"].(string); got != "https://mux.example.com/control" {
 		t.Fatalf("unexpected control URL: %s", got)
 	}
-	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL https://mux.example.com/install.sh") {
+	if got := payload["worker_command"].(string); !strings.Contains(got, "curl -fsSL 'https://mux.example.com/install.sh'") {
 		t.Fatalf("worker command did not use public install script URL: %s", got)
 	}
 }
@@ -628,7 +750,7 @@ func TestInstallScriptEndpoint(t *testing.T) {
 	if !strings.Contains(body, "agentmux") || !strings.Contains(body, "ws://agentmux.test") {
 		t.Fatalf("unexpected install script:\n%s", body)
 	}
-	if !strings.Contains(body, "REPO=\"${AGENTMUX_REPO:-owner/repo}\"") {
+	if !strings.Contains(body, "DEFAULT_REPO='owner/repo'\nREPO=\"${AGENTMUX_REPO:-$DEFAULT_REPO}\"") {
 		t.Fatalf("release repo missing from install script:\n%s", body)
 	}
 	if !strings.Contains(body, "releases/latest/download") {
@@ -1900,6 +2022,79 @@ func TestSessionPreviewRequestForwardsTargetToWorker(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"scope":"pane"`) {
 		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestAuxSessionRequestsRespectRequestCancellation(t *testing.T) {
+	tests := []struct {
+		name        string
+		requestType string
+		request     func(*Server, context.Context) error
+		pending     func(*Server) int
+	}{
+		{
+			name:        "preview",
+			requestType: protocol.TypeSessionPreview,
+			request: func(server *Server, ctx context.Context) error {
+				_, err := server.requestSessionPreview(ctx, "local", "demo", "local/demo", 80, nil)
+				return err
+			},
+			pending: func(server *Server) int { return len(server.previews) },
+		},
+		{
+			name:        "targets",
+			requestType: protocol.TypeSessionTargets,
+			request: func(server *Server, ctx context.Context) error {
+				_, err := server.requestSessionTargets(ctx, "local", "demo", "local/demo")
+				return err
+			},
+			pending: func(server *Server) int { return len(server.targets) },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := New(":0", "secret", nil)
+			worker := &workerConn{id: "local", send: make(chan protocol.Envelope, 1)}
+			server.registerWorker(worker)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- test.request(server, ctx) }()
+
+			select {
+			case env := <-worker.send:
+				if env.Type != test.requestType {
+					t.Fatalf("unexpected request type: %s", env.Type)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("worker did not receive auxiliary session request")
+			}
+
+			select {
+			case err := <-done:
+				t.Fatalf("auxiliary request completed before cancellation: %v", err)
+			case <-time.After(25 * time.Millisecond):
+			}
+
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("request error = %v, want context.Canceled", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("auxiliary request did not stop after cancellation")
+			}
+
+			server.mu.RLock()
+			pending := test.pending(server)
+			server.mu.RUnlock()
+			if pending != 0 {
+				t.Fatalf("canceled request leaked %d pending replies", pending)
+			}
+		})
 	}
 }
 

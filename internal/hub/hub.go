@@ -30,7 +30,6 @@ import (
 const (
 	wsPingInterval           = 15 * time.Second
 	wsPongWait               = 45 * time.Second
-	sessionAuxRequestWait    = 8 * time.Second
 	sessionCreateRequestWait = 5 * time.Second
 	p2pGrantTTL              = 30 * time.Second
 	p2pFallbackAfter         = 10 * time.Second
@@ -223,6 +222,11 @@ type ServerOptions struct {
 }
 
 func NewWithOptions(options ServerOptions) (*Server, error) {
+	publicURL, err := normalizePublicURL(options.PublicURL)
+	if err != nil {
+		return nil, err
+	}
+
 	logger := options.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -232,7 +236,7 @@ func NewWithOptions(options ServerOptions) (*Server, error) {
 	server := &Server{
 		addr:        options.Addr,
 		token:       options.Token,
-		publicURL:   strings.TrimRight(options.PublicURL, "/"),
+		publicURL:   publicURL,
 		releaseRepo: defaultReleaseRepo(options.ReleaseRepo),
 		iceServers:  append([]protocol.P2PICEServer(nil), options.ICEServers...),
 		logger:      logger,
@@ -709,7 +713,7 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := s.requestBaseURL(r)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
-	_, _ = fmt.Fprintf(w, installScriptTemplate, s.releaseRepo, baseURL, websocketBase(baseURL))
+	_, _ = fmt.Fprintf(w, installScriptTemplate, shellQuote(s.releaseRepo), shellQuote(baseURL), shellQuote(websocketBase(baseURL)))
 }
 
 func (s *Server) handleDeployHubScript(w http.ResponseWriter, r *http.Request) {
@@ -719,7 +723,7 @@ func (s *Server) handleDeployHubScript(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := s.requestBaseURL(r)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
-	_, _ = fmt.Fprintf(w, deployHubScriptTemplate, s.releaseRepo, baseURL)
+	_, _ = fmt.Fprintf(w, deployHubScriptTemplate, shellQuote(s.releaseRepo), shellQuote(baseURL))
 }
 
 func (s *Server) handleRunScript(w http.ResponseWriter, r *http.Request) {
@@ -729,7 +733,7 @@ func (s *Server) handleRunScript(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := s.requestBaseURL(r)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
-	_, _ = fmt.Fprintf(w, runScriptTemplate, s.releaseRepo, baseURL, websocketBase(baseURL))
+	_, _ = fmt.Fprintf(w, runScriptTemplate, shellQuote(s.releaseRepo), shellQuote(baseURL), shellQuote(websocketBase(baseURL)))
 }
 
 func (s *Server) handleJoinTokens(w http.ResponseWriter, r *http.Request) {
@@ -2599,14 +2603,10 @@ func (s *Server) requestSessionPreview(ctx context.Context, workerID, name, sess
 		s.logger.Debug("preview request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 		return protocol.SessionPreview{}, err
 	}
-	timer := time.NewTimer(sessionAuxRequestWait)
-	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		s.logger.Debug("preview request canceled", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", ctx.Err())
 		return protocol.SessionPreview{}, ctx.Err()
-	case <-timer.C:
-		s.logger.Debug("preview request timed out", "worker", workerID, "session_id", sessionID, "request_id", requestID)
-		return protocol.SessionPreview{}, fmt.Errorf("session preview timed out")
 	case env := <-reply:
 		if env.Type == protocol.TypeError {
 			var payload protocol.ErrorPayload
@@ -2644,14 +2644,10 @@ func (s *Server) requestSessionTargets(ctx context.Context, workerID, name, sess
 		s.logger.Debug("targets request forward failed", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", err)
 		return protocol.SessionTargets{}, err
 	}
-	timer := time.NewTimer(sessionAuxRequestWait)
-	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		s.logger.Debug("targets request canceled", "worker", workerID, "session_id", sessionID, "request_id", requestID, "error", ctx.Err())
 		return protocol.SessionTargets{}, ctx.Err()
-	case <-timer.C:
-		s.logger.Debug("targets request timed out", "worker", workerID, "session_id", sessionID, "request_id", requestID)
-		return protocol.SessionTargets{}, fmt.Errorf("session targets timed out")
 	case env := <-reply:
 		if env.Type == protocol.TypeError {
 			var payload protocol.ErrorPayload
@@ -3336,17 +3332,91 @@ type controlPageData struct {
 	WSURL   string
 }
 
+// normalizePublicURL verifies the externally configured Hub URL before it is
+// rendered into commands, scripts, redirects, and pages. A Hub is served from a
+// single origin, so paths, credentials, queries, and fragments are rejected.
+func normalizePublicURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid public URL: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("invalid public URL: scheme must be http or https")
+	}
+	if parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("invalid public URL: expected an origin without credentials, path, query, or fragment")
+	}
+	host, ok := validURLHost(parsed.Host)
+	if !ok {
+		return "", fmt.Errorf("invalid public URL host")
+	}
+	return scheme + "://" + host, nil
+}
+
+// validURLHost accepts only an HTTP authority that can be safely re-rendered.
+// It deliberately excludes syntax which could escape a URL or shell literal.
+func validURLHost(host string) (string, bool) {
+	if host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "/\\?#@\"'` \t\r\n") {
+		return "", false
+	}
+	parsed, err := url.Parse("http://" + host)
+	hostname := parsed.Hostname()
+	if err != nil || parsed.Host != host || parsed.User != nil || !validURLHostname(hostname) {
+		return "", false
+	}
+	if port := parsed.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", false
+		}
+	}
+	return parsed.Host, true
+}
+
+func validURLHostname(hostname string) bool {
+	if net.ParseIP(hostname) != nil {
+		return true
+	}
+	hostname = strings.TrimSuffix(hostname, ".")
+	if hostname == "" || len(hostname) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (s *Server) requestBaseURL(r *http.Request) string {
 	if s.publicURL != "" {
 		return s.publicURL
 	}
+
+	// Forwarded headers can be supplied by any client unless the proxy and its
+	// source addresses are explicitly trusted. Use --public-url for proxy or
+	// tunnel deployments instead of treating those headers as authoritative.
 	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+	if r != nil && r.TLS != nil {
 		scheme = "https"
 	}
-	host := r.Host
-	if forwardedHost := r.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
-		host = forwardedHost
+	host := "localhost"
+	if r != nil {
+		if candidate, ok := validURLHost(r.Host); ok {
+			host = candidate
+		}
 	}
 	return scheme + "://" + host
 }
@@ -3357,10 +3427,11 @@ set -eu
 ROLE="${1:-worker}"
 shift || true
 
-REPO="${AGENTMUX_REPO:-%s}"
+DEFAULT_REPO=%s
+REPO="${AGENTMUX_REPO:-$DEFAULT_REPO}"
 VERSION="${AGENTMUX_VERSION:-latest}"
-HUB_HTTP="%s"
-HUB_WS="%s"
+HUB_HTTP=%s
+HUB_WS=%s
 BIN_DIR="${AGENTMUX_BIN_DIR:-$HOME/.local/bin}"
 BIN="$BIN_DIR/agentmux"
 HUB_BIN="$BIN_DIR/agentmux-hub"
@@ -3503,9 +3574,11 @@ esac
 const deployHubScriptTemplate = `#!/bin/sh
 set -eu
 
-REPO="${AGENTMUX_REPO:-%s}"
+DEFAULT_REPO=%s
+REPO="${AGENTMUX_REPO:-$DEFAULT_REPO}"
 VERSION="${AGENTMUX_VERSION:-latest}"
-PUBLIC_URL="${AGENTMUX_PUBLIC_URL:-%s}"
+DEFAULT_PUBLIC_URL=%s
+PUBLIC_URL="${AGENTMUX_PUBLIC_URL:-$DEFAULT_PUBLIC_URL}"
 ADDR="${AGENTMUX_ADDR:-127.0.0.1:8081}"
 DATA="${AGENTMUX_DATA:-/var/lib/agentmux/agentmux.db}"
 DATA_DIR="$(dirname "$DATA")"
@@ -3678,9 +3751,10 @@ if [ "$ROLE" = "$VERSION" ]; then
   VERSION="${AGENTMUX_VERSION:-latest}"
 fi
 
-REPO="${AGENTMUX_REPO:-%s}"
-HUB_HTTP="%s"
-HUB_WS="%s"
+DEFAULT_REPO=%s
+REPO="${AGENTMUX_REPO:-$DEFAULT_REPO}"
+HUB_HTTP=%s
+HUB_WS=%s
 CACHE_DIR="${AGENTMUX_CACHE_DIR:-$HOME/.cache/agentmux}"
 
 case "$ROLE" in

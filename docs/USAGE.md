@@ -61,6 +61,8 @@ Important flags:
 - `--addr`: local listen address.
 - `--data`: SQLite database path for users, signals, and credentials.
 - `--public-url`: external HTTPS URL used to generate worker/control commands.
+  Required behind a reverse proxy or tunnel because forwarded headers are
+  intentionally not trusted.
 - `--release-repo`: GitHub `owner/repo` for `/install.sh` downloads. Defaults to `kinboyw/agentmux`.
 
 On Windows, the release currently supports the Hub role. A convenience starter

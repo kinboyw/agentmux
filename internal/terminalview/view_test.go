@@ -2,6 +2,7 @@ package terminalview
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -170,4 +171,51 @@ func skipANSI(value string, start int) int {
 		}
 	}
 	return i
+}
+
+func TestViewCloseStopsResponseDrain(t *testing.T) {
+	view := New(20, 3)
+	view.Write([]byte("\x1b[c\x1b[6n\x1b[5n"))
+
+	done := make(chan struct{})
+	go func() {
+		view.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("view close did not stop the terminal response drain")
+	}
+	if got := view.Render(); got != "" {
+		t.Fatalf("closed view rendered %q", got)
+	}
+}
+
+func TestViewConcurrentAccessDuringClose(t *testing.T) {
+	view := New(20, 3)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	run := func(fn func()) {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					fn()
+				}
+			}
+		})
+	}
+	run(func() { view.Write([]byte("progress\rupdated\n")) })
+	run(func() { _ = view.Render(); _ = view.Screen(); _ = view.Cells(); _, _, _ = view.Cursor() })
+	run(func() { view.Resize(20, 3); _ = view.MouseInput(MouseEvent{X: 1, Y: 1, Button: MouseLeft}) })
+
+	time.Sleep(20 * time.Millisecond)
+	view.Close()
+	close(stop)
+	wg.Wait()
 }

@@ -169,8 +169,10 @@ Response:
 
 If the Hub is started with `--public-url https://hub.example.com`, generated
 commands and `control_url` use that URL instead of request-local host headers.
-Use a stable hostname for production. With `cloudflared tunnel --url`, copy the
-printed `https://*.trycloudflare.com` URL and restart Hub with that value before
+This is required behind a reverse proxy or tunnel: AgentMux deliberately does
+not trust `X-Forwarded-Host` or `X-Forwarded-Proto` from requests. Use a stable
+hostname for production. With `cloudflared tunnel --url`, copy the printed
+`https://*.trycloudflare.com` URL and restart Hub with that value before
 generating join commands.
 
 Direct Token access is intentionally restricted. It can list shared sessions and
@@ -394,7 +396,8 @@ or command validation errors are returned as `400 Bad Request`.
 
 ### `GET /api/sessions/{worker}/{name}/preview`
 
-Returns a terminal preview for a session.
+Returns a terminal preview for a session. The request waits for the Worker
+response and is canceled when the HTTP client disconnects.
 
 Query parameters:
 
@@ -408,8 +411,10 @@ Response:
 
 ### `GET /api/sessions/{worker}/{name}/targets`
 
-Returns attachable terminal targets for a session. tmux workers report one item
-per pane across all windows so narrow clients can navigate to the pane level.
+Returns attachable terminal targets for a session. The request waits for the
+Worker response and is canceled when the HTTP client disconnects. tmux workers
+report one item per pane across all windows so narrow clients can navigate to the
+pane level.
 Workers without pane-aware backends may return a single session-level target.
 
 Response:
